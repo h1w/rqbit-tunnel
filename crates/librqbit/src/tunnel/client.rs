@@ -256,6 +256,26 @@ impl TunnelClient {
         (self.transport, self.reader, self.writer)
     }
 
+    /// Create a [`TunnelClient`] from already-completed handshake parts.
+    ///
+    /// For tests that run the MSE + Noise handshake outside of
+    /// [`TunnelClient::connect`].
+    #[cfg(test)]
+    pub(crate) fn from_raw_parts(
+        transport: NoiseTransport,
+        reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    ) -> Self {
+        Self {
+            transport,
+            reader,
+            writer,
+            next_stream_id: std::sync::atomic::AtomicU64::new(1),
+            next_assoc_id: std::sync::atomic::AtomicU64::new(1),
+            local_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
     // ── Test hooks ───────────────────────────────────────────────────────
 
     /// Returns the number of local DNS resolver calls.

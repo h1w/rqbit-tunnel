@@ -10,3 +10,6 @@ pub(crate) mod server;
 pub mod service;
 pub(crate) mod socks;
 pub(crate) mod socks_udp;
+
+#[cfg(test)]
+pub(crate) mod test_capture;

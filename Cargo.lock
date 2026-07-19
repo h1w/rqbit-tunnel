@@ -4982,6 +4982,7 @@ dependencies = [
  "console-subscriber",
  "futures",
  "gethostname",
+ "hex 0.4.3",
  "libc",
  "librqbit",
  "librqbit-dualstack-sockets",
