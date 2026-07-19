@@ -36,7 +36,7 @@ pub enum Error {
     V2MissingPieceLayers,
     #[error("v2 piece_layers missing entry for file: {0}")]
     V2MissingPieceLayersEntry(String),
-    #[error("v2 piece_layers entry has wrong size: expected {expected}, got {actual}")]
+    #[error("v2 piece_layers entry has wrong hash count: expected {expected}, got {actual}")]
     V2PieceLayersWrongSize { expected: usize, actual: usize },
     #[error("v2 piece_layers count mismatch: expected {expected}, got {actual}")]
     V2PieceLayerCountMismatch { expected: usize, actual: usize },
@@ -54,4 +54,10 @@ pub enum Error {
     V2InvalidTorrent,
     #[error("v2 hybrid file list mismatch: {0}")]
     V2HybridFileListMismatch(String),
+    #[error("v2 piece layer has too many hashes for this target: {count}")]
+    V2PieceLayerCountTooLarge { count: u64 },
+    #[error("invalid v2 file tree entry")]
+    V2InvalidFileTreeEntry,
+    #[error("invalid v2 piece layer length {actual}: must be a multiple of 32")]
+    InvalidV2PieceLayerLength { actual: usize },
 }

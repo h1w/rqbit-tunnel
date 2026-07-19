@@ -156,4 +156,5 @@ url = { version = "2", default-features = false }
 urlencoding = "2"
 uuid = "1"
 walkdir = "2"
+sha2 = "0.10.9"
 windows = "0.62"

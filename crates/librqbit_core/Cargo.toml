@@ -37,6 +37,7 @@ memchr.workspace = true
 thiserror.workspace = true
 chardetng.workspace = true
 encoding_rs.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
