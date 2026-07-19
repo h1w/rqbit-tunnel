@@ -111,6 +111,8 @@ axum-extra = { workspace = true, features = ["query"] }
 librqbit-dualstack-sockets = { workspace = true, features = ["axum"] }
 socket2.workspace = true
 nix = { workspace = true, features = ["uio"] }
+num-bigint.workspace = true
+rc4.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(windows)'.dependencies]

@@ -1,12 +1,9 @@
 use std::sync::Arc;
 
 use bitvec::{boxed::BitBox, order::Msb0};
-use bytes::Bytes;
-use librqbit_core::{
-    Id32,
-    torrent_metainfo_v2::torrent_v2_from_bytes,
-};
 use buffers::ByteBuf;
+use bytes::Bytes;
+use librqbit_core::{Id32, torrent_metainfo_v2::torrent_v2_from_bytes};
 use peer_binary_protocol::{Message, Piece, Request};
 use sha2::{Digest, Sha256};
 
@@ -56,31 +53,25 @@ impl CarrierPieceLayer {
             TunnelCarrierError::Store(anyhow::anyhow!("parse carrier metainfo: {e}"))
         })?;
 
-        let validated = parsed.info.data
+        let validated = parsed
+            .info
+            .data
             .validate(&parsed.piece_layers)
             .map_err(|e| {
                 TunnelCarrierError::Store(anyhow::anyhow!("validate carrier metainfo: {e}"))
             })?;
 
         let files = validated.files();
-        let pieces_root = files
-            .iter()
-            .find_map(|f| f.pieces_root)
-            .ok_or_else(|| {
-                TunnelCarrierError::Store(anyhow::anyhow!(
-                    "carrier metainfo has no pieces_root"
-                ))
-            })?;
+        let pieces_root = files.iter().find_map(|f| f.pieces_root).ok_or_else(|| {
+            TunnelCarrierError::Store(anyhow::anyhow!("carrier metainfo has no pieces_root"))
+        })?;
 
-        let raw_hashes = parsed
-            .piece_layers
-            .get(&pieces_root)
-            .ok_or_else(|| {
-                TunnelCarrierError::Store(anyhow::anyhow!(
-                    "carrier piece layers missing root {}",
-                    hex::encode(pieces_root.0),
-                ))
-            })?;
+        let raw_hashes = parsed.piece_layers.get(&pieces_root).ok_or_else(|| {
+            TunnelCarrierError::Store(anyhow::anyhow!(
+                "carrier piece layers missing root {}",
+                hex::encode(pieces_root.0),
+            ))
+        })?;
 
         let piece_length = validated.info().piece_length;
         let raw = raw_hashes.as_ref();
@@ -195,10 +186,7 @@ impl TunnelCarrierPeer {
         }
 
         let leaked: &'static [u8] = Box::leak(buf.into_boxed_slice());
-        vec![
-            Message::Bitfield(ByteBuf(leaked)),
-            Message::Unchoke,
-        ]
+        vec![Message::Bitfield(ByteBuf(leaked)), Message::Unchoke]
     }
 
     // ── Message dispatch ──────────────────────────────────────────────────
@@ -223,10 +211,7 @@ impl TunnelCarrierPeer {
 
     // ── Handlers ──────────────────────────────────────────────────────────
 
-    async fn on_request(
-        &mut self,
-        req: Request,
-    ) -> Result<Vec<CarrierAction>, TunnelCarrierError> {
+    async fn on_request(&mut self, req: Request) -> Result<Vec<CarrierAction>, TunnelCarrierError> {
         let idx = req.index;
         let begin = req.begin;
         let length = req.length;
@@ -270,7 +255,10 @@ impl TunnelCarrierPeer {
             return Err(TunnelCarrierError::InvalidRequest {
                 reason: format!(
                     "request range [{begin}, {}+{}) = [{}, {}) exceeds piece_len {piece_len}",
-                    begin, length, begin, begin + length,
+                    begin,
+                    length,
+                    begin,
+                    begin + length,
                 ),
             });
         };
@@ -281,22 +269,21 @@ impl TunnelCarrierPeer {
         Ok(vec![CarrierAction::OutgoingMessage(piece_msg)])
     }
 
-    fn on_piece(&mut self, piece: Piece<ByteBuf<'_>>) -> Result<Vec<CarrierAction>, TunnelCarrierError> {
+    fn on_piece(
+        &mut self,
+        piece: Piece<ByteBuf<'_>>,
+    ) -> Result<Vec<CarrierAction>, TunnelCarrierError> {
         let (block_0, block_1) = piece.data();
 
         // Validate block_0
         if !block_0.is_empty() {
-            self.layer
-                .verify_block(piece.index, piece.begin, block_0)?;
+            self.layer.verify_block(piece.index, piece.begin, block_0)?;
         }
 
         // Validate block_1
         if !block_1.is_empty() {
-            self.layer.verify_block(
-                piece.index,
-                piece.begin + block_0.len() as u32,
-                block_1,
-            )?;
+            self.layer
+                .verify_block(piece.index, piece.begin + block_0.len() as u32, block_1)?;
         }
 
         // Mark piece as available on the remote
@@ -412,14 +399,14 @@ mod tests {
 
         let npieces = (TEST_CORPUS / TEST_PIECE_LEN as u64) as usize; // 4 pieces
         let expected_bytes = npieces.div_ceil(8); // 1 byte
-        assert_eq!(
-            bitfield.len(),
-            expected_bytes,
-            "bitfield size mismatch"
-        );
+        assert_eq!(bitfield.len(), expected_bytes, "bitfield size mismatch");
 
         // All four pieces set (0xF0 in Msb0)
-        assert_eq!(bitfield[0], 0xF0, "all pieces should be set (got {:#04x})", bitfield[0]);
+        assert_eq!(
+            bitfield[0], 0xF0,
+            "all pieces should be set (got {:#04x})",
+            bitfield[0]
+        );
 
         // Second message should be Unchoke
         assert!(matches!(msgs[1], Message::Unchoke), "expected Unchoke");
@@ -534,8 +521,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.is_empty(), "accepting valid piece should produce no actions");
-        assert!(peer.remote_have[0], "piece 0 should be marked as have on remote");
+        assert!(
+            result.is_empty(),
+            "accepting valid piece should produce no actions"
+        );
+        assert!(
+            peer.remote_have[0],
+            "piece 0 should be marked as have on remote"
+        );
         drop(store);
         drop(dir);
     }
@@ -558,7 +551,9 @@ mod tests {
             .unwrap();
         piece_data[42] ^= 0xFF;
 
-        let result = peer.on_message(Message::Piece(Piece::from_data(0, 0, &piece_data))).await;
+        let result = peer
+            .on_message(Message::Piece(Piece::from_data(0, 0, &piece_data)))
+            .await;
         assert!(
             matches!(result, Err(TunnelCarrierError::PieceHashMismatch { .. })),
             "expected PieceHashMismatch, got {result:?}",
@@ -567,14 +562,15 @@ mod tests {
         drop(dir);
     }
 
-
     #[tokio::test]
     async fn rejects_piece_with_out_of_range_index() {
         let (mut peer, _dir) = test_peer().await;
 
         // Piece index out of range
         let dummy = [0u8; 64];
-        let result = peer.on_message(Message::Piece(Piece::from_data(99, 0, &dummy))).await;
+        let result = peer
+            .on_message(Message::Piece(Piece::from_data(99, 0, &dummy)))
+            .await;
 
         assert!(
             matches!(result, Err(TunnelCarrierError::InvalidRequest { .. })),
