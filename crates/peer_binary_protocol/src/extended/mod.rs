@@ -11,16 +11,18 @@ use ut_pex::UtPex;
 
 use crate::DoubleBufHelper;
 use crate::MSGID_EXTENDED;
+use crate::MY_EXTENDED_RQ_TUNNEL;
 use crate::MY_EXTENDED_UT_PEX;
 use crate::SerializeError;
 
-use self::{handshake::ExtendedHandshake, ut_metadata::UtMetadata};
+use self::{handshake::ExtendedHandshake, rq_tunnel::RqTunnelMessage, ut_metadata::UtMetadata};
 
 use super::MessageDeserializeError;
 
 pub mod handshake;
 pub mod ut_metadata;
 pub mod ut_pex;
+pub mod rq_tunnel;
 
 use super::MY_EXTENDED_UT_METADATA;
 
@@ -28,6 +30,7 @@ use super::MY_EXTENDED_UT_METADATA;
 pub struct PeerExtendedMessageIds {
     pub ut_metadata: Option<u8>,
     pub ut_pex: Option<u8>,
+    pub rq_tunnel: Option<u8>,
 }
 
 impl PeerExtendedMessageIds {
@@ -35,6 +38,7 @@ impl PeerExtendedMessageIds {
         Self {
             ut_metadata: Some(MY_EXTENDED_UT_METADATA),
             ut_pex: Some(MY_EXTENDED_UT_PEX),
+            rq_tunnel: Some(MY_EXTENDED_RQ_TUNNEL),
         }
     }
 }
@@ -44,6 +48,7 @@ pub enum ExtendedMessage<ByteBuf: ByteBufT> {
     Handshake(ExtendedHandshake<ByteBuf>),
     UtMetadata(UtMetadata<ByteBuf>),
     UtPex(UtPex<ByteBuf>),
+    RqTunnel(RqTunnelMessage<ByteBuf>),
     Dyn(u8, BencodeValue<ByteBuf>),
 }
 
@@ -77,6 +82,13 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
                 out.write_u8(emsg_id)?;
                 bencode_serialize_to_writer(m, &mut out)?;
             }
+            ExtendedMessage::RqTunnel(msg) => {
+                let emsg_id = peer_extended_msg_ids()
+                    .rq_tunnel
+                    .ok_or(SerializeError::NeedRqTunnel)?;
+                out.write_u8(emsg_id)?;
+                msg.serialize(&mut out)?;
+            }
         }
         Ok(out.position() as usize)
     }
@@ -105,6 +117,15 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
             MY_EXTENDED_UT_METADATA => {
                 Ok(ExtendedMessage::UtMetadata(UtMetadata::deserialize(buf)?))
             }
+            MY_EXTENDED_RQ_TUNNEL => {
+                let payload_len = buf.len();
+                let contiguous = buf
+                    .get_contiguous(payload_len)
+                    .ok_or(MessageDeserializeError::NeedContiguous)?;
+                Ok(ExtendedMessage::RqTunnel(
+                    RqTunnelMessage::deserialize(contiguous, payload_len)?,
+                ))
+            }
             MY_EXTENDED_UT_PEX => Ok(ExtendedMessage::UtPex(from_bytes_contig(&buf)?)),
             _ => Ok(ExtendedMessage::Dyn(emsg_id, from_bytes_contig(&buf)?)),
         }
@@ -116,9 +137,10 @@ mod tests {
     use buffers::ByteBuf;
 
     use crate::{
-        DoubleBufHelper, MessageDeserializeError,
+        DoubleBufHelper, Message, MessageDeserializeError,
         extended::{
             ExtendedMessage, PeerExtendedMessageIds,
+            rq_tunnel::RqTunnelMessage,
             ut_metadata::{UtMetadata, UtMetadataData},
         },
     };
@@ -191,6 +213,71 @@ mod tests {
                     assert_eq!(debuf, b"\x42\x42\x42\x42\x42"[..]);
                 }
                 _ => panic!("bad msg"),
+            }
+        }
+    }
+
+    #[test]
+    fn uses_the_remote_rq_tunnel_id_for_outgoing_payload() {
+        let ids = PeerExtendedMessageIds {
+            rq_tunnel: Some(9),
+            ..Default::default()
+        };
+        let message = Message::Extended(ExtendedMessage::RqTunnel(RqTunnelMessage::from_bytes(
+            b"abc",
+        )));
+        let mut out = [0; 64];
+        let written = message.serialize(&mut out, &|| ids).unwrap();
+        assert_eq!(out[5], 9);
+        assert_eq!(&out[6..written], b"abc");
+    }
+
+    #[test]
+    fn unknown_extension_ids_decode_as_dyn() {
+        let buf = [99u8, b'd', b'3', b':', b'k', b'e', b'y', b'5', b':', b'v', b'a', b'l', b'u', b'e', b'e'];
+        let result = ExtendedMessage::deserialize(DoubleBufHelper::new(&buf, &[]));
+        assert!(
+            matches!(result, Ok(ExtendedMessage::Dyn(99, _))),
+            "expected Dyn(99, ...), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_rq_tunnel_payload_is_rejected() {
+        let oversize = crate::MAX_RQ_TUNNEL_MESSAGE_LEN + 1;
+        let mut buf = vec![0u8; 1 + oversize];
+        buf[0] = crate::MY_EXTENDED_RQ_TUNNEL;
+        buf[1..].fill(0x42u8);
+        let result = ExtendedMessage::deserialize(DoubleBufHelper::new(&buf, &[]));
+        assert!(
+            matches!(
+                result,
+                Err(MessageDeserializeError::RqTunnelMessageTooLarge { .. })
+            ),
+            "expected RqTunnelMessageTooLarge, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn rq_tunnel_split_buffer_roundtrip() {
+        let ids = PeerExtendedMessageIds::my();
+        let payload = b"hello tunnel data";
+        let msg = Message::Extended(ExtendedMessage::RqTunnel(RqTunnelMessage::from_bytes(payload)));
+        let mut out = [0u8; 256];
+        let written = msg.serialize(&mut out, &|| ids).unwrap();
+        let wire = &out[..written];
+
+        for split_point in 0..wire.len() {
+            let (d0, d1) = wire.split_at(split_point);
+            let res = Message::deserialize(d0, d1);
+            match res {
+                Ok((Message::Extended(ExtendedMessage::RqTunnel(m)), _)) => {
+                    assert_eq!(m.as_bytes(), payload);
+                }
+                Err(MessageDeserializeError::NeedContiguous) => {
+                    // Splitting in the middle of the raw payload requires contiguous bytes
+                }
+                other => panic!("unexpected result at split_point={split_point}: {other:?}"),
             }
         }
     }

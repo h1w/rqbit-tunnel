@@ -53,6 +53,9 @@ pub const MY_EXTENDED_UT_METADATA: u8 = 3;
 
 pub const EXTENDED_UT_PEX_KEY: &[u8] = b"ut_pex";
 pub const MY_EXTENDED_UT_PEX: u8 = 1;
+pub const EXTENDED_RQ_TUNNEL_KEY: &[u8] = b"rq_tunnel";
+pub const MY_EXTENDED_RQ_TUNNEL: u8 = 4;
+pub const MAX_RQ_TUNNEL_MESSAGE_LEN: usize = 16 * 1024;
 
 #[derive(Clone, Copy)]
 pub struct MsgIdDebug(MsgId);
@@ -123,6 +126,8 @@ pub enum MessageDeserializeError {
     HandshakePstrWrongContent,
     #[error("pstr should be 19 bytes long but got {0}")]
     HandshakePstrWrongLength(u8),
+    #[error("rq_tunnel message too large: {size} > {max}")]
+    RqTunnelMessageTooLarge { size: usize, max: usize },
 }
 
 pub fn serialize_piece_preamble(chunk: &ChunkInfo, mut buf: &mut [u8]) -> usize {
@@ -241,6 +246,8 @@ pub enum SerializeError {
     NeedUtMetadata,
     #[error("need peer's handshake to serialize ut_pex, or peer does't support ut_pex")]
     NeedPex,
+    #[error("need peer's handshake to serialize rq_tunnel, or peer does't support rq_tunnel")]
+    NeedRqTunnel,
 }
 
 impl From<std::io::Error> for SerializeError {
