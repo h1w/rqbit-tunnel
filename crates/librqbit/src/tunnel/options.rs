@@ -90,7 +90,7 @@ pub struct TunnelServerOptions {
 ///
 /// Default policy: allow public-internet destinations; block private / loopback
 /// / link-local / multicast.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize)]
 pub struct EgressPolicy {
     /// Allow connections to private / RFC 1918 ranges.
     pub allow_private: bool,

@@ -23,13 +23,13 @@ pub(crate) const MAX_FRAME_PAYLOAD: usize = u16::MAX as usize;
 
 // ── Key types ───────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TunnelPrivateKey(pub [u8; 32]);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TunnelPublicKey(pub [u8; 32]);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize)]
 pub struct TunnelPairingBundle {
     pub carrier: super::carrier::TunnelCarrierDescriptor,
     pub server_addr: SocketAddr,

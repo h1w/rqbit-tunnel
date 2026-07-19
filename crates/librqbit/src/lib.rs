@@ -109,6 +109,9 @@ pub use librqbit_core::magnet::*;
 pub use librqbit_core::peer_id::*;
 pub use librqbit_core::torrent_metainfo::*;
 
+pub use tunnel::frame::{TunnelPairingBundle, TunnelPrivateKey, TunnelPublicKey};
+pub use tunnel::options::{EgressPolicy, TunnelClientOptions, TunnelOptions, TunnelServerOptions};
+
 #[cfg(test)]
 mod tests;
 

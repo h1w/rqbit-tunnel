@@ -13,8 +13,10 @@ use clap::{CommandFactory, Parser, ValueEnum};
 use clap_complete::Shell;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, ConnectionOptions,
-    CreateTorrentOptions, DhtSessionConfig, ListOnlyResponse, ListenerMode, ListenerOptions,
-    PeerConnectionOptions, Session, SessionOptions, SessionPersistenceConfig, TorrentStatsState,
+    CreateTorrentOptions, DhtSessionConfig, EgressPolicy, ListOnlyResponse, ListenerMode,
+    ListenerOptions, PeerConnectionOptions, Session, SessionOptions, SessionPersistenceConfig,
+    TorrentStatsState, TunnelClientOptions, TunnelOptions, TunnelPairingBundle, TunnelPrivateKey,
+    TunnelPublicKey, TunnelServerOptions,
     dht::DhtPersistenceConfig,
     http_api::{HttpApi, HttpApiOptions},
     librqbit_spawn,
@@ -35,6 +37,12 @@ enum LogLevel {
     Info,
     Warn,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum TunnelRole {
+    Client,
+    Server,
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -232,6 +240,50 @@ struct Opts {
         env = "RQBIT_RUNTIME_MAX_BLOCKING_THREADS"
     )]
     max_blocking_threads: u16,
+
+
+    // ── Tunnel options ─────────────────────────────────────────────────────
+
+    /// Enable tunnel mode (client or server).
+    #[arg(long = "tunnel-mode", value_enum, env = "RQBIT_TUNNEL_MODE", global = true)]
+    pub tunnel_mode: Option<TunnelRole>,
+
+    /// SOCKS5 listen address for tunnel client mode (default 127.0.0.1:1080).
+    #[arg(long = "tunnel-socks-listen", env = "RQBIT_TUNNEL_SOCKS_LISTEN", global = true)]
+    pub tunnel_socks_listen: Option<SocketAddr>,
+
+    /// Tunnel server address to connect to in client mode.
+    #[arg(long = "tunnel-server-addr", env = "RQBIT_TUNNEL_SERVER_ADDR", global = true)]
+    pub tunnel_server_addr: Option<SocketAddr>,
+
+    /// Listen address for incoming tunnel peer connections in server mode.
+    #[arg(long = "tunnel-peer-listen", env = "RQBIT_TUNNEL_PEER_LISTEN", global = true)]
+    pub tunnel_peer_listen: Option<SocketAddr>,
+
+    /// Path to client identity (private) key file (32-byte hex-encoded).
+    #[arg(long = "tunnel-client-key", env = "RQBIT_TUNNEL_CLIENT_KEY", global = true)]
+    pub tunnel_client_key: Option<PathBuf>,
+
+    /// Path to server key file.  In client mode: server's public key.
+    /// In server mode: server's own identity (private) key.
+    #[arg(long = "tunnel-server-key", env = "RQBIT_TUNNEL_SERVER_KEY", global = true)]
+    pub tunnel_server_key: Option<PathBuf>,
+
+    /// Path to file containing allowed client public keys (server mode, one hex key per line).
+    #[arg(long = "tunnel-allowed-clients", env = "RQBIT_TUNNEL_ALLOWED_CLIENTS", global = true)]
+    pub tunnel_allowed_clients: Option<PathBuf>,
+
+    /// Path to pairing bundle file (client mode, JSON).
+    #[arg(long = "tunnel-pairing", env = "RQBIT_TUNNEL_PAIRING", global = true)]
+    pub tunnel_pairing: Option<PathBuf>,
+
+    /// Path to carrier torrent store root (server mode).
+    #[arg(long = "tunnel-carrier-root", env = "RQBIT_TUNNEL_CARRIER_ROOT", global = true)]
+    pub tunnel_carrier_root: Option<PathBuf>,
+
+    /// Path to egress policy file (server mode, JSON).
+    #[arg(long = "tunnel-egress-policy", env = "RQBIT_TUNNEL_EGRESS_POLICY", global = true)]
+    pub tunnel_egress_policy: Option<PathBuf>,
 
     /// If set will use socks5 proxy for all outgoing connections.
     /// The format is socks5://[username:password]@host:port
@@ -580,6 +632,221 @@ async fn parse_trackers_file(filename: &str) -> anyhow::Result<HashSet<url::Url>
     Ok(trackers)
 }
 
+// ── Tunnel helpers ──────────────────────────────────────────────────────────
+
+/// Reject flags that don't apply to the selected tunnel mode.
+fn validate_tunnel_flags(opts: &Opts) -> anyhow::Result<()> {
+    let mode = match opts.tunnel_mode {
+        Some(m) => m,
+        None => {
+            // No tunnel mode selected — reject all tunnel-specific flags.
+            let tunnel_flags: &[(&str, bool)] = &[
+                ("--tunnel-socks-listen", opts.tunnel_socks_listen.is_some()),
+                ("--tunnel-server-addr", opts.tunnel_server_addr.is_some()),
+                ("--tunnel-peer-listen", opts.tunnel_peer_listen.is_some()),
+                ("--tunnel-client-key", opts.tunnel_client_key.is_some()),
+                ("--tunnel-server-key", opts.tunnel_server_key.is_some()),
+                ("--tunnel-allowed-clients", opts.tunnel_allowed_clients.is_some()),
+                ("--tunnel-pairing", opts.tunnel_pairing.is_some()),
+                ("--tunnel-carrier-root", opts.tunnel_carrier_root.is_some()),
+                ("--tunnel-egress-policy", opts.tunnel_egress_policy.is_some()),
+            ];
+            for (name, set) in tunnel_flags {
+                if *set {
+                    anyhow::bail!(
+                        "{name} requires --tunnel-mode to be set"
+                    );
+                }
+            }
+            return Ok(());
+        }
+    };
+
+    match mode {
+        TunnelRole::Client => {
+            let client_invalid: &[(&str, bool)] = &[
+                ("--tunnel-peer-listen", opts.tunnel_peer_listen.is_some()),
+                ("--tunnel-allowed-clients", opts.tunnel_allowed_clients.is_some()),
+                ("--tunnel-carrier-root", opts.tunnel_carrier_root.is_some()),
+                ("--tunnel-egress-policy", opts.tunnel_egress_policy.is_some()),
+            ];
+            for (name, set) in client_invalid {
+                if *set {
+                    anyhow::bail!(
+                        "{name} is not valid in client tunnel mode"
+                    );
+                }
+            }
+        }
+        TunnelRole::Server => {
+            let server_invalid: &[(&str, bool)] = &[
+                ("--tunnel-socks-listen", opts.tunnel_socks_listen.is_some()),
+                ("--tunnel-server-addr", opts.tunnel_server_addr.is_some()),
+                ("--tunnel-client-key", opts.tunnel_client_key.is_some()),
+                ("--tunnel-pairing", opts.tunnel_pairing.is_some()),
+            ];
+            for (name, set) in server_invalid {
+                if *set {
+                    anyhow::bail!(
+                        "{name} is not valid in server tunnel mode"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read a file, validating that permissions are reasonable (not world-readable
+/// for key material — owner-only is expected).
+#[cfg(not(target_os = "windows"))]
+fn read_key_file(path: &Path) -> anyhow::Result<Vec<u8>> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("cannot stat key file {}", path.display()))?;
+    let mode = meta.permissions().mode();
+    // Warn but don't reject if group/other readable — just a warning.
+    if mode & 0o077 != 0 {
+        tracing::warn!(
+            path = %path.display(),
+            mode = format!("{mode:04o}"),
+            "key file has group/other permissions; consider chmod 600"
+        );
+    }
+    let data = std::fs::read(path)
+        .with_context(|| format!("cannot read key file {}", path.display()))?;
+    Ok(data)
+}
+
+#[cfg(target_os = "windows")]
+fn read_key_file(path: &Path) -> anyhow::Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| format!("cannot read key file {}", path.display()))
+}
+
+/// Parse a 32-byte hex-encoded key from raw bytes (may include whitespace).
+fn parse_hex_key(data: &[u8]) -> anyhow::Result<[u8; 32]> {
+    let hex_str = std::str::from_utf8(data)
+        .context("key file is not valid UTF-8")?
+        .trim();
+    let hex_str = hex_str
+        .split_whitespace()
+        .collect::<String>();
+    let bytes = hex::decode(&hex_str)
+        .context("key file is not valid hex")?;
+    if bytes.len() != 32 {
+        anyhow::bail!(
+            "key file has {} bytes, expected 32",
+            bytes.len()
+        );
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(arr)
+}
+
+/// Load allowed client keys from a newline-delimited hex-encoded file.
+fn load_allowed_client_keys(path: &Path) -> anyhow::Result<HashSet<TunnelPublicKey>> {
+    let data = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read allowed-clients file {}", path.display()))?;
+    let mut keys = HashSet::new();
+    for (i, line) in data.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let key_bytes = parse_hex_key(line.as_bytes())
+            .with_context(|| format!("line {} in {}", i + 1, path.display()))?;
+        keys.insert(TunnelPublicKey(key_bytes));
+    }
+    if keys.is_empty() {
+        anyhow::bail!("allowed-clients file {} contains no keys", path.display());
+    }
+    Ok(keys)
+}
+
+/// Build a TunnelOptions from parsed CLI flags.  Call after validate_tunnel_flags.
+fn build_tunnel_opts(opts: &mut Opts) -> anyhow::Result<Option<TunnelOptions>> {
+    let mode = match opts.tunnel_mode {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+
+    match mode {
+        TunnelRole::Client => {
+            let identity_key = {
+                let path = opts.tunnel_client_key.as_ref()
+                    .context("--tunnel-client-key is required in client mode")?;
+                let data = read_key_file(path)?;
+                TunnelPrivateKey(parse_hex_key(&data)
+                    .context("invalid client identity key")?)
+            };
+            let expected_server_key = {
+                let path = opts.tunnel_server_key.as_ref()
+                    .context("--tunnel-server-key is required in client mode")?;
+                let data = read_key_file(path)?;
+                TunnelPublicKey(parse_hex_key(&data)
+                    .context("invalid server public key")?)
+            };
+            let socks_listen = opts.tunnel_socks_listen
+                .unwrap_or(SocketAddr::from(([127, 0, 0, 1], 1080)));
+            let pairing = match &opts.tunnel_pairing {
+                Some(path) => {
+                    let data = std::fs::read(path)
+                        .with_context(|| format!("cannot read pairing file {}", path.display()))?;
+                    Some(serde_json::from_slice::<TunnelPairingBundle>(&data)
+                        .context("invalid pairing bundle JSON")?)
+                }
+                None => None,
+            };
+            let server_addr = opts.tunnel_server_addr
+                .context("--tunnel-server-addr is required in client mode")?;
+
+            Ok(Some(TunnelOptions::Client(TunnelClientOptions {
+                socks_listen,
+                server_addr,
+                identity_key,
+                expected_server_key,
+                pairing,
+            })))
+        }
+        TunnelRole::Server => {
+            let identity_key = {
+                let path = opts.tunnel_server_key.as_ref()
+                    .context("--tunnel-server-key is required in server mode")?;
+                let data = read_key_file(path)?;
+                TunnelPrivateKey(parse_hex_key(&data)
+                    .context("invalid server identity key")?)
+            };
+            let allowed_client_keys = {
+                let path = opts.tunnel_allowed_clients.as_ref()
+                    .context("--tunnel-allowed-clients is required in server mode")?;
+                load_allowed_client_keys(path)?
+            };
+            let egress_policy = match &opts.tunnel_egress_policy {
+                Some(path) => {
+                    let data = std::fs::read_to_string(path)
+                        .with_context(|| format!("cannot read egress policy {}", path.display()))?;
+                    serde_json::from_str::<EgressPolicy>(&data)
+                        .context("invalid egress policy JSON")?
+                }
+                None => EgressPolicy::default(),
+            };
+            let carrier_root = opts.tunnel_carrier_root.clone()
+                .unwrap_or_else(|| PathBuf::from("."));
+            let peer_listen = opts.tunnel_peer_listen
+                .context("--tunnel-peer-listen is required in server mode")?;
+
+            Ok(Some(TunnelOptions::Server(TunnelServerOptions {
+                peer_listen,
+                identity_key,
+                allowed_client_keys,
+                egress_policy,
+                carrier_root,
+            })))
+        }
+    }
+}
+
 async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result<()> {
     let log_config = init_logging(InitLoggingOptions {
         default_rust_log_value: Some(match opts.log_level.unwrap_or(LogLevel::Info) {
@@ -641,6 +908,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         })
     };
 
+    validate_tunnel_flags(&opts)?;
     let mut sopts = SessionOptions {
         dht,
         // This will be overridden by "server start" below if needed.
@@ -656,6 +924,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
                 ..Default::default()
             }),
         }),
+        tunnel: build_tunnel_opts(&mut opts)?,
         bind_device_name: opts.bind_device_name.take(),
         default_storage_factory: Some({
             fn wrap<S: StorageFactory + Clone>(s: S) -> impl StorageFactory {
@@ -1238,6 +1507,9 @@ fn spawn_stats_printer(session: Arc<Session>) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use clap::Parser;
+
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn test_parse_umask() {
@@ -1254,5 +1526,65 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn parses_tunnel_client_without_reusing_outgoing_socks_proxy() {
+        let opts = Opts::try_parse_from([
+            "rqbit", "server", "start", "/tmp/data",
+            "--tunnel-mode", "client",
+            "--tunnel-socks-listen", "127.0.0.1:1080",
+            "--tunnel-server-addr", "203.0.113.10:4242",
+            "--tunnel-client-key", "/tmp/client.key",
+            "--tunnel-server-key", "/tmp/server.pub",
+            "--tunnel-pairing", "/tmp/pairing.bin",
+        ]).unwrap();
+        assert!(opts.socks_url.is_none());
+        assert!(opts.tunnel_mode.is_some());
+    }
+
+    #[test]
+    fn parses_tunnel_server_flags() {
+        let opts = Opts::try_parse_from([
+            "rqbit", "server", "start", "/tmp/data",
+            "--tunnel-mode", "server",
+            "--tunnel-peer-listen", "0.0.0.0:4242",
+            "--tunnel-server-key", "/tmp/server.key",
+            "--tunnel-allowed-clients", "/tmp/allowed.keys",
+            "--tunnel-carrier-root", "/tmp/carrier",
+            "--tunnel-egress-policy", "/tmp/policy.json",
+        ]).unwrap();
+        assert!(opts.tunnel_mode.is_some());
+        assert!(opts.tunnel_peer_listen.is_some());
+    }
+
+    #[test]
+    fn rejects_client_flag_in_server_mode() {
+        let opts = Opts::try_parse_from([
+            "rqbit", "server", "start", "/tmp/data",
+            "--tunnel-mode", "server",
+            "--tunnel-socks-listen", "127.0.0.1:1080",
+        ]).unwrap();
+        let result = validate_tunnel_flags(&opts);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_server_flag_in_client_mode() {
+        let opts = Opts::try_parse_from([
+            "rqbit", "server", "start", "/tmp/data",
+            "--tunnel-mode", "client",
+            "--tunnel-peer-listen", "0.0.0.0:4242",
+        ]).unwrap();
+        let result = validate_tunnel_flags(&opts);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn tunnel_none_when_no_tunnel_flags() {
+        let opts = Opts::try_parse_from([
+            "rqbit", "server", "start", "/tmp/data",
+        ]).unwrap();
+        assert!(opts.tunnel_mode.is_none());
     }
 }
