@@ -22,19 +22,13 @@ impl<'a> RqTunnelMessage<ByteBuf<'a>> {
 }
 
 impl<'a> RqTunnelMessage<ByteBuf<'a>> {
-    pub(crate) fn serialize(
-        &self,
-        out: &mut Cursor<&mut [u8]>,
-    ) -> Result<(), SerializeError> {
+    pub(crate) fn serialize(&self, out: &mut Cursor<&mut [u8]>) -> Result<(), SerializeError> {
         out.write_all(self.as_bytes())
             .map_err(|_| SerializeError::NoSpaceInBuffer)?;
         Ok(())
     }
 
-    pub(crate) fn deserialize(
-        buf: &'a [u8],
-        len: usize,
-    ) -> Result<Self, MessageDeserializeError> {
+    pub(crate) fn deserialize(buf: &'a [u8], len: usize) -> Result<Self, MessageDeserializeError> {
         use crate::MAX_RQ_TUNNEL_MESSAGE_LEN;
         if len > MAX_RQ_TUNNEL_MESSAGE_LEN {
             return Err(MessageDeserializeError::RqTunnelMessageTooLarge {

@@ -20,9 +20,9 @@ use self::{handshake::ExtendedHandshake, rq_tunnel::RqTunnelMessage, ut_metadata
 use super::MessageDeserializeError;
 
 pub mod handshake;
+pub mod rq_tunnel;
 pub mod ut_metadata;
 pub mod ut_pex;
-pub mod rq_tunnel;
 
 use super::MY_EXTENDED_UT_METADATA;
 
@@ -122,9 +122,10 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
                 let contiguous = buf
                     .get_contiguous(payload_len)
                     .ok_or(MessageDeserializeError::NeedContiguous)?;
-                Ok(ExtendedMessage::RqTunnel(
-                    RqTunnelMessage::deserialize(contiguous, payload_len)?,
-                ))
+                Ok(ExtendedMessage::RqTunnel(RqTunnelMessage::deserialize(
+                    contiguous,
+                    payload_len,
+                )?))
             }
             MY_EXTENDED_UT_PEX => Ok(ExtendedMessage::UtPex(from_bytes_contig(&buf)?)),
             _ => Ok(ExtendedMessage::Dyn(emsg_id, from_bytes_contig(&buf)?)),
@@ -234,7 +235,10 @@ mod tests {
 
     #[test]
     fn unknown_extension_ids_decode_as_dyn() {
-        let buf = [99u8, b'd', b'3', b':', b'k', b'e', b'y', b'5', b':', b'v', b'a', b'l', b'u', b'e', b'e'];
+        let buf = [
+            99u8, b'd', b'3', b':', b'k', b'e', b'y', b'5', b':', b'v', b'a', b'l', b'u', b'e',
+            b'e',
+        ];
         let result = ExtendedMessage::deserialize(DoubleBufHelper::new(&buf, &[]));
         assert!(
             matches!(result, Ok(ExtendedMessage::Dyn(99, _))),
@@ -262,7 +266,9 @@ mod tests {
     fn rq_tunnel_split_buffer_roundtrip() {
         let ids = PeerExtendedMessageIds::my();
         let payload = b"hello tunnel data";
-        let msg = Message::Extended(ExtendedMessage::RqTunnel(RqTunnelMessage::from_bytes(payload)));
+        let msg = Message::Extended(ExtendedMessage::RqTunnel(RqTunnelMessage::from_bytes(
+            payload,
+        )));
         let mut out = [0u8; 256];
         let written = msg.serialize(&mut out, &|| ids).unwrap();
         let wire = &out[..written];
