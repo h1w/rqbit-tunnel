@@ -72,7 +72,7 @@ The carrier retains ordinary BitTorrent state and genuine piece exchange while t
 
 ### Foundational dependency
 
-The current repository exposes v1-shaped types such as `TorrentMetaV1*` and `Id20`; no v2 torrent types were found during discovery. Implementing the carrier therefore requires a BEP 52 foundation before tunnel behavior can be completed. This is a hard prerequisite, not a configuration-only change.
+The core already exposes `Id32` and BEP 52's 20-byte truncation helper, but torrent metainfo, validation, storage, and live peer state remain v1-shaped (`TorrentMetaV1*`). Implementing the carrier therefore requires a BEP 52 metadata and verification foundation before tunnel behavior can be completed. This is a hard prerequisite, not a configuration-only change.
 
 ## Transport layers
 
