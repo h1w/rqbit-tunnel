@@ -83,6 +83,50 @@ eval "$(rqbit completions bash)"
 rqbit --socks-url socks5://[username:password]@host:port ...
 ```
 
+## Tunnel mode
+
+rqbit can operate as an encrypted TCP tunnel between a desktop client behind
+NAT and a reachable VPS server, without using the DHT or a tracker for the
+tunnel carrier.  The server allowlists client public keys — only authorized
+clients may connect.
+
+**Traffic flow:**
+- Local applications (browser, curl, etc.) point at the **client loopback SOCKS address** (`127.0.0.1:1080` by default).
+- **Client-to-VPS** is the *encrypted carrier leg* — data is framed inside
+  Noise-encrypted BitTorrent peer-wire connections carried through a
+  dedicated torrent swarm between client and server.
+- **VPS-to-destination** is normal, unencrypted destination traffic — the
+  VPS egresses requests as a standard TCP connection to the target host.
+
+### VPS server
+
+```
+rqbit server start /data \
+  --tunnel-mode server \
+  --tunnel-peer-listen 0.0.0.0:4242 \
+  --tunnel-server-key /etc/rqbit/server.key \
+  --tunnel-allowed-clients /etc/rqbit/clients.txt \
+  --tunnel-carrier-root /var/lib/rqbit/tunnel
+```
+
+### Desktop client
+
+```
+rqbit server start /data \
+  --tunnel-mode client \
+  --tunnel-socks-listen 127.0.0.1:1080 \
+  --tunnel-server-addr vps.example.com:4242 \
+  --tunnel-client-key ~/.rqbit/client.key \
+  --tunnel-server-key ~/.rqbit/server.pub \
+  --tunnel-pairing ~/.rqbit/pairing.bin
+```
+
+Keys are 32-byte hex-encoded values.  The server key is the server's own
+identity (private) key in server mode, and the server's *public* key in
+client mode.  Client identities are always private keys.  The pairing bundle
+(`--tunnel-pairing`) is a JSON file with the info-hash and initial peers
+for the carrier swarm.
+
 ## Watching a directory for .torrents
 
 ```

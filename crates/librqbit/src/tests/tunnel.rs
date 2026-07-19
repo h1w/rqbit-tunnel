@@ -15,7 +15,7 @@ async fn minimal_tunnel_fixture_does_not_hang() {
         fixture.udp_echo_port()
     );
     let mut client = fixture.client.lock().await;
-    let stream_id = client
+    let _stream_id = client
         .open_tcp(crate::tunnel::frame::TunnelDestination::Domain(
             "echo.tunnel.test".into(),
             fixture.tcp_echo_port(),
@@ -24,7 +24,7 @@ async fn minimal_tunnel_fixture_does_not_hang() {
         .expect("open_tcp");
     drop(client);
     let mut client = fixture.client.lock().await;
-    let frame = client.read_frame().await.expect("read TcpOpened");
+    let _frame = client.read_frame().await.expect("read TcpOpened");
 }
 
 // ── TCP CONNECT ─────────────────────────────────────────────────────────────
@@ -118,7 +118,7 @@ async fn udp_associate_echoes_datagram_through_tunnel() {
     let mut client = fixture.client.lock().await;
     let assoc_id = client.open_udp().await.expect("open_udp");
 
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::net::{Ipv4Addr, SocketAddrV4};
     let dest = TunnelDestination::Ip(std::net::SocketAddr::V4(SocketAddrV4::new(
         Ipv4Addr::LOCALHOST,
         fixture.udp_echo_port(),
@@ -159,7 +159,7 @@ async fn client_rejects_wrong_server_key_before_sending_frames() {
     use crate::tunnel::crypto::generate_keypair;
     use librqbit_core::Id20;
     use std::collections::HashSet;
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::net::{Ipv4Addr, SocketAddrV4};
 
     // Start a server with a keypair. The client will pin a DIFFERENT key.
     let (server_sk, _server_pk) = generate_keypair();
@@ -207,7 +207,7 @@ async fn client_rejects_wrong_server_key_before_sending_frames() {
                         // Send reply or close — either way, client should detect mismatch
                         if let Ok((_transport, _ck, reply)) = result {
                             use tokio::io::AsyncWriteExt;
-                            let reply_len = (reply.len() as u16).to_be_bytes();
+                            let reply_len = u16::try_from(reply.len()).unwrap().to_be_bytes();
                             let _ = e.writer.write_all(&reply_len).await;
                             let _ = e.writer.write_all(&reply).await;
                             let _ = e.writer.flush().await;
@@ -273,8 +273,7 @@ async fn server_rejects_unknown_client_key_during_noise_handshake() {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let carrier_hash = Id20::new([0xAB; 20]);
-                let result = server_clone.accept(stream, carrier_hash).await;
-                result
+                server_clone.accept(stream, carrier_hash).await
             }
             Err(_) => Err(crate::tunnel::server::TunnelAdmissionError::PeerDisconnected),
         }
@@ -430,7 +429,7 @@ async fn multiple_concurrent_tcp_streams_through_tunnel() {
 
     let mut client = fixture.client.lock().await;
 
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::net::{Ipv4Addr, SocketAddrV4};
     let dest = TunnelDestination::Ip(std::net::SocketAddr::V4(SocketAddrV4::new(
         Ipv4Addr::LOCALHOST,
         fixture.tcp_echo_port(),

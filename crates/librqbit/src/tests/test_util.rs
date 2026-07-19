@@ -224,17 +224,17 @@ pub mod tunnel_fixture {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use bytes::Bytes;
     use librqbit_core::Id20;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream, UdpSocket};
-    use tokio::sync::{Mutex, mpsc};
+    use tokio::net::{TcpListener, UdpSocket};
+    use tokio::sync::Mutex;
 
     use crate::tunnel::client::TunnelClient;
     use crate::tunnel::crypto::{NoiseTransport, generate_keypair};
     use crate::tunnel::frame::{TunnelDestination, TunnelFrame, TunnelPublicKey};
     use crate::tunnel::server;
 
+    #[allow(dead_code)]
     pub struct TunnelFixture {
         _temp_dir: tempfile::TempDir,
         pub client: Arc<Mutex<TunnelClient>>,
@@ -262,26 +262,21 @@ pub mod tunnel_fixture {
                 .expect("bind tcp echo");
             let tcp_echo_port = tcp_listener.local_addr().unwrap().port();
             let tcp_echo_handle = tokio::spawn(async move {
-                loop {
-                    match tcp_listener.accept().await {
-                        Ok((mut stream, _)) => {
-                            tokio::spawn(async move {
-                                let (mut r, mut w) = stream.split();
-                                let mut buf = vec![0u8; 65536];
-                                loop {
-                                    match r.read(&mut buf).await {
-                                        Ok(0) | Err(_) => break,
-                                        Ok(n) => {
-                                            if w.write_all(&buf[..n]).await.is_err() {
-                                                break;
-                                            }
-                                        }
+                while let Ok((mut stream, _)) = tcp_listener.accept().await {
+                    tokio::spawn(async move {
+                        let (mut r, mut w) = stream.split();
+                        let mut buf = vec![0u8; 65536];
+                        loop {
+                            match r.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    if w.write_all(&buf[..n]).await.is_err() {
+                                        break;
                                     }
                                 }
-                            });
+                            }
                         }
-                        Err(_) => break,
-                    }
+                    });
                 }
             });
 
@@ -292,13 +287,8 @@ pub mod tunnel_fixture {
             let udp_echo_port = udp_echo.local_addr().unwrap().port();
             let udp_echo_handle = tokio::spawn(async move {
                 let mut buf = vec![0u8; 65536];
-                loop {
-                    match udp_echo.recv_from(&mut buf).await {
-                        Ok((n, src)) => {
-                            let _ = udp_echo.send_to(&buf[..n], src).await;
-                        }
-                        Err(_) => break,
-                    }
+                while let Ok((n, src)) = udp_echo.recv_from(&mut buf).await {
+                    let _ = udp_echo.send_to(&buf[..n], src).await;
                 }
             });
 
@@ -329,7 +319,7 @@ pub mod tunnel_fixture {
                     crate::tunnel::crypto::responder_accept(&server_sk, &noise_msg, &allowed)
                         .unwrap();
 
-                let reply_len = (reply.len() as u16).to_be_bytes();
+                let reply_len = u16::try_from(reply.len()).unwrap().to_be_bytes();
                 writer.write_all(&reply_len).await.unwrap();
                 writer.write_all(&reply).await.unwrap();
                 writer.flush().await.unwrap();
@@ -347,7 +337,7 @@ pub mod tunnel_fixture {
             let (handshake, noise_msg) =
                 crate::tunnel::crypto::initiator_start(&client_sk, &server_pk).unwrap();
 
-            let msg_len = (noise_msg.len() as u16).to_be_bytes();
+            let msg_len = u16::try_from(noise_msg.len()).unwrap().to_be_bytes();
             client_writer.write_all(&msg_len).await.unwrap();
             client_writer.write_all(&noise_msg).await.unwrap();
             client_writer.flush().await.unwrap();
@@ -425,6 +415,7 @@ pub mod tunnel_fixture {
             let frame = {
                 let mut t = transport.lock().await;
                 let mut r = reader.lock().await;
+                #[allow(clippy::explicit_auto_deref)]
                 match server::read_frame(&mut *t, &mut **r).await {
                     Ok(f) => f,
                     Err(_) => break,
@@ -469,7 +460,7 @@ pub mod tunnel_fixture {
                         server::write_frame(&mut *t, &mut **w, &TunnelFrame::TcpFin { stream_id })
                             .await;
                 }
-                TunnelFrame::OpenUdp { association_id } => {}
+                TunnelFrame::OpenUdp { association_id: _ } => {}
                 TunnelFrame::UdpDatagram {
                     association_id,
                     bytes,
@@ -497,7 +488,7 @@ pub mod tunnel_fixture {
                     )
                     .await;
                 }
-                TunnelFrame::CloseUdp { association_id } => {}
+                TunnelFrame::CloseUdp { association_id: _ } => {}
                 TunnelFrame::Ping { nonce } => {
                     let mut t = transport.lock().await;
                     let mut w = writer.lock().await;

@@ -105,7 +105,7 @@ pub fn torrent_v2_from_bytes(buf: &[u8]) -> Result<TorrentMetaV2<ByteBuf<'_>>> {
 
     let mut torrent: TorrentMetaV2<ByteBuf<'_>> =
         bencode::from_bytes(buf).map_err(|_| Error::V2InvalidTorrent)?;
-    torrent.info_hash = info_hash_v2(&torrent.info.raw_bytes);
+    torrent.info_hash = info_hash_v2(torrent.info.raw_bytes);
     validate_metadata(&torrent.info.data, &torrent.piece_layers)?;
     Ok(torrent)
 }
@@ -270,14 +270,14 @@ fn validate_file<Buf: AsRef<[u8]>>(
             }
         }
         (size, Some(root)) => {
-            if let Some(previous_size) = required_layers.insert(root, size) {
-                if previous_size != size {
-                    return Err(Error::V2PieceLayerSizeMismatch {
-                        root: hex::encode(root.0),
-                        expected: previous_size,
-                        actual: size,
-                    });
-                }
+            if let Some(previous_size) = required_layers.insert(root, size)
+                && previous_size != size
+            {
+                return Err(Error::V2PieceLayerSizeMismatch {
+                    root: hex::encode(root.0),
+                    expected: previous_size,
+                    actual: size,
+                });
             }
             Ok(())
         }
@@ -386,7 +386,7 @@ pub fn merkle_root(hashes: &[Id32], piece_length: u32) -> Id32 {
 }
 
 pub fn zero_hash(depth: u32) -> Id32 {
-    let mut hash = Id32::new(sha2::Sha256::digest(&[0u8; BLOCK_LENGTH as usize]).into());
+    let mut hash = Id32::new(sha2::Sha256::digest([0u8; BLOCK_LENGTH as usize]).into());
     for _ in 0..depth {
         hash = hash_pair(hash, hash);
     }
@@ -404,9 +404,7 @@ pub fn hash_pair(left: Id32, right: Id32) -> Id32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        checked_piece_count_with_limit, hash_pair, merkle_root, torrent_v2_from_bytes, zero_hash,
-    };
+    use super::{checked_piece_count_with_limit, torrent_v2_from_bytes};
     use crate::{Error, Id32};
     use sha2::Digest;
     #[test]
@@ -537,7 +535,7 @@ mod tests {
     #[test]
     fn zero_hash_base_matches_bep52_block_hash() {
         let zh0 = super::zero_hash(0);
-        let expected = Id32::new(sha2::Sha256::digest(&[0u8; 16 * 1024]).into());
+        let expected = Id32::new(sha2::Sha256::digest([0u8; 16 * 1024]).into());
         assert_eq!(zh0, expected);
     }
 
