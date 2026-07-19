@@ -6,11 +6,11 @@ use bitvec::{boxed::BitBox, order::Msb0, slice::BitSlice};
 use bytes::Bytes;
 use librqbit_core::{
     Id20, Id32,
-    torrent_metainfo_v2::{info_hash_v2, torrent_v2_from_bytes},
+    torrent_metainfo_v2::{info_hash_v2, merkle_root, torrent_v2_from_bytes},
 };
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 
 // ── Config & Public Types ────────────────────────────────────────────────────
 
@@ -53,17 +53,16 @@ mod serde_bytes_helpers {
 
 const DESCRIPTOR_FILENAME: &str = "carrier-descriptor.bin";
 const CORPUS_FILENAME: &str = "carrier-corpus";
-const BLOCK_LEN: u32 = 16 * 1024;
 
 // ── Bencode helpers ──────────────────────────────────────────────────────────
 
 fn bencode_bytes(w: &mut Vec<u8>, data: &[u8]) {
-    write!(w, "{}:", data.len()).unwrap();
+    write!(w, "{}:", data.len()).expect("infallible: write to Vec");
     w.extend_from_slice(data);
 }
 
 fn bencode_int(w: &mut Vec<u8>, n: i64) {
-    write!(w, "i{}e", n).unwrap();
+    write!(w, "i{}e", n).expect("infallible: write to Vec");
 }
 
 fn bencode_dict_start(w: &mut Vec<u8>) {
@@ -74,48 +73,15 @@ fn bencode_dict_end(w: &mut Vec<u8>) {
     w.push(b'e');
 }
 
-// ── Merkle tree helpers ──────────────────────────────────────────────────────
-
 fn piece_count(size: u64, piece_length: u32) -> usize {
     size.div_ceil(u64::from(piece_length)) as usize
 }
 
 fn hash_piece(data: &[u8]) -> Id32 {
-    let digest = Sha256::digest(data);
+    let digest = sha2::Sha256::digest(data);
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(&digest);
     Id32::new(bytes)
-}
-
-fn merkle_root(hashes: &[Id32], piece_length: u32) -> Id32 {
-    let layer_depth = (piece_length / BLOCK_LEN).ilog2();
-    let mut layer = hashes.to_vec();
-    layer.resize(layer.len().next_power_of_two(), zero_hash(layer_depth));
-
-    while layer.len() > 1 {
-        for i in 0..layer.len() / 2 {
-            layer[i] = hash_pair(layer[i * 2], layer[i * 2 + 1]);
-        }
-        layer.truncate(layer.len() / 2);
-    }
-    layer[0]
-}
-
-fn zero_hash(depth: u32) -> Id32 {
-    let mut hash = Id32::new(Sha256::digest([0u8; BLOCK_LEN as usize]).into());
-    for _ in 0..depth {
-        hash = hash_pair(hash, hash);
-    }
-    hash
-}
-
-fn hash_pair(left: Id32, right: Id32) -> Id32 {
-    let mut digest = Sha256::new();
-    digest.update(left.0);
-    digest.update(right.0);
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&digest.finalize());
-    Id32::new(hash)
 }
 
 // ── Build v2 metainfo bytes (bencode) ────────────────────────────────────────
@@ -244,7 +210,7 @@ impl TunnelCarrierStore {
             .with_context(|| format!("reading descriptor {}", desc_path.display()))?;
         let metainfo = Bytes::from(metainfo_bytes);
 
-        // Re-validate metainfo: clone for the parse that borrows
+        // Re-validate metainfo
         let metainfo_for_parse = metainfo.clone();
         let meta = torrent_v2_from_bytes(&metainfo_for_parse)
             .with_context(|| "re-validating carrier metainfo")?;
@@ -295,10 +261,17 @@ impl TunnelCarrierStore {
         let stored_bytes = piece_layers
             .get(&pieces_root)
             .ok_or_else(|| anyhow::anyhow!("carrier piece layers missing root"))?;
-        let stored_hashes: Vec<Id32> = stored_bytes
-            .as_ref()
-            .chunks_exact(32)
+        let stored_bytes_ref = stored_bytes.as_ref();
+        let stored_hashes: Vec<Id32> = stored_bytes_ref
+            .chunks(32)
             .map(|chunk| {
+                if chunk.len() != 32 {
+                    panic!(
+                        "carrier piece layer has trailing bytes: {} total, {} remainder",
+                        stored_bytes_ref.len(),
+                        stored_bytes_ref.len() % 32
+                    );
+                }
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(chunk);
                 Id32::new(arr)
@@ -396,28 +369,41 @@ impl TunnelCarrierStore {
     pub async fn read_piece(&self, piece: ValidPieceIndex, out: &mut [u8]) -> anyhow::Result<()> {
         let piece_len = out.len();
         let corpus_path = self.root.join(CORPUS_FILENAME);
-        let corpus = tokio::fs::read(&corpus_path)
-            .await
-            .with_context(|| "reading carrier corpus for piece read")?;
+
+        let corpus_len = {
+            let meta = std::fs::metadata(&corpus_path)
+                .with_context(|| format!("stat corpus {}", corpus_path.display()))?;
+            meta.len() as usize
+        };
 
         let idx = piece.0 as usize;
         let start = idx * piece_len;
-        let end = (start + piece_len).min(corpus.len());
 
-        if start >= corpus.len() {
+        if start >= corpus_len {
             bail!(
                 "piece index {} out of range (corpus has {} bytes)",
                 idx,
-                corpus.len()
+                corpus_len
             );
         }
 
-        let data = &corpus[start..end];
-        out[..data.len()].copy_from_slice(data);
+        let read_len = piece_len.min(corpus_len - start);
+
+        // Random-access read — avoids loading the entire corpus into memory
+        let mut file = tokio::fs::File::open(&corpus_path)
+            .await
+            .with_context(|| format!("opening corpus for read {}", corpus_path.display()))?;
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        file.seek(std::io::SeekFrom::Start(start as u64))
+            .await
+            .with_context(|| format!("seeking to piece {} in corpus", idx))?;
+        file.read_exact(&mut out[..read_len])
+            .await
+            .with_context(|| format!("reading piece {} from corpus", idx))?;
 
         // If the last piece is shorter than piece_len, zero-pad the rest
-        if data.len() < piece_len {
-            out[data.len()..].fill(0);
+        if read_len < piece_len {
+            out[read_len..].fill(0);
         }
 
         Ok(())
@@ -433,7 +419,7 @@ mod tests {
     fn test_config() -> TunnelCarrierConfig {
         TunnelCarrierConfig {
             corpus_bytes: 65536,
-            piece_length: 16384, // 16 KiB, power of two >= BLOCK_LEN
+            piece_length: 16384,
             display_name: "carrier-test".into(),
         }
     }
@@ -487,5 +473,20 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(buf, vec![0u8; piece_len], "piece 1 should not be all zeros");
+    }
+
+    #[tokio::test]
+    async fn rejects_reopen_with_mismatched_config() {
+        let dir = tempfile::tempdir().unwrap();
+        TunnelCarrierStore::open_or_initialize(dir.path(), &test_config())
+            .await
+            .unwrap();
+
+        let bad_config = TunnelCarrierConfig {
+            corpus_bytes: 32768, // different size
+            ..test_config()
+        };
+        let result = TunnelCarrierStore::open_or_initialize(dir.path(), &bad_config).await;
+        assert!(result.is_err());
     }
 }

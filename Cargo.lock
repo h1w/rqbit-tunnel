@@ -2920,6 +2920,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "serde_with",
+ "sha2",
  "size_format",
  "socket2",
  "sqlx",

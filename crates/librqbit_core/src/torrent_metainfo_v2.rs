@@ -371,7 +371,7 @@ fn validate_meta_version(meta_version: u64) -> Result<()> {
     Ok(())
 }
 
-fn merkle_root(hashes: &[Id32], piece_length: u32) -> Id32 {
+pub fn merkle_root(hashes: &[Id32], piece_length: u32) -> Id32 {
     let layer_depth = (piece_length / BLOCK_LENGTH).ilog2();
     let mut layer = hashes.to_vec();
     layer.resize(layer.len().next_power_of_two(), zero_hash(layer_depth));
@@ -385,7 +385,7 @@ fn merkle_root(hashes: &[Id32], piece_length: u32) -> Id32 {
     layer[0]
 }
 
-fn zero_hash(depth: u32) -> Id32 {
+pub fn zero_hash(depth: u32) -> Id32 {
     let mut hash = Id32::new(sha2::Sha256::digest(&[0u8; BLOCK_LENGTH as usize]).into());
     for _ in 0..depth {
         hash = hash_pair(hash, hash);
@@ -393,7 +393,7 @@ fn zero_hash(depth: u32) -> Id32 {
     hash
 }
 
-fn hash_pair(left: Id32, right: Id32) -> Id32 {
+pub fn hash_pair(left: Id32, right: Id32) -> Id32 {
     let mut digest = Sha256::new();
     digest.update(left.0);
     digest.update(right.0);
