@@ -14,8 +14,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::session::Session;
 
+use super::client::TunnelClient;
 use super::options::TunnelOptions;
 use super::server::TunnelServer;
+use super::socks::SocksIngress;
 
 /// Handle to a running tunnel service.
 ///
@@ -44,9 +46,37 @@ impl TunnelService {
         });
 
         match options {
-            TunnelOptions::Client(_opts) => {
-                // Client / SOCKS listener is wired in a follow-up task.
-                tracing::info!("tunnel client service started (SOCKS pending)");
+            TunnelOptions::Client(opts) => {
+                // ── Extract carrier hash from pairing bundle ─────────────────
+                let carrier_hash = opts
+                    .pairing
+                    .as_ref()
+                    .map(|p| p.carrier.handshake_info_hash)
+                    .unwrap_or_else(|| librqbit_core::Id20::new([0u8; 20]));
+
+                // ── Connect to tunnel server ────────────────────────────────
+                let client = TunnelClient::connect(
+                    opts.server_addr,
+                    &opts.identity_key,
+                    &opts.expected_server_key,
+                    carrier_hash,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("tunnel client connect failed: {e}"))?;
+
+                // ── Bind SOCKS5 listener ────────────────────────────────────
+                let listener = TcpListener::bind(opts.socks_listen).await?;
+                let local_addr = listener.local_addr()?;
+
+                let ingress = SocksIngress::new(local_addr);
+                let client = std::sync::Arc::new(tokio::sync::Mutex::new(client));
+
+                let socks_shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    ingress.run(listener, client, socks_shutdown).await;
+                });
+
+                tracing::info!("tunnel client SOCKS5 listening on {local_addr}");
             }
             TunnelOptions::Server(opts) => {
                 let listener = TcpListener::bind(opts.peer_listen).await?;
