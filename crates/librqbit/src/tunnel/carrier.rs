@@ -1,0 +1,491 @@
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, bail};
+use bitvec::{boxed::BitBox, order::Msb0, slice::BitSlice};
+use bytes::Bytes;
+use librqbit_core::{
+    Id20, Id32,
+    torrent_metainfo_v2::{info_hash_v2, torrent_v2_from_bytes},
+};
+use rand::{Rng, SeedableRng, rngs::StdRng};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+// ── Config & Public Types ────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub(crate) struct TunnelCarrierConfig {
+    pub corpus_bytes: u64,
+    pub piece_length: u32,
+    pub display_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelCarrierDescriptor {
+    pub info_hash: Id32,
+    pub handshake_info_hash: Id20,
+    #[serde(with = "serde_bytes_helpers")]
+    pub metainfo: Bytes,
+}
+
+/// A validated piece index that is guaranteed to be in-range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidPieceIndex(pub u32);
+
+// ── Serde helpers for `Bytes` ────────────────────────────────────────────────
+
+mod serde_bytes_helpers {
+    use bytes::Bytes;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &Bytes, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Bytes, D::Error> {
+        let v: Vec<u8> = Vec::deserialize(deserializer)?;
+        Ok(Bytes::from(v))
+    }
+}
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
+const DESCRIPTOR_FILENAME: &str = "carrier-descriptor.bin";
+const CORPUS_FILENAME: &str = "carrier-corpus";
+const BLOCK_LEN: u32 = 16 * 1024;
+
+// ── Bencode helpers ──────────────────────────────────────────────────────────
+
+fn bencode_bytes(w: &mut Vec<u8>, data: &[u8]) {
+    write!(w, "{}:", data.len()).unwrap();
+    w.extend_from_slice(data);
+}
+
+fn bencode_int(w: &mut Vec<u8>, n: i64) {
+    write!(w, "i{}e", n).unwrap();
+}
+
+fn bencode_dict_start(w: &mut Vec<u8>) {
+    w.push(b'd');
+}
+
+fn bencode_dict_end(w: &mut Vec<u8>) {
+    w.push(b'e');
+}
+
+// ── Merkle tree helpers ──────────────────────────────────────────────────────
+
+fn piece_count(size: u64, piece_length: u32) -> usize {
+    size.div_ceil(u64::from(piece_length)) as usize
+}
+
+fn hash_piece(data: &[u8]) -> Id32 {
+    let digest = Sha256::digest(data);
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&digest);
+    Id32::new(bytes)
+}
+
+fn merkle_root(hashes: &[Id32], piece_length: u32) -> Id32 {
+    let layer_depth = (piece_length / BLOCK_LEN).ilog2();
+    let mut layer = hashes.to_vec();
+    layer.resize(layer.len().next_power_of_two(), zero_hash(layer_depth));
+
+    while layer.len() > 1 {
+        for i in 0..layer.len() / 2 {
+            layer[i] = hash_pair(layer[i * 2], layer[i * 2 + 1]);
+        }
+        layer.truncate(layer.len() / 2);
+    }
+    layer[0]
+}
+
+fn zero_hash(depth: u32) -> Id32 {
+    let mut hash = Id32::new(Sha256::digest([0u8; BLOCK_LEN as usize]).into());
+    for _ in 0..depth {
+        hash = hash_pair(hash, hash);
+    }
+    hash
+}
+
+fn hash_pair(left: Id32, right: Id32) -> Id32 {
+    let mut digest = Sha256::new();
+    digest.update(left.0);
+    digest.update(right.0);
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&digest.finalize());
+    Id32::new(hash)
+}
+
+// ── Build v2 metainfo bytes (bencode) ────────────────────────────────────────
+
+/// Returns `(info_dict_bytes, full_metainfo_bytes)`.
+fn build_metainfo(
+    display_name: &str,
+    corpus_bytes: u64,
+    piece_length: u32,
+    pieces_root: Id32,
+    leaf_hashes: &[Id32],
+) -> (Vec<u8>, Vec<u8>) {
+    let name_bytes = display_name.as_bytes();
+    let empty: &[u8] = b"";
+
+    // Piece layers value: all leaf hashes concatenated
+    let mut piece_layers_value = Vec::new();
+    for h in leaf_hashes {
+        piece_layers_value.extend_from_slice(&h.0);
+    }
+
+    // File tree: { name: { "": { length, pieces root } } }
+    let mut file_tree = Vec::new();
+    bencode_dict_start(&mut file_tree);
+    {
+        bencode_bytes(&mut file_tree, name_bytes);
+        bencode_dict_start(&mut file_tree);
+        {
+            bencode_bytes(&mut file_tree, empty);
+            bencode_dict_start(&mut file_tree);
+            {
+                bencode_bytes(&mut file_tree, b"length");
+                bencode_int(&mut file_tree, corpus_bytes as i64);
+                bencode_bytes(&mut file_tree, b"pieces root");
+                bencode_bytes(&mut file_tree, &pieces_root.0);
+            }
+            bencode_dict_end(&mut file_tree);
+        }
+        bencode_dict_end(&mut file_tree);
+    }
+    bencode_dict_end(&mut file_tree);
+
+    // Info dict
+    let mut info = Vec::new();
+    bencode_dict_start(&mut info);
+    {
+        bencode_bytes(&mut info, b"file tree");
+        info.extend_from_slice(&file_tree);
+        bencode_bytes(&mut info, b"meta version");
+        bencode_int(&mut info, 2);
+        bencode_bytes(&mut info, b"name");
+        bencode_bytes(&mut info, name_bytes);
+        bencode_bytes(&mut info, b"piece length");
+        bencode_int(&mut info, piece_length as i64);
+    }
+    bencode_dict_end(&mut info);
+
+    // Piece layers dict
+    let mut piece_layers_dict = Vec::new();
+    bencode_dict_start(&mut piece_layers_dict);
+    {
+        bencode_bytes(&mut piece_layers_dict, &pieces_root.0);
+        bencode_bytes(&mut piece_layers_dict, &piece_layers_value);
+    }
+    bencode_dict_end(&mut piece_layers_dict);
+
+    // Full metainfo
+    let mut metainfo = Vec::new();
+    bencode_dict_start(&mut metainfo);
+    {
+        bencode_bytes(&mut metainfo, b"info");
+        metainfo.extend_from_slice(&info);
+        bencode_bytes(&mut metainfo, b"piece layers");
+        metainfo.extend_from_slice(&piece_layers_dict);
+    }
+    bencode_dict_end(&mut metainfo);
+
+    (info, metainfo)
+}
+
+fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+    let tmp_path = path.with_extension("tmp");
+    std::fs::write(&tmp_path, data)
+        .with_context(|| format!("writing temp file {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path)
+        .with_context(|| format!("renaming {} -> {}", tmp_path.display(), path.display()))?;
+    Ok(())
+}
+
+// ── Carrier Store ────────────────────────────────────────────────────────────
+
+pub(crate) struct TunnelCarrierStore {
+    descriptor: TunnelCarrierDescriptor,
+    root: PathBuf,
+    have: BitBox<u8, Msb0>,
+}
+
+impl TunnelCarrierStore {
+    pub async fn open_or_initialize(
+        root: &Path,
+        config: &TunnelCarrierConfig,
+    ) -> anyhow::Result<Self> {
+        tokio::fs::create_dir_all(root)
+            .await
+            .with_context(|| format!("creating carrier dir {}", root.display()))?;
+
+        let desc_path = root.join(DESCRIPTOR_FILENAME);
+        let corpus_path = root.join(CORPUS_FILENAME);
+
+        if desc_path.exists() {
+            Self::reopen(root, config, &desc_path, &corpus_path).await
+        } else {
+            Self::initialize(root, config, &desc_path, &corpus_path).await
+        }
+    }
+
+    async fn reopen(
+        root: &Path,
+        config: &TunnelCarrierConfig,
+        desc_path: &Path,
+        corpus_path: &Path,
+    ) -> anyhow::Result<Self> {
+        // Descriptor file contains just the raw metainfo bytes
+        let metainfo_bytes = tokio::fs::read(desc_path)
+            .await
+            .with_context(|| format!("reading descriptor {}", desc_path.display()))?;
+        let metainfo = Bytes::from(metainfo_bytes);
+
+        // Re-validate metainfo: clone for the parse that borrows
+        let metainfo_for_parse = metainfo.clone();
+        let meta = torrent_v2_from_bytes(&metainfo_for_parse)
+            .with_context(|| "re-validating carrier metainfo")?;
+
+        let descriptor = TunnelCarrierDescriptor {
+            info_hash: meta.info_hash,
+            handshake_info_hash: meta.handshake_info_hash(),
+            metainfo,
+        };
+
+        let corpus = tokio::fs::read(corpus_path)
+            .await
+            .with_context(|| format!("reading carrier corpus {}", corpus_path.display()))?;
+        if corpus.len() as u64 != config.corpus_bytes {
+            bail!(
+                "carrier corpus size mismatch: expected {}, got {}",
+                config.corpus_bytes,
+                corpus.len()
+            );
+        }
+
+        let piece_len = config.piece_length as usize;
+        let npieces = piece_count(config.corpus_bytes, config.piece_length);
+
+        let piece_layers = &meta.piece_layers;
+        let validated = meta
+            .info
+            .data
+            .validate(piece_layers)
+            .with_context(|| "validating carrier metainfo v2 info")?;
+
+        // Compute piece hashes from stored corpus
+        let mut computed_hashes = Vec::with_capacity(npieces);
+        for i in 0..npieces {
+            let start = i * piece_len;
+            let end = ((i + 1) * piece_len).min(corpus.len());
+            computed_hashes.push(hash_piece(&corpus[start..end]));
+        }
+
+        // Get the expected root from the file tree
+        let files = validated.files();
+        let pieces_root = files
+            .iter()
+            .find_map(|f| f.pieces_root)
+            .ok_or_else(|| anyhow::anyhow!("carrier has no pieces_root"))?;
+
+        // Get stored piece layer hashes and compare
+        let stored_bytes = piece_layers
+            .get(&pieces_root)
+            .ok_or_else(|| anyhow::anyhow!("carrier piece layers missing root"))?;
+        let stored_hashes: Vec<Id32> = stored_bytes
+            .as_ref()
+            .chunks_exact(32)
+            .map(|chunk| {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(chunk);
+                Id32::new(arr)
+            })
+            .collect();
+
+        if computed_hashes != stored_hashes {
+            bail!("carrier piece hash mismatch on reopen");
+        }
+
+        let verified_root = merkle_root(&computed_hashes, config.piece_length);
+        if verified_root != pieces_root {
+            bail!("carrier merkle root mismatch on reopen");
+        }
+
+        let have = bitvec::bitbox![u8, Msb0; 1; npieces];
+
+        Ok(Self {
+            descriptor,
+            root: root.to_path_buf(),
+            have,
+        })
+    }
+
+    async fn initialize(
+        root: &Path,
+        config: &TunnelCarrierConfig,
+        desc_path: &Path,
+        corpus_path: &Path,
+    ) -> anyhow::Result<Self> {
+        let piece_len = config.piece_length as usize;
+        let corpus_len = config.corpus_bytes as usize;
+        let npieces = piece_count(config.corpus_bytes, config.piece_length);
+
+        // Generate random corpus
+        let mut rng = StdRng::from_os_rng();
+        let mut corpus = vec![0u8; corpus_len];
+        rng.fill(&mut corpus[..]);
+
+        // Hash each piece
+        let mut leaf_hashes = Vec::with_capacity(npieces);
+        for i in 0..npieces {
+            let start = i * piece_len;
+            let end = ((i + 1) * piece_len).min(corpus_len);
+            leaf_hashes.push(hash_piece(&corpus[start..end]));
+        }
+
+        // Compute pieces root via Merkle tree
+        let pieces_root = merkle_root(&leaf_hashes, config.piece_length);
+
+        // Build metainfo
+        let (info_bytes, metainfo_bytes) = build_metainfo(
+            &config.display_name,
+            config.corpus_bytes,
+            config.piece_length,
+            pieces_root,
+            &leaf_hashes,
+        );
+
+        let metainfo = Bytes::from(metainfo_bytes);
+        let info_hash = info_hash_v2(&info_bytes);
+
+        // Parse to validate and get handshake_info_hash
+        let parsed = torrent_v2_from_bytes(&metainfo)
+            .with_context(|| "validating generated carrier metainfo")?;
+        assert_eq!(parsed.info_hash, info_hash);
+
+        let descriptor = TunnelCarrierDescriptor {
+            info_hash,
+            handshake_info_hash: parsed.handshake_info_hash(),
+            metainfo: metainfo.clone(),
+        };
+
+        // Persist corpus and descriptor atomically
+        atomic_write(corpus_path, &corpus).with_context(|| "writing carrier corpus")?;
+        atomic_write(desc_path, &metainfo).with_context(|| "writing carrier descriptor")?;
+
+        let have = bitvec::bitbox![u8, Msb0; 1; npieces];
+
+        Ok(Self {
+            descriptor,
+            root: root.to_path_buf(),
+            have,
+        })
+    }
+
+    pub fn descriptor(&self) -> &TunnelCarrierDescriptor {
+        &self.descriptor
+    }
+
+    pub fn have_bitfield(&self) -> &BitSlice<u8, Msb0> {
+        &self.have
+    }
+
+    pub async fn read_piece(&self, piece: ValidPieceIndex, out: &mut [u8]) -> anyhow::Result<()> {
+        let piece_len = out.len();
+        let corpus_path = self.root.join(CORPUS_FILENAME);
+        let corpus = tokio::fs::read(&corpus_path)
+            .await
+            .with_context(|| "reading carrier corpus for piece read")?;
+
+        let idx = piece.0 as usize;
+        let start = idx * piece_len;
+        let end = (start + piece_len).min(corpus.len());
+
+        if start >= corpus.len() {
+            bail!(
+                "piece index {} out of range (corpus has {} bytes)",
+                idx,
+                corpus.len()
+            );
+        }
+
+        let data = &corpus[start..end];
+        out[..data.len()].copy_from_slice(data);
+
+        // If the last piece is shorter than piece_len, zero-pad the rest
+        if data.len() < piece_len {
+            out[data.len()..].fill(0);
+        }
+
+        Ok(())
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> TunnelCarrierConfig {
+        TunnelCarrierConfig {
+            corpus_bytes: 65536,
+            piece_length: 16384, // 16 KiB, power of two >= BLOCK_LEN
+            display_name: "carrier-test".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn initializes_then_reopens_the_same_carrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = TunnelCarrierStore::open_or_initialize(dir.path(), &test_config())
+            .await
+            .unwrap();
+        let descriptor = first.descriptor().clone();
+        drop(first);
+
+        let reopened = TunnelCarrierStore::open_or_initialize(dir.path(), &test_config())
+            .await
+            .unwrap();
+        assert_eq!(reopened.descriptor(), &descriptor);
+        assert!(reopened.have_bitfield().all());
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_piece_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TunnelCarrierStore::open_or_initialize(dir.path(), &test_config())
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; test_config().piece_length as usize];
+
+        // 4 pieces for 65536/16384 — piece 4 is out of range
+        let result = store.read_piece(ValidPieceIndex(4), &mut buf).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_piece_roundtrip_produces_valid_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TunnelCarrierStore::open_or_initialize(dir.path(), &test_config())
+            .await
+            .unwrap();
+        let piece_len = test_config().piece_length as usize;
+
+        let mut buf = vec![0u8; piece_len];
+        store
+            .read_piece(ValidPieceIndex(0), &mut buf)
+            .await
+            .unwrap();
+        assert_ne!(buf, vec![0u8; piece_len], "piece 0 should not be all zeros");
+
+        store
+            .read_piece(ValidPieceIndex(1), &mut buf)
+            .await
+            .unwrap();
+        assert_ne!(buf, vec![0u8; piece_len], "piece 1 should not be all zeros");
+    }
+}
