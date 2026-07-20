@@ -30,6 +30,7 @@ use crate::type_aliases::BoxAsyncWrite;
 
 use super::crypto::{NoiseTransport, TunnelCryptoError};
 use super::egress::{EgressPolicy, EgressTransport};
+use super::flow::{IdleGuard, SendCredit};
 use super::frame::{MAX_FRAME_PAYLOAD, TunnelDestination, TunnelErrorCode, TunnelFrame};
 use super::server::AdmittedPeer;
 
@@ -154,11 +155,17 @@ enum PeerToDest {
 
 struct TcpEntry {
     to_dest: mpsc::Sender<PeerToDest>,
+    /// Credit the server may use to send dest→peer data (granted by the client
+    /// via `Credit` frames as it drains its local socket).
+    send_credit: SendCredit,
+    /// Bidirectional idle watchdog, poked on activity in either direction.
+    idle: IdleGuard,
     shutdown: CancellationToken,
 }
 
 struct UdpEntry {
     socket: Arc<UdpSocket>,
+    idle: IdleGuard,
     shutdown: CancellationToken,
 }
 
@@ -220,10 +227,14 @@ pub(crate) async fn run_server_relay(
                 }
                 let (to_dest_tx, to_dest_rx) = mpsc::channel::<PeerToDest>(PER_STREAM_QUEUE);
                 let stream_token = shutdown.child_token();
+                let send_credit = SendCredit::new();
+                let idle = IdleGuard::spawn(egress.idle_timeout, stream_token.clone());
                 map.insert(
                     stream_id,
                     TcpEntry {
                         to_dest: to_dest_tx,
+                        send_credit: send_credit.clone(),
+                        idle: idle.clone(),
                         shutdown: stream_token.clone(),
                     },
                 );
@@ -237,17 +248,21 @@ pub(crate) async fn run_server_relay(
                     sink.clone(),
                     tcp.clone(),
                     to_dest_rx,
+                    send_credit,
+                    idle,
                     stream_token,
                 ));
             }
             TunnelFrame::TcpData { stream_id, bytes } => {
-                let to_dest = {
+                let entry = {
                     let map = tcp.lock().await;
-                    map.get(&stream_id).map(|e| e.to_dest.clone())
+                    map.get(&stream_id)
+                        .map(|e| (e.to_dest.clone(), e.idle.clone()))
                 };
-                if let Some(to_dest) = to_dest {
-                    // Backpressure: if the destination is slow, this awaits,
-                    // slowing the peer read for THIS stream (bounded queue).
+                if let Some((to_dest, idle)) = entry {
+                    idle.poke();
+                    // Credit flow control keeps this queue below its bound, so
+                    // the send never blocks long enough to stall other streams.
                     let _ = to_dest.send(PeerToDest::Data(bytes)).await;
                 }
             }
@@ -260,8 +275,17 @@ pub(crate) async fn run_server_relay(
                     let _ = to_dest.send(PeerToDest::Fin).await;
                 }
             }
+            TunnelFrame::Credit { stream_id, bytes } => {
+                // The client drained `bytes` of dest→peer data; replenish the
+                // server's send credit for this stream.
+                let map = tcp.lock().await;
+                if let Some(entry) = map.get(&stream_id) {
+                    entry.send_credit.grant(bytes as usize);
+                }
+            }
             TunnelFrame::TcpReset { stream_id, .. } => {
                 if let Some(entry) = tcp.lock().await.remove(&stream_id) {
+                    entry.send_credit.close();
                     entry.shutdown.cancel();
                 }
             }
@@ -284,10 +308,12 @@ pub(crate) async fn run_server_relay(
                     }
                 };
                 let token = shutdown.child_token();
+                let idle = IdleGuard::spawn(egress.idle_timeout, token.clone());
                 map.insert(
                     association_id,
                     UdpEntry {
                         socket: socket.clone(),
+                        idle: idle.clone(),
                         shutdown: token.clone(),
                     },
                 );
@@ -296,7 +322,7 @@ pub(crate) async fn run_server_relay(
                     association_id,
                     socket,
                     sink.clone(),
-                    egress.idle_timeout,
+                    idle,
                     token,
                 ));
             }
@@ -305,11 +331,13 @@ pub(crate) async fn run_server_relay(
                 destination,
                 bytes,
             } => {
-                let socket = {
+                let entry = {
                     let map = udp.lock().await;
-                    map.get(&association_id).map(|e| e.socket.clone())
+                    map.get(&association_id)
+                        .map(|e| (e.socket.clone(), e.idle.clone()))
                 };
-                if let Some(socket) = socket {
+                if let Some((socket, idle)) = entry {
+                    idle.poke();
                     match egress.authorize(&destination, EgressTransport::Udp).await {
                         Ok(resolved) => {
                             let _ = socket.send_to(&bytes, resolved.selected).await;
@@ -335,6 +363,7 @@ pub(crate) async fn run_server_relay(
 
     // Peer gone: tear everything down.
     for (_, entry) in tcp.lock().await.drain() {
+        entry.send_credit.close();
         entry.shutdown.cancel();
     }
     for (_, entry) in udp.lock().await.drain() {
@@ -355,9 +384,22 @@ async fn handle_tcp_stream(
     sink: FrameSink,
     tcp: TcpMap,
     to_dest_rx: mpsc::Receiver<PeerToDest>,
+    send_credit: SendCredit,
+    idle: IdleGuard,
     token: CancellationToken,
 ) {
-    let result = open_and_pump(stream_id, host, port, &egress, &sink, to_dest_rx, &token).await;
+    let result = open_and_pump(
+        stream_id,
+        host,
+        port,
+        &egress,
+        &sink,
+        to_dest_rx,
+        &send_credit,
+        &idle,
+        &token,
+    )
+    .await;
 
     if let Err(code) = result {
         sink.send(TunnelFrame::TcpReset { stream_id, code }).await;
@@ -365,6 +407,7 @@ async fn handle_tcp_stream(
 
     // Deregister the stream (unless it was already replaced).
     if let Some(entry) = tcp.lock().await.remove(&stream_id) {
+        entry.send_credit.close();
         entry.shutdown.cancel();
     }
 }
@@ -372,6 +415,7 @@ async fn handle_tcp_stream(
 /// Authorize + connect the destination, then pump both directions until the
 /// stream ends. On any pre-connect failure returns `Err(code)` so the caller
 /// sends a single `TcpReset`.
+#[allow(clippy::too_many_arguments)]
 async fn open_and_pump(
     stream_id: u64,
     host: String,
@@ -379,6 +423,8 @@ async fn open_and_pump(
     egress: &EgressPolicy,
     sink: &FrameSink,
     mut to_dest_rx: mpsc::Receiver<PeerToDest>,
+    send_credit: &SendCredit,
+    idle: &IdleGuard,
     token: &CancellationToken,
 ) -> Result<(), TunnelErrorCode> {
     let destination = parse_destination(&host, port);
@@ -416,10 +462,12 @@ async fn open_and_pump(
     }
 
     let (mut dest_read, mut dest_write) = dest.into_split();
-    let idle = egress.idle_timeout;
 
-    // peer → destination
+    // peer → destination: write received data, then grant the peer credit for
+    // exactly what we drained so it may send that much more.
     let pd_token = token.clone();
+    let pd_sink = sink.clone();
+    let pd_idle = idle.clone();
     let peer_to_dest: JoinHandle<()> = tokio::spawn(async move {
         loop {
             let msg = tokio::select! {
@@ -428,7 +476,18 @@ async fn open_and_pump(
             };
             match msg {
                 Some(PeerToDest::Data(bytes)) => {
+                    let n = bytes.len();
                     if dest_write.write_all(&bytes).await.is_err() {
+                        break;
+                    }
+                    pd_idle.poke();
+                    if !pd_sink
+                        .send(TunnelFrame::Credit {
+                            stream_id,
+                            bytes: n as u32,
+                        })
+                        .await
+                    {
                         break;
                     }
                 }
@@ -440,25 +499,30 @@ async fn open_and_pump(
         }
     });
 
-    // destination → peer (runs in this task)
+    // destination → peer (runs in this task). Reserve send credit before each
+    // chunk so we never overrun the peer's receive window.
     let mut buf = vec![0u8; DEST_READ_BUF];
     let mut result_code: Option<TunnelErrorCode> = None;
     loop {
         let read = tokio::select! {
             _ = token.cancelled() => { break; }
-            r = tokio::time::timeout(idle, dest_read.read(&mut buf)) => r,
+            r = dest_read.read(&mut buf) => r,
         };
         match read {
-            Err(_elapsed) => {
-                result_code = Some(TunnelErrorCode::TimedOut);
-                break;
-            }
-            Ok(Ok(0)) => {
+            Ok(0) => {
                 // Destination closed: half-close toward the peer.
                 sink.send(TunnelFrame::TcpFin { stream_id }).await;
                 break;
             }
-            Ok(Ok(n)) => {
+            Ok(n) => {
+                let reserved = tokio::select! {
+                    _ = token.cancelled() => false,
+                    ok = send_credit.reserve(n) => ok,
+                };
+                if !reserved {
+                    break;
+                }
+                idle.poke();
                 if !sink
                     .send(TunnelFrame::TcpData {
                         stream_id,
@@ -469,7 +533,7 @@ async fn open_and_pump(
                     break;
                 }
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 tracing::debug!(stream_id, error = %e, "egress read error");
                 result_code = Some(TunnelErrorCode::ConnectionRefused);
                 break;
@@ -497,17 +561,18 @@ async fn udp_recv_loop(
     association_id: u64,
     socket: Arc<UdpSocket>,
     sink: FrameSink,
-    idle: Duration,
+    idle: IdleGuard,
     token: CancellationToken,
 ) {
     let mut buf = vec![0u8; UDP_READ_BUF];
     loop {
         let recv = tokio::select! {
             _ = token.cancelled() => break,
-            r = tokio::time::timeout(idle, socket.recv_from(&mut buf)) => r,
+            r = socket.recv_from(&mut buf) => r,
         };
         match recv {
-            Ok(Ok((n, src))) => {
+            Ok((n, src)) => {
+                idle.poke();
                 let sent = sink
                     .send(TunnelFrame::UdpDatagram {
                         association_id,
@@ -519,8 +584,8 @@ async fn udp_recv_loop(
                     break;
                 }
             }
-            // Idle timeout or socket error: end the association.
-            _ => break,
+            // Socket error: end the association (idle handled by the watchdog).
+            Err(_) => break,
         }
     }
 }

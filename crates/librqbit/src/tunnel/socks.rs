@@ -22,6 +22,8 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_util::sync::CancellationToken;
 
 use super::client_mux::{ClientMux, InboundTcp, InboundUdp};
+use super::client_supervisor::TunnelClientSupervisor;
+use super::flow::SendCredit;
 use super::frame::{TunnelDestination, TunnelErrorCode};
 use super::socks_udp::{encode_socks_udp_datagram, parse_socks_udp_datagram};
 
@@ -112,11 +114,13 @@ impl SocksIngress {
         self.listen_addr
     }
 
-    /// Run the SOCKS5 accept loop against a shared tunnel mux.
+    /// Run the SOCKS5 accept loop, dispatching each connection onto whichever
+    /// tunnel mux is currently connected (via the supervisor). If the tunnel is
+    /// not connected the SOCKS connection is dropped.
     pub(crate) async fn run(
         self,
         listener: TcpListener,
-        mux: Arc<ClientMux>,
+        supervisor: Arc<TunnelClientSupervisor>,
         shutdown: CancellationToken,
     ) {
         loop {
@@ -124,11 +128,16 @@ impl SocksIngress {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, addr)) => {
-                            if mux.is_shutdown() {
-                                tracing::debug!("tunnel gone; refusing SOCKS connection");
-                                continue;
-                            }
-                            let mux = Arc::clone(&mux);
+                            let mux = match supervisor.current() {
+                                Some(mux) if !mux.is_shutdown() => mux,
+                                _ => {
+                                    tracing::debug!(
+                                        client_addr = %addr,
+                                        "tunnel not connected; dropping SOCKS connection"
+                                    );
+                                    continue;
+                                }
+                            };
                             tokio::spawn(async move {
                                 if let Err(e) = handle_connection(stream, mux).await {
                                     tracing::debug!(
@@ -189,8 +198,8 @@ async fn handle_connection(
         })?;
         let destination = target_to_destination(&target);
 
-        let (stream_id, mut inbound) = match mux.open_tcp(destination).await {
-            Some(pair) => pair,
+        let (stream_id, mut inbound, send_credit) = match mux.open_tcp(destination).await {
+            Some(triple) => triple,
             None => {
                 inner.write_all(&reply_general_failure()).await?;
                 return Ok(());
@@ -203,7 +212,7 @@ async fn handle_connection(
                 let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
                 inner.write_all(&reply_success(bind_addr)).await?;
                 inner.flush().await?;
-                pump_tcp(inner, mux, stream_id, inbound).await;
+                pump_tcp(inner, mux, stream_id, inbound, send_credit).await;
                 Ok(())
             }
             Ok(Some(InboundTcp::Reset(code))) => {
@@ -258,10 +267,11 @@ async fn pump_tcp(
     mux: Arc<ClientMux>,
     stream_id: u64,
     mut inbound: tokio::sync::mpsc::Receiver<InboundTcp>,
+    send_credit: SendCredit,
 ) {
     let (mut local_read, mut local_write) = tokio::io::split(local);
 
-    // local → tunnel
+    // local → tunnel: reserve flow-control credit before each chunk.
     let send_mux = Arc::clone(&mux);
     let send_handle = tokio::spawn(async move {
         let mut buf = vec![0u8; LOCAL_READ_BUF];
@@ -272,6 +282,9 @@ async fn pump_tcp(
                     break;
                 }
                 Ok(n) => {
+                    if !send_credit.reserve(n).await {
+                        break;
+                    }
                     if !send_mux
                         .send_tcp_data(stream_id, Bytes::copy_from_slice(&buf[..n]))
                         .await
@@ -284,11 +297,15 @@ async fn pump_tcp(
         }
     });
 
-    // tunnel → local
+    // tunnel → local: grant the server credit for each chunk we drain locally.
     loop {
         match inbound.recv().await {
             Some(InboundTcp::Data(bytes)) => {
+                let n = bytes.len();
                 if local_write.write_all(&bytes).await.is_err() {
+                    break;
+                }
+                if !mux.grant_credit(stream_id, n).await {
                     break;
                 }
             }

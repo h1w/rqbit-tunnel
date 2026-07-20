@@ -533,3 +533,231 @@ async fn server_tunnel_starts_on_fixed_port_without_double_bind() {
         "tunnel service should be started"
     );
 }
+
+// ── Follow-up: reconnecting client startup ───────────────────────────────────
+
+/// The client tunnel must NOT make session startup fail when the server is
+/// unreachable — the SOCKS listener comes up and the supervisor retries in the
+/// background.
+#[tokio::test]
+async fn client_tunnel_starts_when_server_unreachable() {
+    use crate::tunnel::crypto::generate_keypair;
+    use crate::tunnel::options::{TunnelClientOptions, TunnelOptions};
+    use crate::{Session, session::SessionOptions, tests::test_util::setup_test_logging};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+    setup_test_logging();
+
+    // Reserve a port and immediately release it so connects are refused.
+    let probe = tokio::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let dead_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let (client_sk, _client_pk) = generate_keypair();
+    let (_server_sk, server_pk) = generate_keypair();
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let session = Session::new_with_opts(
+        dir.path().into(),
+        SessionOptions {
+            dht: None,
+            persistence: None,
+            listen: None,
+            tunnel: Some(TunnelOptions::Client(TunnelClientOptions {
+                socks_listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                server_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, dead_port)),
+                identity_key: client_sk,
+                expected_server_key: server_pk,
+                pairing: None,
+            })),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("session must start even if the tunnel server is unreachable");
+
+    assert!(
+        session.tunnel_service().is_some(),
+        "tunnel service should be started (SOCKS listener up, connecting in background)"
+    );
+}
+
+// ── Follow-up: real relay + credit-based flow control ────────────────────────
+
+/// Build a client + admitted-peer pair over an in-process encrypted duplex,
+/// wired to the REAL production handshake (not the echo test fixture).
+async fn build_real_relay_pair() -> (
+    crate::tunnel::client::TunnelClient,
+    crate::tunnel::server::AdmittedPeer,
+) {
+    use crate::tunnel::client::TunnelClient;
+    use crate::tunnel::crypto::{self, generate_keypair};
+    use crate::tunnel::peer_wire_crypto::PeerWireCrypto;
+    use crate::tunnel::server::AdmittedPeer;
+    use librqbit_core::Id20;
+    use std::collections::HashSet;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (client_sk, client_pk) = generate_keypair();
+    let (server_sk, server_pk) = generate_keypair();
+    let carrier_hash = Id20::new([0xAB; 20]);
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let client_pk_c = client_pk.clone();
+
+    let server_handle = tokio::spawn(async move {
+        let enc = PeerWireCrypto::responder(server_io, carrier_hash)
+            .await
+            .unwrap();
+        let mut reader = enc.reader;
+        let mut writer = enc.writer;
+        let mut len_buf = [0u8; 2];
+        reader.read_exact(&mut len_buf).await.unwrap();
+        let msg_len = u16::from_be_bytes(len_buf) as usize;
+        let mut noise_msg = vec![0u8; msg_len];
+        reader.read_exact(&mut noise_msg).await.unwrap();
+        let mut allowed = HashSet::new();
+        allowed.insert(client_pk_c);
+        let (transport, client_key, reply) =
+            crypto::responder_accept(&server_sk, &noise_msg, &allowed).unwrap();
+        let reply_len = u16::try_from(reply.len()).unwrap().to_be_bytes();
+        writer.write_all(&reply_len).await.unwrap();
+        writer.write_all(&reply).await.unwrap();
+        writer.flush().await.unwrap();
+        AdmittedPeer {
+            client_key,
+            transport,
+            reader,
+            writer,
+        }
+    });
+
+    let enc = PeerWireCrypto::initiator(client_io, carrier_hash)
+        .await
+        .unwrap();
+    let mut client_reader = enc.reader;
+    let mut client_writer = enc.writer;
+    let (handshake, noise_msg) = crypto::initiator_start(&client_sk, &server_pk).unwrap();
+    let msg_len = u16::try_from(noise_msg.len()).unwrap().to_be_bytes();
+    client_writer.write_all(&msg_len).await.unwrap();
+    client_writer.write_all(&noise_msg).await.unwrap();
+    client_writer.flush().await.unwrap();
+    let mut len_buf = [0u8; 2];
+    client_reader.read_exact(&mut len_buf).await.unwrap();
+    let reply_len = u16::from_be_bytes(len_buf) as usize;
+    let mut reply_buf = vec![0u8; reply_len];
+    client_reader.read_exact(&mut reply_buf).await.unwrap();
+    let client_transport = crypto::initiator_complete(handshake, &reply_buf).unwrap();
+
+    let peer = server_handle.await.unwrap();
+    let client = TunnelClient::from_raw_parts(
+        client_transport,
+        Box::new(client_reader),
+        Box::new(client_writer),
+    );
+    (client, peer)
+}
+
+/// Transfer more than one flow-control window through the real relay against a
+/// real loopback echo server. A payload larger than `INITIAL_WINDOW` can only
+/// complete if credit is granted and replenished in BOTH directions — so this
+/// exercises the whole credit machinery end-to-end without deadlocking.
+#[tokio::test]
+async fn real_relay_transfers_large_payload_with_flow_control() {
+    use crate::tunnel::client_mux::{ClientMux, InboundTcp};
+    use crate::tunnel::egress::EgressPolicy;
+    use crate::tunnel::relay::run_server_relay;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
+
+    crate::tests::test_util::setup_test_logging();
+
+    // Loopback echo server.
+    let echo = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = echo.accept().await {
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+
+    let (client, peer) = build_real_relay_pair().await;
+    let token = CancellationToken::new();
+
+    // Real server relay; default egress permits loopback.
+    let relay_token = token.clone();
+    tokio::spawn(async move {
+        run_server_relay(peer, Arc::new(EgressPolicy::default()), relay_token).await;
+    });
+
+    let mux = ClientMux::new(client, token.clone());
+    let (stream_id, mut inbound, credit) = mux
+        .open_tcp(TunnelDestination::Ip(echo_addr))
+        .await
+        .expect("open_tcp");
+
+    match inbound.recv().await {
+        Some(InboundTcp::Opened(_)) => {}
+        _ => panic!("expected TcpOpened"),
+    }
+
+    const TOTAL: usize = 600 * 1024; // > INITIAL_WINDOW (256 KiB)
+    const CHUNK: usize = 16 * 1024;
+
+    // Sender: respects flow-control credit.
+    let send_mux = mux.clone();
+    let sender = tokio::spawn(async move {
+        let mut sent = 0usize;
+        while sent < TOTAL {
+            let n = CHUNK.min(TOTAL - sent);
+            let chunk: Vec<u8> = (0..n)
+                .map(|i| u8::try_from((sent + i) % 256).unwrap())
+                .collect();
+            assert!(credit.reserve(n).await, "credit pool closed");
+            assert!(
+                send_mux.send_tcp_data(stream_id, Bytes::from(chunk)).await,
+                "send failed"
+            );
+            sent += n;
+        }
+        send_mux.fin_tcp(stream_id).await;
+    });
+
+    // Receiver: grants credit back as it drains.
+    let mut received: Vec<u8> = Vec::with_capacity(TOTAL);
+    while received.len() < TOTAL {
+        match inbound.recv().await {
+            Some(InboundTcp::Data(bytes)) => {
+                let n = bytes.len();
+                received.extend_from_slice(&bytes);
+                assert!(mux.grant_credit(stream_id, n).await, "grant failed");
+            }
+            Some(InboundTcp::Fin) => break,
+            Some(InboundTcp::Reset(code)) => {
+                panic!("stream reset at {} bytes: {code:?}", received.len())
+            }
+            Some(InboundTcp::Opened(_)) => panic!("duplicate Opened"),
+            None => panic!("tunnel lost at {} bytes", received.len()),
+        }
+    }
+    sender.await.unwrap();
+
+    assert_eq!(received.len(), TOTAL, "did not receive full payload");
+    for (i, b) in received.iter().enumerate() {
+        assert_eq!(
+            *b,
+            u8::try_from(i % 256).unwrap(),
+            "payload corrupted at byte {i}"
+        );
+    }
+
+    token.cancel();
+}

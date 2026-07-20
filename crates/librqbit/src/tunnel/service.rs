@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::session::Session;
 
-use super::client::TunnelClient;
+use super::client_supervisor::TunnelClientSupervisor;
 use super::options::TunnelOptions;
 use super::server::TunnelServer;
 use super::socks::SocksIngress;
@@ -47,35 +47,21 @@ impl TunnelService {
 
         match options {
             TunnelOptions::Client(opts) => {
-                // ── Extract carrier hash from pairing bundle ─────────────────
-                let carrier_hash = opts
-                    .pairing
-                    .as_ref()
-                    .map(|p| p.carrier.handshake_info_hash)
-                    .unwrap_or_else(|| librqbit_core::Id20::new([0u8; 20]));
-
-                // ── Connect to tunnel server ────────────────────────────────
-                let client = TunnelClient::connect(
-                    opts.server_addr,
-                    &opts.identity_key,
-                    &opts.expected_server_key,
-                    carrier_hash,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("tunnel client connect failed: {e}"))?;
-
-                // ── Bind SOCKS5 listener ────────────────────────────────────
+                // ── Bind SOCKS5 listener up front ───────────────────────────
+                // The listener stays up for the whole session; the tunnel
+                // connection is established and re-established in the background
+                // by the supervisor, so session startup does not fail (and the
+                // proxy does not go away) just because the server is briefly
+                // unreachable.
                 let listener = TcpListener::bind(opts.socks_listen).await?;
                 let local_addr = listener.local_addr()?;
 
-                // Split the client into shared reader/writer tasks so many
-                // SOCKS connections can multiplex over one tunnel.
-                let mux = super::client_mux::ClientMux::new(client, shutdown.clone());
+                let supervisor = TunnelClientSupervisor::start(opts, shutdown.clone());
 
                 let ingress = SocksIngress::new(local_addr);
                 let socks_shutdown = shutdown.clone();
                 tokio::spawn(async move {
-                    ingress.run(listener, mux, socks_shutdown).await;
+                    ingress.run(listener, supervisor, socks_shutdown).await;
                 });
 
                 tracing::info!("tunnel client SOCKS5 listening on {local_addr}");

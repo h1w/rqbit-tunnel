@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::client::TunnelClient;
 use super::crypto::NoiseTransport;
+use super::flow::SendCredit;
 use super::frame::{TunnelDestination, TunnelErrorCode, TunnelFrame};
 use super::relay::{FrameSink, read_encrypted_frame, spawn_frame_writer};
 
@@ -43,7 +44,15 @@ pub(crate) enum InboundUdp {
 
 const PER_CONN_QUEUE: usize = 128;
 
-type TcpRoutes = Arc<Mutex<HashMap<u64, mpsc::Sender<InboundTcp>>>>;
+/// Per-TCP-stream client state.
+struct TcpRoute {
+    inbound: mpsc::Sender<InboundTcp>,
+    /// Credit for the local→tunnel direction, replenished by the server's
+    /// `Credit` frames as it drains to the destination.
+    send_credit: SendCredit,
+}
+
+type TcpRoutes = Arc<Mutex<HashMap<u64, TcpRoute>>>;
 type UdpRoutes = Arc<Mutex<HashMap<u64, mpsc::Sender<InboundUdp>>>>;
 
 /// Multiplexer over a connected tunnel client.
@@ -85,13 +94,24 @@ impl ClientMux {
     // ── TCP ──────────────────────────────────────────────────────────────
 
     /// Allocate a stream, register its inbound route, and send `OpenTcp`.
+    ///
+    /// Returns the stream id, the inbound event receiver, and the send-credit
+    /// handle for the local→tunnel direction (the caller `reserve`s from it
+    /// before sending data).
     pub(crate) async fn open_tcp(
         &self,
         destination: TunnelDestination,
-    ) -> Option<(u64, mpsc::Receiver<InboundTcp>)> {
+    ) -> Option<(u64, mpsc::Receiver<InboundTcp>, SendCredit)> {
         let stream_id = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(PER_CONN_QUEUE);
-        self.tcp.lock().await.insert(stream_id, tx);
+        let send_credit = SendCredit::new();
+        self.tcp.lock().await.insert(
+            stream_id,
+            TcpRoute {
+                inbound: tx,
+                send_credit: send_credit.clone(),
+            },
+        );
 
         let (host, port) = match destination {
             TunnelDestination::Ip(addr) => (addr.ip().to_string(), addr.port()),
@@ -106,7 +126,7 @@ impl ClientMux {
             })
             .await
         {
-            Some((stream_id, rx))
+            Some((stream_id, rx, send_credit))
         } else {
             self.tcp.lock().await.remove(&stream_id);
             None
@@ -119,12 +139,25 @@ impl ClientMux {
             .await
     }
 
+    /// Grant the server `n` bytes of credit for the dest→local direction after
+    /// draining that much to the local SOCKS socket.
+    pub(crate) async fn grant_credit(&self, stream_id: u64, n: usize) -> bool {
+        self.sink
+            .send(TunnelFrame::Credit {
+                stream_id,
+                bytes: n as u32,
+            })
+            .await
+    }
+
     pub(crate) async fn fin_tcp(&self, stream_id: u64) -> bool {
         self.sink.send(TunnelFrame::TcpFin { stream_id }).await
     }
 
     pub(crate) async fn unregister_tcp(&self, stream_id: u64) {
-        self.tcp.lock().await.remove(&stream_id);
+        if let Some(route) = self.tcp.lock().await.remove(&stream_id) {
+            route.send_credit.close();
+        }
     }
 
     // ── UDP ──────────────────────────────────────────────────────────────
@@ -206,7 +239,17 @@ async fn reader_loop(
             TunnelFrame::TcpFin { stream_id } => route_tcp(&tcp, stream_id, InboundTcp::Fin).await,
             TunnelFrame::TcpReset { stream_id, code } => {
                 route_tcp(&tcp, stream_id, InboundTcp::Reset(code)).await;
-                tcp.lock().await.remove(&stream_id);
+                if let Some(route) = tcp.lock().await.remove(&stream_id) {
+                    route.send_credit.close();
+                }
+            }
+            TunnelFrame::Credit { stream_id, bytes } => {
+                // The server drained `bytes` of local→tunnel data; replenish
+                // our send credit for this stream.
+                let map = tcp.lock().await;
+                if let Some(route) = map.get(&stream_id) {
+                    route.send_credit.grant(bytes as usize);
+                }
             }
             TunnelFrame::UdpDatagram {
                 association_id,
@@ -224,14 +267,17 @@ async fn reader_loop(
     }
 
     // Connection gone: dropping every sender makes each handler's `recv()`
-    // return `None`, which they treat as a hard reset.
-    tcp.lock().await.clear();
+    // return `None`, which they treat as a hard reset. Close credit pools so
+    // any sender blocked on `reserve` also wakes.
+    for (_, route) in tcp.lock().await.drain() {
+        route.send_credit.close();
+    }
     udp.lock().await.clear();
     shutdown.cancel();
 }
 
 async fn route_tcp(tcp: &TcpRoutes, stream_id: u64, event: InboundTcp) {
-    let tx = tcp.lock().await.get(&stream_id).cloned();
+    let tx = tcp.lock().await.get(&stream_id).map(|r| r.inbound.clone());
     if let Some(tx) = tx {
         let _ = tx.send(event).await;
     }
