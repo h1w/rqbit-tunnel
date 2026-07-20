@@ -75,6 +75,24 @@ pub(crate) const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// try. Bounds memory (the DHT lookup channel is drained into this cache).
 pub(crate) const DHT_PEER_CACHE: usize = 32;
 
+// ── Ping / RTT measurement ──────────────────────────────────────────────────
+
+/// How often each side sends a `Ping` on every carrier connection. Feeds the
+/// per-carrier `RttEstimator` (running-min + EWMA-smoothed RTT) — the
+/// observability foundation for the later adaptive-window controller.
+pub(crate) const PING_INTERVAL: Duration = Duration::from_secs(1);
+
+/// EWMA smoothing factor for `RttEstimator::record`: alpha = NUM/DEN = 1/8,
+/// the standard TCP RTO smoothing factor (RFC 6298). Kept as an integer
+/// fraction (rather than a float) so the EWMA math is deterministic in tests.
+pub(crate) const RTT_EWMA_NUM: u32 = 1;
+pub(crate) const RTT_EWMA_DEN: u32 = 8;
+
+/// Cap on the inflight `Ping` nonce→send-time map (per side, per carrier
+/// connection). Bounds memory if `Pong`s are lost — the oldest (smallest,
+/// since nonces are assigned monotonically) entry is evicted first.
+pub(crate) const PING_NONCE_MAP_CAP: usize = 256;
+
 // ── Carriers ─────────────────────────────────────────────────────────────────
 
 /// Default number of parallel carrier connections a client opens to the server.

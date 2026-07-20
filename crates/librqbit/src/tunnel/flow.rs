@@ -17,13 +17,14 @@
 //     destination-read direction, so a busy upload with a quiet download
 //     direction was wrongly reset.)
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use super::config::DEFAULT_WINDOW;
+use super::config::{DEFAULT_WINDOW, RTT_EWMA_DEN, RTT_EWMA_NUM};
 
 // ── Credit-based flow control ───────────────────────────────────────────────
 
@@ -126,6 +127,106 @@ impl IdleGuard {
     }
 }
 
+// ── RTT estimation via Ping/Pong ─────────────────────────────────────────────
+//
+// Pure, no I/O: fed by whoever owns the wire (the client mux's ping task /
+// reader, and the server relay's mirrored ping task / reader). Share via
+// `Arc<Mutex<RttEstimator>>` at the call site.
+
+/// Tracks per-carrier round-trip time from `Ping`/`Pong` round trips: a
+/// running minimum (the baseline, no-queuing RTT) and an EWMA-smoothed value
+/// (the current estimate, which rises under queuing). `queuing_delay()` —
+/// smooth minus min — is the core signal the later adaptive-window
+/// controller uses to detect self-inflicted bufferbloat.
+pub(crate) struct RttEstimator {
+    min: Option<Duration>,
+    smooth: Option<Duration>,
+}
+
+impl RttEstimator {
+    pub(crate) fn new() -> Self {
+        Self {
+            min: None,
+            smooth: None,
+        }
+    }
+
+    /// Record one round-trip sample. The first sample seeds both the running
+    /// minimum and the smoothed estimate; later samples update the minimum
+    /// and nudge the smoothed estimate toward the sample by `NUM/DEN`
+    /// (integer-nanosecond EWMA — deterministic, no floats, so tests aren't
+    /// flaky).
+    pub(crate) fn record(&mut self, sample: Duration) {
+        self.min = Some(match self.min {
+            Some(min) => min.min(sample),
+            None => sample,
+        });
+        self.smooth = Some(match self.smooth {
+            Some(smooth) => ewma_step(smooth, sample),
+            None => sample,
+        });
+    }
+
+    /// Lowest RTT sample observed so far (baseline, no-queuing RTT). Zero
+    /// until the first sample is recorded.
+    pub(crate) fn rtt_min(&self) -> Duration {
+        self.min.unwrap_or(Duration::ZERO)
+    }
+
+    /// EWMA-smoothed RTT (current estimate, includes queuing). Zero until the
+    /// first sample is recorded.
+    pub(crate) fn rtt_smooth(&self) -> Duration {
+        self.smooth.unwrap_or(Duration::ZERO)
+    }
+
+    /// Estimated self-inflicted queuing delay: `rtt_smooth - rtt_min`.
+    pub(crate) fn queuing_delay(&self) -> Duration {
+        self.rtt_smooth().saturating_sub(self.rtt_min())
+    }
+}
+
+impl Default for RttEstimator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One step of integer-nanosecond EWMA: `smooth += (sample - smooth) *
+/// NUM/DEN`, computed on unsigned nanos in both directions so it never
+/// depends on floats or signed overflow.
+fn ewma_step(smooth: Duration, sample: Duration) -> Duration {
+    let smooth_nanos = smooth.as_nanos() as u64;
+    let sample_nanos = sample.as_nanos() as u64;
+    let new_nanos = if sample_nanos >= smooth_nanos {
+        let delta = sample_nanos - smooth_nanos;
+        smooth_nanos + delta * u64::from(RTT_EWMA_NUM) / u64::from(RTT_EWMA_DEN)
+    } else {
+        let delta = smooth_nanos - sample_nanos;
+        smooth_nanos - delta * u64::from(RTT_EWMA_NUM) / u64::from(RTT_EWMA_DEN)
+    };
+    Duration::from_nanos(new_nanos)
+}
+
+// ── Inflight-ping bookkeeping (shared by the client mux + server relay) ─────
+
+/// Record that `nonce` was just sent at `now`, evicting the oldest in-flight
+/// entry first if `map` is already at `cap`. Nonces are assigned
+/// monotonically per side, so the smallest key is always the oldest — this
+/// bounds memory even if `Pong`s are lost or arrive very late.
+pub(crate) fn record_ping_sent(
+    map: &mut HashMap<u64, Instant>,
+    nonce: u64,
+    now: Instant,
+    cap: usize,
+) {
+    if map.len() >= cap {
+        if let Some(&oldest) = map.keys().min() {
+            map.remove(&oldest);
+        }
+    }
+    map.insert(nonce, now);
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -154,5 +255,65 @@ mod tests {
         // Granting credit unblocks it.
         credit.grant(1);
         assert!(pending.await);
+    }
+
+    #[test]
+    fn rtt_estimator_tracks_min_and_smooths_toward_samples() {
+        let mut est = RttEstimator::new();
+
+        // Before any sample, everything reads zero.
+        assert_eq!(est.rtt_min(), Duration::ZERO);
+        assert_eq!(est.rtt_smooth(), Duration::ZERO);
+
+        est.record(Duration::from_millis(100));
+        est.record(Duration::from_millis(120));
+        est.record(Duration::from_millis(110));
+
+        assert_eq!(
+            est.rtt_min(),
+            Duration::from_millis(100),
+            "rtt_min should track the lowest sample seen"
+        );
+
+        let smooth = est.rtt_smooth();
+        assert!(
+            smooth > Duration::from_millis(100) && smooth < Duration::from_millis(120),
+            "expected smoothed RTT to have moved toward recent samples while staying \
+             between min and max, got {smooth:?}"
+        );
+
+        let queuing = est.queuing_delay();
+        assert_eq!(
+            queuing,
+            smooth.saturating_sub(est.rtt_min()),
+            "queuing_delay must equal smooth - min"
+        );
+        assert!(
+            queuing <= Duration::from_millis(20),
+            "queuing delay should stay within the sample spread, got {queuing:?}"
+        );
+
+        // A later, lower sample must drop the running minimum.
+        est.record(Duration::from_millis(80));
+        assert_eq!(
+            est.rtt_min(),
+            Duration::from_millis(80),
+            "rtt_min should drop to a new lower sample"
+        );
+    }
+
+    #[test]
+    fn record_ping_sent_evicts_oldest_when_at_capacity() {
+        let mut map = HashMap::new();
+        let now = Instant::now();
+        for n in 0..4u64 {
+            record_ping_sent(&mut map, n, now, 3);
+        }
+        assert_eq!(map.len(), 3, "map should stay capped at 3 entries");
+        assert!(
+            !map.contains_key(&0),
+            "oldest nonce (0) should have been evicted"
+        );
+        assert!(map.contains_key(&3), "newest nonce (3) should be present");
     }
 }

@@ -16,7 +16,8 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -27,10 +28,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::type_aliases::BoxAsyncWrite;
 
-use super::config::{CONNECT_TIMEOUT, OUTBOUND_QUEUE, PER_STREAM_QUEUE, READ_CHUNK, UDP_READ_BUF};
+use super::config::{
+    CONNECT_TIMEOUT, OUTBOUND_QUEUE, PER_STREAM_QUEUE, PING_INTERVAL, PING_NONCE_MAP_CAP,
+    READ_CHUNK, UDP_READ_BUF,
+};
 use super::crypto::{NoiseTransport, TunnelCryptoError};
 use super::egress::{EgressPolicy, EgressTransport};
-use super::flow::{IdleGuard, SendCredit};
+use super::flow::{IdleGuard, RttEstimator, SendCredit, record_ping_sent};
 use super::frame::{MAX_FRAME_PAYLOAD, TunnelDestination, TunnelErrorCode, TunnelFrame};
 use super::server::AdmittedPeer;
 
@@ -165,6 +169,9 @@ struct UdpEntry {
 
 type TcpMap = Arc<Mutex<HashMap<u64, TcpEntry>>>;
 type UdpMap = Arc<Mutex<HashMap<u64, UdpEntry>>>;
+/// Nonce → send-time for pings the server has sent but not yet heard a `Pong`
+/// for. Mirrors the client mux's identical bookkeeping.
+type PingInflight = Arc<StdMutex<HashMap<u64, Instant>>>;
 
 /// Run the full egress relay for one admitted peer until the peer disconnects
 /// or `shutdown` fires.
@@ -185,6 +192,18 @@ pub(crate) async fn run_server_relay(
 
     let tcp: TcpMap = Arc::new(Mutex::new(HashMap::new()));
     let udp: UdpMap = Arc::new(Mutex::new(HashMap::new()));
+
+    // Per-carrier RTT measurement (§flow::RttEstimator): our own ping task
+    // probes the download direction; the `Ping` arm below answers the
+    // client's pings so it can measure the upload direction. Feeds the later
+    // adaptive-window controller.
+    let rtt = Arc::new(StdMutex::new(RttEstimator::new()));
+    let ping_inflight: PingInflight = Arc::new(StdMutex::new(HashMap::new()));
+    tokio::spawn(server_ping_task(
+        sink.clone(),
+        ping_inflight.clone(),
+        shutdown.clone(),
+    ));
 
     loop {
         let frame = tokio::select! {
@@ -350,6 +369,12 @@ pub(crate) async fn run_server_relay(
             TunnelFrame::Ping { nonce } => {
                 sink.send(TunnelFrame::Pong { nonce }).await;
             }
+            TunnelFrame::Pong { nonce } => {
+                let sent_at = ping_inflight.lock().unwrap().remove(&nonce);
+                if let Some(sent_at) = sent_at {
+                    rtt.lock().unwrap().record(sent_at.elapsed());
+                }
+            }
             // Frames a server never expects to receive, or that need no action.
             _ => {}
         }
@@ -365,6 +390,34 @@ pub(crate) async fn run_server_relay(
     }
     writer_handle.abort();
     tracing::debug!(?client_key, "tunnel server relay: peer session ended");
+}
+
+/// Mirrors the client mux's `ping_task`: probe RTT on the download direction
+/// (from the server's perspective) with our own periodic `Ping`s. The
+/// `Ping` arm in `run_server_relay` already answers the client's pings, which
+/// is how the client measures the upload direction.
+///
+/// Stops on shutdown, or once the sink is gone — which happens shortly after
+/// `run_server_relay` aborts the writer task on peer disconnect, since that
+/// closes the channel `sink.send` writes to.
+async fn server_ping_task(sink: FrameSink, inflight: PingInflight, shutdown: CancellationToken) {
+    let mut interval = tokio::time::interval(PING_INTERVAL);
+    let mut next_nonce: u64 = 0;
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = interval.tick() => {}
+        }
+        let nonce = next_nonce;
+        next_nonce = next_nonce.wrapping_add(1);
+        {
+            let mut map = inflight.lock().unwrap();
+            record_ping_sent(&mut map, nonce, Instant::now(), PING_NONCE_MAP_CAP);
+        }
+        if !sink.send(TunnelFrame::Ping { nonce }).await {
+            break;
+        }
+    }
 }
 
 // ── Per-TCP-stream egress ───────────────────────────────────────────────────

@@ -903,6 +903,77 @@ async fn client_mux_load_does_not_leak_on_server_tcp_reset() {
     token.cancel();
 }
 
+// ── Per-carrier RTT measurement (Ping/Pong) ─────────────────────────────────
+
+/// The tunnel module has `#![allow(dead_code, unused_variables)]`, so the
+/// compiler will happily accept a ping task that's spawned but never fires,
+/// or an `RttEstimator` that's constructed but never fed. This test proves
+/// the wiring is actually LIVE end-to-end: mirrors `build_real_relay_pair` +
+/// `ClientMux::new` + `run_server_relay` from
+/// `real_relay_transfers_large_payload_with_flow_control` above (a real
+/// Noise-encrypted client/server pair, no echo-fixture indirection), then
+/// polls `ClientMux::rtt_for_test()` until `rtt_smooth()` turns non-zero —
+/// which can only happen if the client's ping task actually sent a `Ping`
+/// and the server actually replied with a matching `Pong` that the reader
+/// actually recorded.
+#[tokio::test]
+async fn client_mux_rtt_estimator_becomes_live_via_ping_pong() {
+    use crate::tunnel::client_mux::ClientMux;
+    use crate::tunnel::egress::EgressPolicy;
+    use crate::tunnel::relay::run_server_relay;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    crate::tests::test_util::setup_test_logging();
+
+    let (client, peer) = build_real_relay_pair().await;
+    let token = CancellationToken::new();
+
+    let relay_token = token.clone();
+    tokio::spawn(async move {
+        run_server_relay(peer, Arc::new(EgressPolicy::default()), relay_token).await;
+    });
+
+    let mux = ClientMux::new(client, token.clone());
+
+    // Before any Pong round-trips, both readings are zero.
+    let (initial_min, initial_smooth) = mux.rtt_for_test();
+    assert_eq!(initial_min, Duration::ZERO);
+    assert_eq!(initial_smooth, Duration::ZERO);
+
+    crate::tests::test_util::wait_until(
+        || {
+            let (_, smooth) = mux.rtt_for_test();
+            if smooth > Duration::ZERO {
+                Ok(())
+            } else {
+                anyhow::bail!("rtt_smooth is still zero")
+            }
+        },
+        Duration::from_secs(3),
+    )
+    .await
+    .expect("rtt_smooth should become non-zero once Ping/Pong round trips are recorded");
+
+    let (rtt_min, rtt_smooth) = mux.rtt_for_test();
+    assert!(
+        rtt_min > Duration::ZERO,
+        "rtt_min should also be non-zero once a sample lands, got {rtt_min:?}"
+    );
+    assert!(
+        rtt_smooth >= rtt_min,
+        "smoothed RTT must never be below the running minimum: smooth={rtt_smooth:?} min={rtt_min:?}"
+    );
+    // Real in-process loopback round trip: should be well under a second.
+    assert!(
+        rtt_smooth < Duration::from_secs(1),
+        "unexpectedly large in-process RTT: {rtt_smooth:?}"
+    );
+
+    token.cancel();
+}
+
 // ── CarrierPool live-pool distribution + carrier-loss coverage ─────────────
 //
 // `pool_spawns_requested_carrier_count` in `client_pool.rs` never yields to
