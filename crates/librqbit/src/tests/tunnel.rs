@@ -902,3 +902,245 @@ async fn client_mux_load_does_not_leak_on_server_tcp_reset() {
 
     token.cancel();
 }
+
+// ── CarrierPool live-pool distribution + carrier-loss coverage ─────────────
+//
+// `pool_spawns_requested_carrier_count` in `client_pool.rs` never yields to
+// the runtime — the configured server address is unreachable, so every
+// carrier stays disconnected — which means it never exercises `pick()`'s
+// least-loaded selection across ACTUALLY connected carriers. The tests below
+// stand up a REAL `TunnelServer` bound to a real loopback `TcpListener` and a
+// REAL `CarrierPool` client (production `TunnelClientSupervisor` /
+// `ClientMux` path, full Noise IK handshake), so `pick()` runs against
+// genuinely live carrier connections.
+
+/// Stand up a real tunnel server (bound to loopback) plus a real
+/// `CarrierPool` client with `carriers` parallel connections, and a real
+/// loopback "sink" destination that accepts and holds connections so opened
+/// streams stay open. Returns the pool, the server's shutdown token
+/// (cancelling it drops every admitted carrier connection at once), the
+/// client's shutdown token, and the sink address to open streams against.
+/// The returned `TempDir` must be kept alive for the carrier store.
+async fn start_live_carrier_pool(
+    carriers: usize,
+) -> (
+    std::sync::Arc<crate::tunnel::client_pool::CarrierPool>,
+    tokio_util::sync::CancellationToken,
+    tokio_util::sync::CancellationToken,
+    std::net::SocketAddr,
+    tempfile::TempDir,
+) {
+    use crate::tunnel::client_pool::CarrierPool;
+    use crate::tunnel::crypto::generate_keypair;
+    use crate::tunnel::options::{EgressPolicy, TunnelClientOptions, TunnelServerOptions};
+    use crate::tunnel::server::TunnelServer;
+    use std::collections::HashSet;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
+
+    let (server_sk, server_pk) = generate_keypair();
+    let (client_sk, client_pk) = generate_keypair();
+
+    let carrier_dir = tempfile::TempDir::new().expect("carrier temp dir");
+
+    // Real listening server.
+    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind server listener");
+    let server_addr = listener.local_addr().unwrap();
+
+    let mut allowed_client_keys = HashSet::new();
+    allowed_client_keys.insert(client_pk);
+    let server_opts = TunnelServerOptions {
+        peer_listen: server_addr,
+        identity_key: server_sk,
+        allowed_client_keys,
+        egress_policy: EgressPolicy {
+            allow_loopback: true,
+            ..Default::default()
+        },
+        carrier_root: carrier_dir.path().to_path_buf(),
+    };
+    let server = TunnelServer::new(server_opts);
+    let server_shutdown = CancellationToken::new();
+    let server_for_run = server.clone();
+    let run_shutdown = server_shutdown.clone();
+    tokio::spawn(async move {
+        server_for_run.run(listener, run_shutdown).await;
+    });
+
+    // Local sink so opened streams actually establish and stay alive: accept
+    // and hold every connection (never drop it), so the server-side egress
+    // connect succeeds and the stream doesn't get reset.
+    let sink = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind sink");
+    let sink_addr = sink.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = sink.accept().await {
+            held.push(s);
+        }
+    });
+
+    let client_shutdown = CancellationToken::new();
+    let client_opts = TunnelClientOptions {
+        socks_listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        server_addr: Some(server_addr),
+        identity_key: client_sk,
+        expected_server_key: server_pk,
+        pairing: None,
+        carriers,
+    };
+    let pool = CarrierPool::start(client_opts, None, client_shutdown.clone());
+
+    (
+        pool,
+        server_shutdown,
+        client_shutdown,
+        sink_addr,
+        carrier_dir,
+    )
+}
+
+/// Test A: streams distribute across carriers.
+///
+/// This is the genuine `CarrierPool::pick()` coverage the multi-carrier plan
+/// needs: two REAL carrier connections come up over loopback TCP (full Noise
+/// IK handshake, real `TunnelServer::run` accept loop), four TCP streams are
+/// opened and their `TcpOpened` verdict is awaited (so each stream is truly
+/// established end-to-end through the tunnel to the sink), and the resulting
+/// per-carrier `load()` values are asserted directly via the
+/// `live_muxes_for_test` accessor — not inferred from `pick()`'s return
+/// value alone. With 2 carriers and least-loaded selection, four sequential
+/// opens must split exactly 2/2 (see `select_carrier`'s tie-break-to-lowest-
+/// index rule in `client_pool.rs`).
+#[tokio::test]
+async fn carrier_pool_distributes_streams_across_live_carriers() {
+    use crate::tunnel::client_mux::InboundTcp;
+    use std::time::Duration;
+
+    crate::tests::test_util::setup_test_logging();
+
+    let (pool, server_shutdown, _client_shutdown, sink_addr, _carrier_dir) =
+        start_live_carrier_pool(2).await;
+
+    crate::tests::test_util::wait_until(
+        || {
+            let live = pool.live_count();
+            if live == 2 {
+                Ok(())
+            } else {
+                anyhow::bail!("live_count = {live}, expected 2")
+            }
+        },
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("expected 2 live carriers within 10s");
+
+    // Open 4 streams through the pool, keeping every handle alive (dropping
+    // the mpsc::Receiver / SendCredit is not what unregisters the stream —
+    // an explicit `unregister_tcp` is — but keeping the whole tuple alive
+    // avoids any ambiguity and matches the harness contract).
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let mux = pool.pick().expect("a live carrier");
+        let (stream_id, mut inbound, credit) = mux
+            .open_tcp(TunnelDestination::Ip(sink_addr))
+            .await
+            .expect("open_tcp");
+        match inbound.recv().await {
+            Some(InboundTcp::Opened(_)) => {}
+            _ => panic!("expected TcpOpened verdict, stream was not truly established"),
+        }
+        handles.push((mux, stream_id, inbound, credit));
+    }
+
+    let live = pool.live_muxes_for_test();
+    let loads: Vec<usize> = live.iter().flatten().map(|m| m.load()).collect();
+    assert_eq!(
+        loads.len(),
+        2,
+        "expected exactly 2 live muxes reporting load, got {loads:?}"
+    );
+    assert_eq!(
+        loads.iter().sum::<usize>(),
+        4,
+        "all 4 opened streams must be accounted for across carriers, got {loads:?}"
+    );
+    assert!(
+        loads.iter().all(|&l| l >= 1),
+        "genuine distribution requires BOTH carriers to receive load, got {loads:?}"
+    );
+    // Deterministic: 2 carriers + least-loaded/tie-break-lowest-index pick
+    // over 4 sequential opens always yields an even 2/2 split.
+    assert_eq!(
+        loads,
+        vec![2, 2],
+        "expected an even 2/2 split, got {loads:?}"
+    );
+
+    drop(handles);
+    server_shutdown.cancel();
+}
+
+/// Test B: the pool reflects total carrier loss.
+///
+/// Deterministically killing exactly ONE of N carriers in-process would
+/// require new production hooks (e.g. a way to reach into a specific
+/// `TunnelClientSupervisor` and sever only its socket) — this task may not
+/// add those. Instead this test cancels the SERVER's shutdown token, which
+/// drops every admitted carrier connection at once (`TunnelServer::run`
+/// derives each peer's shutdown token as a CHILD of the token passed in, so
+/// cancelling the parent cancels every relay task together). Combined with
+/// the independent-per-carrier-supervisor design — each carrier reconnects
+/// on its own, already covered by `client_tunnel_starts_when_server_unreachable`
+/// and the backoff/reconnect loop in `client_supervisor.rs` — this is the
+/// intended liveness coverage for this task: the pool must notice when its
+/// carriers die and stop handing out muxes.
+#[tokio::test]
+async fn carrier_pool_reflects_full_carrier_loss() {
+    use std::time::Duration;
+
+    crate::tests::test_util::setup_test_logging();
+
+    let (pool, server_shutdown, _client_shutdown, _sink_addr, _carrier_dir) =
+        start_live_carrier_pool(2).await;
+
+    crate::tests::test_util::wait_until(
+        || {
+            let live = pool.live_count();
+            if live == 2 {
+                Ok(())
+            } else {
+                anyhow::bail!("live_count = {live}, expected 2")
+            }
+        },
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("expected 2 live carriers within 10s");
+
+    server_shutdown.cancel();
+
+    crate::tests::test_util::wait_until(
+        || {
+            let live = pool.live_count();
+            if live == 0 {
+                Ok(())
+            } else {
+                anyhow::bail!("live_count = {live}, expected 0 after server shutdown")
+            }
+        },
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("expected live_count() to drop to 0 within 10s after server shutdown");
+
+    assert!(
+        pool.pick().is_none(),
+        "pick() must return None once every carrier is gone"
+    );
+}

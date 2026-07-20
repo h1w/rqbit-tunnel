@@ -71,6 +71,14 @@ impl CarrierPool {
         let idx = select_carrier(&loads)?;
         muxes.into_iter().nth(idx).flatten()
     }
+
+    /// Test-only accessor exposing the current live-mux snapshot (indexed by
+    /// carrier slot, `None` for a disconnected carrier), so integration tests
+    /// can inspect per-carrier `load()` directly.
+    #[cfg(test)]
+    pub(crate) fn live_muxes_for_test(&self) -> Vec<Option<Arc<ClientMux>>> {
+        self.live_muxes()
+    }
 }
 
 #[cfg(test)]
