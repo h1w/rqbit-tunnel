@@ -19,6 +19,9 @@ pub enum TunnelConfigError {
 
     #[error("server mode requires at least one allowed client key")]
     EmptyClientAllowlist,
+
+    #[error("carriers must be between 1 and 16")]
+    InvalidCarrierCount,
 }
 
 // ── Role enum ───────────────────────────────────────────────────────────────
@@ -50,6 +53,9 @@ pub struct TunnelClientOptions {
 
     /// Pairing bundle containing carrier descriptor and server metadata.
     pub pairing: Option<TunnelPairingBundle>,
+
+    /// Number of parallel carrier connections to open (per-stream striping).
+    pub carriers: usize,
 }
 
 impl Default for TunnelClientOptions {
@@ -60,6 +66,7 @@ impl Default for TunnelClientOptions {
             identity_key: TunnelPrivateKey([0u8; 32]),
             expected_server_key: TunnelPublicKey([0u8; 32]),
             pairing: None,
+            carriers: super::config::DEFAULT_CARRIERS,
         }
     }
 }
@@ -128,6 +135,9 @@ impl TunnelOptions {
                 // what authenticates the server and derives the carrier hash.
                 if opts.expected_server_key == TunnelPublicKey([0u8; 32]) {
                     return Err(TunnelConfigError::MissingServerKey);
+                }
+                if opts.carriers == 0 || opts.carriers > super::config::MAX_CARRIERS {
+                    return Err(TunnelConfigError::InvalidCarrierCount);
                 }
                 Ok(())
             }
@@ -251,5 +261,41 @@ mod tests {
         assert!(!policy.allow_loopback);
         assert!(!policy.allow_link_local);
         assert!(!policy.allow_multicast);
+    }
+}
+
+#[cfg(test)]
+mod carrier_tests {
+    use super::*;
+
+    #[test]
+    fn client_options_default_carriers_is_four() {
+        assert_eq!(TunnelClientOptions::default().carriers, 4);
+    }
+
+    #[test]
+    fn validate_rejects_zero_carriers() {
+        let mut opts = TunnelClientOptions {
+            expected_server_key: TunnelPublicKey([1u8; 32]),
+            ..Default::default()
+        };
+        opts.carriers = 0;
+        assert!(matches!(
+            TunnelOptions::Client(opts).validate(),
+            Err(TunnelConfigError::InvalidCarrierCount)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_too_many_carriers() {
+        let opts = TunnelClientOptions {
+            expected_server_key: TunnelPublicKey([1u8; 32]),
+            carriers: super::super::config::MAX_CARRIERS + 1,
+            ..Default::default()
+        };
+        assert!(matches!(
+            TunnelOptions::Client(opts).validate(),
+            Err(TunnelConfigError::InvalidCarrierCount)
+        ));
     }
 }

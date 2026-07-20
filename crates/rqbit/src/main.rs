@@ -322,6 +322,10 @@ struct Opts {
     )]
     pub tunnel_egress_policy: Option<PathBuf>,
 
+    /// Number of parallel carrier connections in client mode (default 4, max 16).
+    #[arg(long = "tunnel-carriers", env = "RQBIT_TUNNEL_CARRIERS", global = true)]
+    pub tunnel_carriers: Option<usize>,
+
     /// If set will use socks5 proxy for all outgoing connections.
     /// The format is socks5://[username:password]@host:port
     ///
@@ -723,6 +727,7 @@ fn validate_tunnel_flags(opts: &Opts) -> anyhow::Result<()> {
                     "--tunnel-egress-policy",
                     opts.tunnel_egress_policy.is_some(),
                 ),
+                ("--tunnel-carriers", opts.tunnel_carriers.is_some()),
             ];
             for (name, set) in tunnel_flags {
                 if *set {
@@ -759,6 +764,7 @@ fn validate_tunnel_flags(opts: &Opts) -> anyhow::Result<()> {
                 ("--tunnel-server-addr", opts.tunnel_server_addr.is_some()),
                 ("--tunnel-client-key", opts.tunnel_client_key.is_some()),
                 ("--tunnel-pairing", opts.tunnel_pairing.is_some()),
+                ("--tunnel-carriers", opts.tunnel_carriers.is_some()),
             ];
             for (name, set) in server_invalid {
                 if *set {
@@ -874,12 +880,15 @@ fn build_tunnel_opts(opts: &mut Opts) -> anyhow::Result<Option<TunnelOptions>> {
             // DHT (using the carrier hash derived from the pinned server key).
             let server_addr = opts.tunnel_server_addr;
 
+            let carriers = opts.tunnel_carriers.unwrap_or(4).clamp(1, 16);
+
             Ok(Some(TunnelOptions::Client(TunnelClientOptions {
                 socks_listen,
                 server_addr,
                 identity_key,
                 expected_server_key,
                 pairing,
+                carriers,
             })))
         }
         TunnelRole::Server => {

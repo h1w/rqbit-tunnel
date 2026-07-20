@@ -68,3 +68,14 @@ pub(crate) const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Max recent DHT-discovered candidate addresses kept for the tunnel client to
 /// try. Bounds memory (the DHT lookup channel is drained into this cache).
 pub(crate) const DHT_PEER_CACHE: usize = 32;
+
+// ── Carriers ─────────────────────────────────────────────────────────────────
+
+/// Default number of parallel carrier connections a client opens to the server.
+/// Streams are striped per-connection across them; aggregate throughput fills
+/// the link and one dead carrier only resets its own streams.
+pub(crate) const DEFAULT_CARRIERS: usize = 4;
+
+/// Upper bound on `--tunnel-carriers` (beyond this, diminishing returns plus
+/// extra handshakes / DHT noise).
+pub(crate) const MAX_CARRIERS: usize = 16;

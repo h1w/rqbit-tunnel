@@ -574,6 +574,7 @@ async fn client_tunnel_starts_when_server_unreachable() {
                 identity_key: client_sk,
                 expected_server_key: server_pk,
                 pairing: None,
+                carriers: crate::tunnel::config::DEFAULT_CARRIERS,
             })),
             ..Default::default()
         },
