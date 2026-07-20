@@ -35,9 +35,10 @@ done
 
 echo "Tunnel client -> $SERVER"
 echo "Point your browser/app SOCKS5 proxy at $SOCKS"
+# DHT is left ENABLED: it lets the client also find the server by its carrier
+# hash (dynamic-IP friendly) and blends with real BitTorrent DHT traffic.
 HTTP_API="${RQBIT_HTTP_API:-127.0.0.1:3030}"
 exec "$BIN" \
-    --disable-dht --disable-dht-persistence \
     --disable-tcp-listen --disable-upnp-port-forward \
     --http-api-listen-addr "$HTTP_API" \
     server start --disable-persistence "$DATA" \

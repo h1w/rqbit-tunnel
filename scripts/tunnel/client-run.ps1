@@ -34,7 +34,6 @@ Write-Host "Tunnel client -> $server"
 Write-Host "Point your browser/app SOCKS5 proxy at $socks"
 
 $rqbitArgs = @(
-    "--disable-dht", "--disable-dht-persistence",
     "--disable-tcp-listen", "--disable-upnp-port-forward",
     "--http-api-listen-addr", $httpApi,
     "server", "start", "--disable-persistence", $data,

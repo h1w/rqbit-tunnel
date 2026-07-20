@@ -58,3 +58,13 @@ pub(crate) const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Cap on the exponential reconnection backoff.
 pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+// ── DHT discovery ────────────────────────────────────────────────────────────
+
+/// Per-candidate connect+handshake timeout when trying an address (static or
+/// DHT-discovered), so a dead/poisoned DHT peer can't stall the attempt loop.
+pub(crate) const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Max recent DHT-discovered candidate addresses kept for the tunnel client to
+/// try. Bounds memory (the DHT lookup channel is drained into this cache).
+pub(crate) const DHT_PEER_CACHE: usize = 32;

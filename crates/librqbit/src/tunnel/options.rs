@@ -14,9 +14,6 @@ use super::frame::{TunnelPairingBundle, TunnelPrivateKey, TunnelPublicKey};
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TunnelConfigError {
-    #[error("client mode requires a server address")]
-    MissingServerAddress,
-
     #[error("client mode requires a pinned server public key")]
     MissingServerKey,
 
@@ -39,8 +36,11 @@ pub struct TunnelClientOptions {
     /// SOCKS5 listen address.  Defaults to loopback `127.0.0.1:0` (OS-assigned port).
     pub socks_listen: SocketAddr,
 
-    /// Address of the tunnel server to connect to.  REQUIRED — validated by `validate()`.
-    pub server_addr: SocketAddr,
+    /// Address of the tunnel server to connect to. Optional: when `None`, or as
+    /// a fallback, the client discovers the server via the DHT (looking up the
+    /// carrier hash derived from `expected_server_key`). When `Some`, it is
+    /// tried first as a fast path / static override.
+    pub server_addr: Option<SocketAddr>,
 
     /// Client identity key (Noise static key).
     pub identity_key: TunnelPrivateKey,
@@ -56,7 +56,7 @@ impl Default for TunnelClientOptions {
     fn default() -> Self {
         Self {
             socks_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
-            server_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+            server_addr: None,
             identity_key: TunnelPrivateKey([0u8; 32]),
             expected_server_key: TunnelPublicKey([0u8; 32]),
             pairing: None,
@@ -123,9 +123,9 @@ impl TunnelOptions {
     pub fn validate(&self) -> Result<(), TunnelConfigError> {
         match self {
             TunnelOptions::Client(opts) => {
-                if opts.server_addr.ip().is_unspecified() && opts.server_addr.port() == 0 {
-                    return Err(TunnelConfigError::MissingServerAddress);
-                }
+                // `server_addr` is optional (the server can be discovered via
+                // the DHT), but the pinned server key is always required — it is
+                // what authenticates the server and derives the carrier hash.
                 if opts.expected_server_key == TunnelPublicKey([0u8; 32]) {
                     return Err(TunnelConfigError::MissingServerKey);
                 }
@@ -162,18 +162,23 @@ mod tests {
     }
 
     #[test]
-    fn client_mode_requires_server_address_and_pinned_key() {
+    fn client_mode_requires_pinned_key() {
+        // No server_addr and no key -> only the missing key is an error now
+        // (the address is optional; the server can be found via DHT).
         let options = TunnelOptions::Client(TunnelClientOptions::default());
         assert!(matches!(
             options.validate(),
-            Err(TunnelConfigError::MissingServerAddress)
+            Err(TunnelConfigError::MissingServerKey)
         ));
     }
 
     #[test]
     fn client_mode_rejects_missing_server_key() {
         let mut opts = TunnelClientOptions::default();
-        opts.server_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 9090));
+        opts.server_addr = Some(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            9090,
+        )));
         // expected_server_key is still the zero sentinel
         let options = TunnelOptions::Client(opts);
         assert!(matches!(
@@ -183,9 +188,24 @@ mod tests {
     }
 
     #[test]
-    fn client_mode_passes_with_valid_config() {
+    fn client_mode_passes_with_key_and_no_address() {
+        // A pinned key with no static address is valid — DHT discovery.
         let opts = TunnelClientOptions {
-            server_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 9090)),
+            server_addr: None,
+            expected_server_key: dummy_client_key(),
+            ..Default::default()
+        };
+        let options = TunnelOptions::Client(opts);
+        assert!(options.validate().is_ok());
+    }
+
+    #[test]
+    fn client_mode_passes_with_key_and_address() {
+        let opts = TunnelClientOptions {
+            server_addr: Some(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(10, 0, 0, 1),
+                9090,
+            ))),
             expected_server_key: dummy_client_key(),
             ..Default::default()
         };

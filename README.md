@@ -111,7 +111,15 @@ connection looks like an encrypted (MSE/PE) BitTorrent peer connection.
 - **VPS → destination:** normal TCP (the VPS egresses requests to the target host).
 
 The server allowlists client public keys — only authorized clients may connect.
-No DHT, tracker, or persistence state is used for the tunnel carrier.
+
+**DHT discovery (optional).** With the DHT enabled, the server announces the
+carrier hash and the client looks it up, so the client can find the server
+without a pre-shared address (`--tunnel-server-addr` becomes optional) — which
+also survives a change of the server's IP — and the connection blends with real
+BitTorrent DHT traffic. DHT results are untrusted: the server is always
+authenticated by its pinned static key, so a wrong/poisoned address just fails
+and the next candidate is tried. A static `--tunnel-server-addr`, when given, is
+tried first as a fast path.
 
 ### Key generation
 

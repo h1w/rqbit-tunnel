@@ -259,7 +259,9 @@ struct Opts {
     )]
     pub tunnel_socks_listen: Option<SocketAddr>,
 
-    /// Tunnel server address to connect to in client mode.
+    /// Tunnel server address to connect to in client mode. Optional: if omitted,
+    /// the client discovers the server via the DHT (requires DHT enabled). When
+    /// set, it is tried first as a fast path.
     #[arg(
         long = "tunnel-server-addr",
         env = "RQBIT_TUNNEL_SERVER_ADDR",
@@ -868,9 +870,9 @@ fn build_tunnel_opts(opts: &mut Opts) -> anyhow::Result<Option<TunnelOptions>> {
                 }
                 None => None,
             };
-            let server_addr = opts
-                .tunnel_server_addr
-                .context("--tunnel-server-addr is required in client mode")?;
+            // Optional: when omitted, the client discovers the server via the
+            // DHT (using the carrier hash derived from the pinned server key).
+            let server_addr = opts.tunnel_server_addr;
 
             Ok(Some(TunnelOptions::Client(TunnelClientOptions {
                 socks_listen,

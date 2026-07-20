@@ -53,9 +53,10 @@ Starting tunnel server on 0.0.0.0:$PEER_PORT (Ctrl-C to stop) ...
 EOF
 
 # 4. Start the server (foreground).
+# DHT is left ENABLED: the server announces the carrier hash so the client can
+# discover it, and it blends the connection with real BitTorrent DHT traffic.
 HTTP_API="${RQBIT_HTTP_API:-127.0.0.1:3030}"
 exec "$BIN" \
-    --disable-dht --disable-dht-persistence \
     --disable-tcp-listen --disable-upnp-port-forward \
     --http-api-listen-addr "$HTTP_API" \
     server start --disable-persistence "$DIR/data" \
