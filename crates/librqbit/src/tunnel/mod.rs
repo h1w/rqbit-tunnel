@@ -19,6 +19,7 @@ pub(crate) mod carrier_peer;
 pub(crate) mod client;
 pub(crate) mod client_mux;
 pub(crate) mod client_supervisor;
+pub(crate) mod config;
 pub(crate) mod crypto;
 pub(crate) mod egress;
 pub(crate) mod flow;

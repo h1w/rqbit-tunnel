@@ -17,7 +17,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -28,30 +27,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::type_aliases::BoxAsyncWrite;
 
+use super::config::{CONNECT_TIMEOUT, OUTBOUND_QUEUE, PER_STREAM_QUEUE, READ_CHUNK, UDP_READ_BUF};
 use super::crypto::{NoiseTransport, TunnelCryptoError};
 use super::egress::{EgressPolicy, EgressTransport};
 use super::flow::{IdleGuard, SendCredit};
 use super::frame::{MAX_FRAME_PAYLOAD, TunnelDestination, TunnelErrorCode, TunnelFrame};
 use super::server::AdmittedPeer;
-
-// ── Tunables ────────────────────────────────────────────────────────────────
-
-/// Chunk size for reading destination sockets. Kept well under the u16 frame
-/// length limit so a single `TcpData` frame's ciphertext never overflows the
-/// 2-byte length prefix.
-const DEST_READ_BUF: usize = 16 * 1024;
-
-/// Maximum size of a UDP datagram we will read from a destination socket.
-const UDP_READ_BUF: usize = 64 * 1024;
-
-/// How long to wait for a destination TCP connection to establish.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// Bound on the outbound frame queue feeding the single writer task.
-const OUTBOUND_QUEUE: usize = 256;
-
-/// Bound on the per-stream peer→destination queue.
-const PER_STREAM_QUEUE: usize = 64;
 
 // ── Shared wire helpers ─────────────────────────────────────────────────────
 
@@ -94,6 +75,19 @@ impl FrameSink {
     /// has stopped (peer gone).
     pub(crate) async fn send(&self, frame: TunnelFrame) -> bool {
         self.tx.send(frame).await.is_ok()
+    }
+
+    /// Best-effort enqueue for lossy traffic (UDP datagrams). Drops the frame
+    /// if the shared outbound queue is full instead of blocking the caller —
+    /// which would head-of-line-block every other stream on this connection.
+    /// Returns `false` only if the peer connection is gone.
+    pub(crate) fn try_send_lossy(&self, frame: TunnelFrame) -> bool {
+        use mpsc::error::TrySendError;
+        match self.tx.try_send(frame) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => true, // dropped; connection still alive
+            Err(TrySendError::Closed(_)) => false,
+        }
     }
 }
 
@@ -501,7 +495,7 @@ async fn open_and_pump(
 
     // destination → peer (runs in this task). Reserve send credit before each
     // chunk so we never overrun the peer's receive window.
-    let mut buf = vec![0u8; DEST_READ_BUF];
+    let mut buf = vec![0u8; READ_CHUNK];
     let mut result_code: Option<TunnelErrorCode> = None;
     loop {
         let read = tokio::select! {
@@ -573,14 +567,13 @@ async fn udp_recv_loop(
         match recv {
             Ok((n, src)) => {
                 idle.poke();
-                let sent = sink
-                    .send(TunnelFrame::UdpDatagram {
-                        association_id,
-                        destination: TunnelDestination::Ip(src),
-                        bytes: Bytes::copy_from_slice(&buf[..n]),
-                    })
-                    .await;
-                if !sent {
+                // Lossy: drop under congestion rather than stall other streams.
+                let alive = sink.try_send_lossy(TunnelFrame::UdpDatagram {
+                    association_id,
+                    destination: TunnelDestination::Ip(src),
+                    bytes: Bytes::copy_from_slice(&buf[..n]),
+                });
+                if !alive {
                     break;
                 }
             }

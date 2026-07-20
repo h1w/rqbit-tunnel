@@ -10,7 +10,6 @@
 //     streams on the dead connection are reset, new ones use the fresh mux.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
 use librqbit_core::Id20;
@@ -18,10 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::client::TunnelClient;
 use super::client_mux::ClientMux;
+use super::config::{INITIAL_BACKOFF, MAX_BACKOFF};
 use super::options::TunnelClientOptions;
-
-const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Owns the "current" [`ClientMux`] and keeps it connected.
 pub(crate) struct TunnelClientSupervisor {

@@ -22,9 +22,7 @@ use std::time::Duration;
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-/// Initial per-stream receive window (bytes). Both peers assume this much
-/// credit at stream open, so no window-advertisement handshake is needed.
-pub(crate) const INITIAL_WINDOW: usize = 256 * 1024;
+use super::config::INITIAL_WINDOW;
 
 // ── Credit-based flow control ───────────────────────────────────────────────
 

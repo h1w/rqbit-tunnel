@@ -21,6 +21,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::client::TunnelClient;
+use super::config::PER_CONN_QUEUE;
 use super::crypto::NoiseTransport;
 use super::flow::SendCredit;
 use super::frame::{TunnelDestination, TunnelErrorCode, TunnelFrame};
@@ -41,8 +42,6 @@ pub(crate) enum InboundUdp {
         bytes: Bytes,
     },
 }
-
-const PER_CONN_QUEUE: usize = 128;
 
 /// Per-TCP-stream client state.
 struct TcpRoute {
@@ -181,19 +180,19 @@ impl ClientMux {
         }
     }
 
-    pub(crate) async fn send_udp_datagram(
+    /// Best-effort send of an outbound UDP datagram. Drops under congestion
+    /// (correct UDP semantics); returns `false` only if the tunnel is gone.
+    pub(crate) fn send_udp_datagram(
         &self,
         association_id: u64,
         destination: TunnelDestination,
         bytes: Bytes,
     ) -> bool {
-        self.sink
-            .send(TunnelFrame::UdpDatagram {
-                association_id,
-                destination,
-                bytes,
-            })
-            .await
+        self.sink.try_send_lossy(TunnelFrame::UdpDatagram {
+            association_id,
+            destination,
+            bytes,
+        })
     }
 
     pub(crate) async fn close_udp(&self, association_id: u64) {
@@ -258,7 +257,9 @@ async fn reader_loop(
             } => {
                 let tx = udp.lock().await.get(&association_id).cloned();
                 if let Some(tx) = tx {
-                    let _ = tx.send(InboundUdp::Datagram { destination, bytes }).await;
+                    // Lossy: drop under congestion so a slow UDP consumer never
+                    // stalls the shared reader (and thus every TCP stream).
+                    let _ = tx.try_send(InboundUdp::Datagram { destination, bytes });
                 }
             }
             // Pong / other server-origin frames need no client action.

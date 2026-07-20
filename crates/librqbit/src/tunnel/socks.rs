@@ -11,7 +11,6 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use fast_socks5::server::{AcceptAuthentication, Config, DenyAuthentication, Socks5Socket};
@@ -23,15 +22,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::client_mux::{ClientMux, InboundTcp, InboundUdp};
 use super::client_supervisor::TunnelClientSupervisor;
+use super::config::{OPEN_TIMEOUT, READ_CHUNK};
 use super::flow::SendCredit;
 use super::frame::{TunnelDestination, TunnelErrorCode};
 use super::socks_udp::{encode_socks_udp_datagram, parse_socks_udp_datagram};
-
-/// How long to wait for the server's `TcpOpened`/`TcpReset` after `OpenTcp`.
-const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Buffer size for reading the local SOCKS TCP stream.
-const LOCAL_READ_BUF: usize = 16 * 1024;
 
 // ── Error type ──────────────────────────────────────────────────────────────
 
@@ -274,7 +268,7 @@ async fn pump_tcp(
     // local → tunnel: reserve flow-control credit before each chunk.
     let send_mux = Arc::clone(&mux);
     let send_handle = tokio::spawn(async move {
-        let mut buf = vec![0u8; LOCAL_READ_BUF];
+        let mut buf = vec![0u8; READ_CHUNK];
         loop {
             match local_read.read(&mut buf).await {
                 Ok(0) => {
@@ -353,10 +347,11 @@ async fn handle_udp(
             *l2t_addr.lock().await = Some(src);
             match parse_socks_udp_datagram(&buf[..n]) {
                 Ok((destination, payload)) => {
-                    if !l2t_mux
-                        .send_udp_datagram(assoc_id, destination, Bytes::copy_from_slice(payload))
-                        .await
-                    {
+                    if !l2t_mux.send_udp_datagram(
+                        assoc_id,
+                        destination,
+                        Bytes::copy_from_slice(payload),
+                    ) {
                         break;
                     }
                 }
