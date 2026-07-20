@@ -164,6 +164,34 @@ a latency-under-load probe.
 - `Ping/Pong` addition must stay backward-tolerant (unknown-frame handling).
 - Per-client egress limit semantics change with N connections (documented above).
 
+## Results (Plan 1 — multi-carrier)
+
+Measured 2026-07-20 with the local delay-proxy harness (in-process origin ~24
+Gbit/s ceiling; a single userspace proxy carrying all N carrier connections; 8
+parallel curl streams unless noted). Lossless localhost — this isolates the
+tunnel's own scaling and does NOT reproduce real-path packet loss.
+
+| RTT | carriers | streams | throughput |
+|-----|----------|---------|-----------|
+| 0 ms (direct) | 1 | 8 | 1254 Mbit/s |
+| 0 ms (direct) | 4 | 8 | **3509 Mbit/s (2.8×)** |
+| 100 ms | 1 | 8 | 1100 Mbit/s |
+| 100 ms | 4 | 8 | **1604 Mbit/s (1.46×)** |
+| 100 ms | 4 | 1 | 305 Mbit/s |
+
+- **Multi-carrier lifts the single-core crypto ceiling**: N independent Noise
+  sessions encrypt in parallel across cores (0 ms: 1254 → 3509 Mbit/s). A real
+  gain even with no loss.
+- The 100 ms N=4 number is limited by the single Python proxy's CPU at these
+  rates (not the tunnel); the parallel-crypto benefit still shows (1.46×).
+- **Single-stream at 100 ms is unchanged** (~305 Mbit ≈ 4 MiB window / RTT) —
+  Plan 1 deliberately does not touch the per-stream window; that is Plan 2
+  (adaptive window / B2).
+- **Not shown on lossless localhost**: the primary real-world win — N parallel
+  TCP flows are far more loss-tolerant than one, which is what caused the user's
+  upload collapse (542→33) and download halving (532→225). Demonstrating it
+  needs an actual lossy path (or `tc netem`, which needs root).
+
 ## Future work (out of scope)
 
 - **UDP/QUIC carrier with own (BBR-style) congestion control** — removes
