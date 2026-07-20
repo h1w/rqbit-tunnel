@@ -45,6 +45,8 @@ $(cat "$DIR/keys/server.pub")
 2) Start the client:
      Linux:    ./client-run.sh $PUBIP:$PEER_PORT
      Windows:  double-click client-run.bat  (enter $PUBIP:$PEER_PORT when asked)
+   The address is the reliable fast path. You may instead leave it EMPTY to let
+   the client find this server via the DHT (slower; needs this port reachable).
 
 3) Point your browser/app SOCKS5 proxy at 127.0.0.1:1080.
 ======================================================================
