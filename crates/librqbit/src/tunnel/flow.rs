@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+use super::config;
 use super::config::{DEFAULT_WINDOW, RTT_EWMA_DEN, RTT_EWMA_NUM};
 
 // ── Credit-based flow control ───────────────────────────────────────────────
@@ -205,6 +206,78 @@ fn ewma_step(smooth: Duration, sample: Duration) -> Duration {
         smooth_nanos - delta * u64::from(RTT_EWMA_NUM) / u64::from(RTT_EWMA_DEN)
     };
     Duration::from_nanos(new_nanos)
+}
+
+// ── Delay-adaptive window controller (Vegas/LEDBAT-style AIMD) ──────────────
+//
+// Pure, no I/O: driven once per RTT sample by whoever owns the carrier's
+// `RttEstimator` (the ping task). Watches `queuing_delay` (smoothed RTT minus
+// the running-minimum, no-queuing RTT) as the congestion signal instead of
+// loss, so it backs off before a bottleneck buffer actually overflows —
+// standard TCP Vegas / LEDBAT low-latency-first stance, appropriate for an
+// interactive tunnel that would rather cap latency than max out throughput.
+
+/// Per-carrier controller over an in-flight target (bytes), driven by
+/// self-inflicted queuing delay. Additive-increase while the link is
+/// utilized and queuing delay stays low; multiplicative-decrease as soon as
+/// queuing delay rises, before a real loss-based signal would ever fire.
+pub(crate) struct WindowController {
+    target: usize,
+}
+
+impl WindowController {
+    /// A fresh controller, starting at the conservative floor
+    /// (`config::MIN_TARGET`) rather than assuming the link can already take
+    /// the max.
+    pub(crate) fn new() -> Self {
+        Self {
+            target: config::MIN_TARGET,
+        }
+    }
+
+    /// One control step, called once per RTT sample.
+    ///
+    /// `queuing_delay` is `rtt_smooth - rtt_min` from the carrier's
+    /// `RttEstimator`. `utilized` is whether the carrier actually hit send
+    /// backpressure (credit exhausted on some stream) since the last step —
+    /// growth is gated on this so an idle low-delay link doesn't get its
+    /// target inflated for no reason (there's no evidence yet that a bigger
+    /// window would even be used, let alone that the link can sustain it).
+    ///
+    /// Backoff, by contrast, isn't gated on utilization: a high queuing delay
+    /// means something (even a long-past burst) is still draining through a
+    /// buffer, so it always takes precedence over growth/hold.
+    pub(crate) fn step(&mut self, queuing_delay: Duration, utilized: bool) {
+        if queuing_delay > config::QUEUING_DELAY_HIGH {
+            self.target = self.target * config::TARGET_BACKOFF_NUM / config::TARGET_BACKOFF_DEN;
+        } else if utilized && queuing_delay < config::QUEUING_DELAY_LOW {
+            self.target = self.target.saturating_add(config::TARGET_GROW_STEP);
+        }
+        // else: delay is in [LOW, HIGH], or low-but-idle — hold.
+
+        self.target = self.target.clamp(config::MIN_TARGET, config::MAX_TARGET);
+    }
+
+    /// The current per-carrier in-flight target (bytes).
+    pub(crate) fn target(&self) -> usize {
+        self.target
+    }
+
+    /// Per-stream window = the carrier's target split evenly across
+    /// `active_streams`, clamped to `[MIN_WINDOW, MAX_WINDOW]`. Zero active
+    /// streams is treated as one (no divide-by-zero, and a carrier with no
+    /// streams yet should still hand out a sane starting window to the next
+    /// one that opens).
+    pub(crate) fn per_stream_window(&self, active_streams: usize) -> usize {
+        let divisor = active_streams.max(1);
+        (self.target / divisor).clamp(config::MIN_WINDOW, config::MAX_WINDOW)
+    }
+}
+
+impl Default for WindowController {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── Writer-side pacing (token bucket) ───────────────────────────────────────
@@ -400,6 +473,192 @@ mod tests {
         assert!(
             delay2 < 1_000_000,
             "expected ~0ns delay once refilled after waiting out the prior debt, got {delay2}"
+        );
+    }
+
+    #[test]
+    fn window_controller_starts_at_min_target() {
+        let ctl = WindowController::new();
+        assert_eq!(ctl.target(), config::MIN_TARGET);
+    }
+
+    #[test]
+    fn window_controller_grows_additively_while_low_delay_and_utilized() {
+        let mut ctl = WindowController::new();
+        let low_delay = Duration::from_millis(1);
+
+        ctl.step(low_delay, true);
+        assert_eq!(
+            ctl.target(),
+            config::MIN_TARGET + config::TARGET_GROW_STEP,
+            "one utilized low-delay step should grow by exactly one grow-step"
+        );
+
+        ctl.step(low_delay, true);
+        assert_eq!(
+            ctl.target(),
+            config::MIN_TARGET + 2 * config::TARGET_GROW_STEP,
+            "growth should accumulate additively across steps"
+        );
+    }
+
+    #[test]
+    fn window_controller_growth_clamps_at_max_target_without_overflow() {
+        let mut ctl = WindowController::new();
+        let low_delay = Duration::from_millis(1);
+
+        // Many more steps than needed to reach MAX_TARGET from MIN_TARGET.
+        let steps = (config::MAX_TARGET / config::TARGET_GROW_STEP) + 100;
+        for _ in 0..steps {
+            ctl.step(low_delay, true);
+        }
+
+        assert_eq!(
+            ctl.target(),
+            config::MAX_TARGET,
+            "target must clamp at MAX_TARGET and never overflow past it"
+        );
+    }
+
+    #[test]
+    fn window_controller_idle_low_delay_does_not_grow() {
+        let mut ctl = WindowController::new();
+        let low_delay = Duration::from_millis(1);
+
+        ctl.step(low_delay, false);
+        assert_eq!(
+            ctl.target(),
+            config::MIN_TARGET,
+            "an idle (non-utilized) low-delay step must hold, not grow"
+        );
+
+        ctl.step(low_delay, false);
+        assert_eq!(
+            ctl.target(),
+            config::MIN_TARGET,
+            "repeated idle low-delay steps must still hold"
+        );
+    }
+
+    #[test]
+    fn window_controller_high_delay_backs_off_multiplicatively() {
+        let mut ctl = WindowController::new();
+        let low_delay = Duration::from_millis(1);
+        let high_delay = Duration::from_millis(50);
+
+        // Grow a bit first so the backoff has room to show a real decrease.
+        for _ in 0..10 {
+            ctl.step(low_delay, true);
+        }
+        let grown = ctl.target();
+        assert!(grown > config::MIN_TARGET);
+
+        ctl.step(high_delay, true);
+        let expected = (grown * config::TARGET_BACKOFF_NUM / config::TARGET_BACKOFF_DEN)
+            .max(config::MIN_TARGET);
+        assert_eq!(
+            ctl.target(),
+            expected,
+            "a high-delay step should multiply target by TARGET_BACKOFF_NUM/DEN"
+        );
+
+        // utilized=false during high delay must still back off (backoff isn't
+        // gated on utilization the way growth is).
+        let before = ctl.target();
+        ctl.step(high_delay, false);
+        let expected2 = (before * config::TARGET_BACKOFF_NUM / config::TARGET_BACKOFF_DEN)
+            .max(config::MIN_TARGET);
+        assert_eq!(ctl.target(), expected2);
+    }
+
+    #[test]
+    fn window_controller_high_delay_backoff_floors_at_min_target() {
+        let mut ctl = WindowController::new();
+        let high_delay = Duration::from_millis(50);
+
+        // Already at MIN_TARGET: repeated backoff must never go below it.
+        for _ in 0..20 {
+            ctl.step(high_delay, true);
+            assert!(
+                ctl.target() >= config::MIN_TARGET,
+                "target must never drop below MIN_TARGET"
+            );
+        }
+        assert_eq!(ctl.target(), config::MIN_TARGET);
+    }
+
+    #[test]
+    fn window_controller_mid_range_delay_holds() {
+        let mut ctl = WindowController::new();
+        let low_delay = Duration::from_millis(1);
+        let mid_delay = Duration::from_millis(10); // between LOW (5ms) and HIGH (25ms)
+
+        // Grow a bit so we're off MIN_TARGET, to distinguish "hold" from
+        // "floored at MIN anyway".
+        for _ in 0..5 {
+            ctl.step(low_delay, true);
+        }
+        let before = ctl.target();
+
+        ctl.step(mid_delay, true);
+        assert_eq!(
+            ctl.target(),
+            before,
+            "delay strictly between LOW and HIGH must hold, neither grow nor back off"
+        );
+
+        ctl.step(mid_delay, false);
+        assert_eq!(
+            ctl.target(),
+            before,
+            "mid-range delay holds regardless of utilization"
+        );
+    }
+
+    #[test]
+    fn per_stream_window_splits_target_across_active_streams() {
+        let mut ctl = WindowController::new();
+        let low_delay = Duration::from_millis(1);
+
+        // Grow target to exactly 1 MiB.
+        while ctl.target() < 1024 * 1024 {
+            ctl.step(low_delay, true);
+        }
+        assert_eq!(ctl.target(), 1024 * 1024);
+
+        assert_eq!(
+            ctl.per_stream_window(4),
+            256 * 1024,
+            "1 MiB target split across 4 active streams should be 256 KiB"
+        );
+    }
+
+    #[test]
+    fn per_stream_window_clamps_to_min_and_max() {
+        let mut ctl = WindowController::new();
+
+        // At MIN_TARGET, splitting across many streams must clamp up to
+        // MIN_WINDOW rather than returning something tiny.
+        assert_eq!(ctl.per_stream_window(1000), config::MIN_WINDOW);
+
+        // Growing to MAX_TARGET with a single active stream must clamp down
+        // to MAX_WINDOW rather than handing one stream the whole target.
+        let low_delay = Duration::from_millis(1);
+        let steps = (config::MAX_TARGET / config::TARGET_GROW_STEP) + 10;
+        for _ in 0..steps {
+            ctl.step(low_delay, true);
+        }
+        assert_eq!(ctl.target(), config::MAX_TARGET);
+        assert_eq!(ctl.per_stream_window(1), config::MAX_WINDOW);
+    }
+
+    #[test]
+    fn per_stream_window_treats_zero_active_streams_as_one() {
+        let ctl = WindowController::new();
+        assert_eq!(
+            ctl.per_stream_window(0),
+            ctl.per_stream_window(1),
+            "0 active streams must not divide-by-zero and should behave like 1"
         );
     }
 

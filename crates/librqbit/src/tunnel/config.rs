@@ -32,6 +32,30 @@ pub(crate) const DEFAULT_WINDOW: usize = 256 * 1024;
 pub(crate) const MIN_WINDOW: usize = 64 * 1024;
 pub(crate) const MAX_WINDOW: usize = 4 * 1024 * 1024;
 
+/// Clamp bounds for the per-carrier in-flight target driven by
+/// `flow::WindowController` (delay-adaptive AIMD over `RttEstimator`'s
+/// `queuing_delay`).
+pub(crate) const MIN_TARGET: usize = 256 * 1024;
+pub(crate) const MAX_TARGET: usize = 16 * 1024 * 1024;
+
+/// Below this queuing delay (and while the carrier is actually utilized), the
+/// link isn't self-inflicting bufferbloat, so `WindowController` grows the
+/// target additively.
+pub(crate) const QUEUING_DELAY_LOW: Duration = Duration::from_millis(5);
+
+/// Above this queuing delay, the carrier is buffering under its own load, so
+/// `WindowController` backs the target off multiplicatively.
+pub(crate) const QUEUING_DELAY_HIGH: Duration = Duration::from_millis(25);
+
+/// Additive per-step growth of the in-flight target while queuing delay stays
+/// low and the carrier is utilized.
+pub(crate) const TARGET_GROW_STEP: usize = 128 * 1024;
+
+/// Multiplicative backoff factor (`NUM/DEN` = 0.85) applied to the in-flight
+/// target when queuing delay exceeds `QUEUING_DELAY_HIGH`.
+pub(crate) const TARGET_BACKOFF_NUM: usize = 85;
+pub(crate) const TARGET_BACKOFF_DEN: usize = 100;
+
 // ── Queue depths ────────────────────────────────────────────────────────────
 
 /// Bound on the outbound frame queue feeding a connection's single writer task.
