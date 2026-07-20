@@ -93,6 +93,20 @@ pub(crate) const RTT_EWMA_DEN: u32 = 8;
 /// since nonces are assigned monotonically) entry is evicted first.
 pub(crate) const PING_NONCE_MAP_CAP: usize = 256;
 
+// ── Pacing (writer-side token bucket) ───────────────────────────────────────
+
+/// Default pacing rate for the frame writer's token bucket, in bytes/second.
+/// Effectively unlimited (10 GB/s) — this task lands the pacing *mechanism*
+/// only; a later controller task drives this down from congestion signals
+/// (queuing delay from `flow::RttEstimator`). At this default the bucket
+/// never meaningfully delays a frame, so throughput is unchanged.
+pub(crate) const PACING_DEFAULT_RATE: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Token bucket burst allowance, in bytes. Lets a burst of already-queued
+/// frames through immediately even at a low configured rate, so pacing only
+/// smooths sustained throughput rather than adding latency to every frame.
+pub(crate) const PACING_BURST: u64 = 256 * 1024;
+
 // ── Carriers ─────────────────────────────────────────────────────────────────
 
 /// Default number of parallel carrier connections a client opens to the server.

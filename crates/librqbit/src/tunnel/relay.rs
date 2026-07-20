@@ -16,8 +16,9 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -29,12 +30,12 @@ use tokio_util::sync::CancellationToken;
 use crate::type_aliases::BoxAsyncWrite;
 
 use super::config::{
-    CONNECT_TIMEOUT, OUTBOUND_QUEUE, PER_STREAM_QUEUE, PING_INTERVAL, PING_NONCE_MAP_CAP,
-    READ_CHUNK, UDP_READ_BUF,
+    CONNECT_TIMEOUT, OUTBOUND_QUEUE, PACING_BURST, PER_STREAM_QUEUE, PING_INTERVAL,
+    PING_NONCE_MAP_CAP, READ_CHUNK, UDP_READ_BUF,
 };
 use super::crypto::{NoiseTransport, TunnelCryptoError};
 use super::egress::{EgressPolicy, EgressTransport};
-use super::flow::{IdleGuard, RttEstimator, SendCredit, record_ping_sent};
+use super::flow::{IdleGuard, RttEstimator, SendCredit, TokenBucket, record_ping_sent};
 use super::frame::{MAX_FRAME_PAYLOAD, TunnelDestination, TunnelErrorCode, TunnelFrame};
 use super::server::AdmittedPeer;
 
@@ -97,13 +98,24 @@ impl FrameSink {
 
 /// Spawn the single writer task. It owns the write half and the shared
 /// transport, encrypting each queued frame and writing it in order.
+///
+/// `pacing_rate` is a shared bytes/second cell: the writer's token bucket
+/// re-reads it on every frame, so a later controller task can drive it down
+/// from congestion signals while this task's callers just seed it at
+/// `config::PACING_DEFAULT_RATE` (effectively unlimited).
 pub(crate) fn spawn_frame_writer(
     transport: Arc<Mutex<NoiseTransport>>,
     mut writer: BoxAsyncWrite,
     shutdown: CancellationToken,
+    pacing_rate: Arc<AtomicU64>,
 ) -> (FrameSink, JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<TunnelFrame>(OUTBOUND_QUEUE);
     let handle = tokio::spawn(async move {
+        // Base instant for the pure `TokenBucket`'s injected clock — it never
+        // calls `Instant::now()` itself, so it stays deterministically
+        // testable.
+        let base = Instant::now();
+        let mut bucket = TokenBucket::new(pacing_rate.load(Ordering::Relaxed), PACING_BURST);
         loop {
             let frame = tokio::select! {
                 _ = shutdown.cancelled() => break,
@@ -122,6 +134,18 @@ pub(crate) fn spawn_frame_writer(
                     }
                 }
             };
+
+            // Pace on the encrypted blob's length (the wire-relevant size:
+            // the ciphertext actually written, excluding only the 2-byte
+            // length prefix). Re-read the rate each iteration so a live
+            // controller update takes effect on the very next frame.
+            bucket.set_rate(pacing_rate.load(Ordering::Relaxed));
+            let now_nanos = base.elapsed().as_nanos() as u64;
+            let delay_nanos = bucket.take(now_nanos, blob.len() as u64);
+            if delay_nanos > 0 {
+                tokio::time::sleep(Duration::from_nanos(delay_nanos)).await;
+            }
+
             let len = (blob.len() as u16).to_be_bytes();
             if writer.write_all(&len).await.is_err()
                 || writer.write_all(&blob).await.is_err()
@@ -188,7 +212,11 @@ pub(crate) async fn run_server_relay(
     } = peer;
 
     let transport = Arc::new(Mutex::new(transport));
-    let (sink, writer_handle) = spawn_frame_writer(transport.clone(), writer, shutdown.clone());
+    // Phase A: seed at the effectively-unlimited default; a later controller
+    // task (Task E) can update this cell live to pace the connection.
+    let pacing_rate = Arc::new(AtomicU64::new(super::config::PACING_DEFAULT_RATE));
+    let (sink, writer_handle) =
+        spawn_frame_writer(transport.clone(), writer, shutdown.clone(), pacing_rate);
 
     let tcp: TcpMap = Arc::new(Mutex::new(HashMap::new()));
     let udp: UdpMap = Arc::new(Mutex::new(HashMap::new()));
@@ -633,5 +661,144 @@ async fn udp_recv_loop(
             // Socket error: end the association (idle handled by the watchdog).
             Err(_) => break,
         }
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use tokio::io::AsyncReadExt;
+
+    use super::super::config::PACING_DEFAULT_RATE;
+    use super::super::crypto::{
+        generate_keypair, initiator_complete, initiator_start, responder_accept,
+    };
+    use super::super::frame::TunnelPublicKey;
+    use super::*;
+
+    /// A real (in-process) authenticated Noise pair, so `spawn_frame_writer`
+    /// exercises its actual `encrypt()` call rather than a stub.
+    fn handshake_pair() -> (NoiseTransport, NoiseTransport) {
+        let (client_priv, client_pub) = generate_keypair();
+        let (server_priv, server_pub) = generate_keypair();
+        let mut allowed: HashSet<TunnelPublicKey> = HashSet::new();
+        allowed.insert(client_pub);
+
+        let (handshake, msg1) = initiator_start(&client_priv, &server_pub).unwrap();
+        let (server_transport, _remote, reply) =
+            responder_accept(&server_priv, &msg1, &allowed).unwrap();
+        let client_transport = initiator_complete(handshake, &reply).unwrap();
+        (client_transport, server_transport)
+    }
+
+    /// Run the real writer task over a real Noise transport, send `n` frames
+    /// each carrying `payload_len` bytes, and return (wall-clock elapsed,
+    /// total on-wire bytes written) by draining the raw length-prefixed
+    /// frames on the other end of an in-memory duplex pipe.
+    async fn run_writer_and_measure(
+        rate_bytes_per_s: u64,
+        n_frames: usize,
+        payload_len: usize,
+    ) -> (Duration, u64) {
+        let (client_transport, _server_transport) = handshake_pair();
+        // Sized generously so `write_all` never blocks on the reader side —
+        // this test only cares about the writer's own internal pacing delay,
+        // not pipe backpressure.
+        let (write_half, mut read_half) = tokio::io::duplex(8 * 1024 * 1024);
+
+        let shutdown = CancellationToken::new();
+        let pacing_rate = Arc::new(AtomicU64::new(rate_bytes_per_s));
+        let (sink, _handle) = spawn_frame_writer(
+            Arc::new(Mutex::new(client_transport)),
+            Box::new(write_half),
+            shutdown.clone(),
+            pacing_rate,
+        );
+
+        let start = Instant::now();
+        for i in 0..n_frames {
+            let ok = sink
+                .send(TunnelFrame::TcpData {
+                    stream_id: 1,
+                    bytes: Bytes::from(vec![0u8; payload_len]).slice(0..payload_len),
+                })
+                .await;
+            assert!(ok, "frame {i} should have been accepted by the writer");
+        }
+
+        // Drain exactly `n_frames` length-prefixed blobs off the wire; this
+        // only completes once the (possibly paced) writer has actually
+        // written every byte, so `start.elapsed()` below captures the full
+        // pacing delay, not just enqueue time.
+        let mut total_bytes: u64 = 0;
+        for _ in 0..n_frames {
+            let mut len_buf = [0u8; 2];
+            read_half.read_exact(&mut len_buf).await.unwrap();
+            let len = u16::from_be_bytes(len_buf) as usize;
+            let mut blob = vec![0u8; len];
+            read_half.read_exact(&mut blob).await.unwrap();
+            total_bytes += (2 + len) as u64;
+        }
+        let elapsed = start.elapsed();
+
+        shutdown.cancel();
+        (elapsed, total_bytes)
+    }
+
+    /// The whole point of Task C: prove the writer's `tokio::time::sleep` is
+    /// actually awaited, not merely computed and discarded (the tunnel
+    /// module's blanket `#[allow(dead_code, unused_variables)]` would let
+    /// exactly that bug compile clean and silently do nothing). At a rate far
+    /// below what's needed to carry the frames instantly, total wall-clock
+    /// time must track `deficit_bytes / rate`, not the near-zero time an
+    /// in-memory duplex pipe would otherwise take.
+    #[tokio::test]
+    async fn writer_paces_sends_at_a_low_rate() {
+        const PAYLOAD: usize = 16 * 1024; // matches READ_CHUNK
+        const N_FRAMES: usize = 18; // comfortably exceeds PACING_BURST (256 KiB)
+        const LOW_RATE: u64 = 64 * 1024; // 64 KiB/s
+
+        let (elapsed, total_bytes) = run_writer_and_measure(LOW_RATE, N_FRAMES, PAYLOAD).await;
+
+        let deficit = total_bytes.saturating_sub(PACING_BURST);
+        assert!(
+            deficit > 0,
+            "test setup should send more than one burst's worth of bytes, sent {total_bytes}"
+        );
+        let expected_delay = Duration::from_secs_f64(deficit as f64 / LOW_RATE as f64);
+
+        // A generous window: real pacing must land in the right ballpark
+        // (ruling out "no delay at all"), without making the test flaky
+        // under CI scheduling jitter.
+        assert!(
+            elapsed >= expected_delay.mul_f64(0.5),
+            "expected at least ~{expected_delay:?} of pacing delay for a {deficit}-byte \
+             deficit at {LOW_RATE} B/s, only took {elapsed:?} (total {total_bytes} bytes) \
+             — is the writer's sleep actually being awaited?"
+        );
+        assert!(
+            elapsed <= expected_delay.mul_f64(2.5) + Duration::from_millis(500),
+            "pacing delay much larger than expected: {elapsed:?} vs expected ~{expected_delay:?}"
+        );
+    }
+
+    /// No-regression companion: at the production default (effectively
+    /// unlimited) rate, the same frames must clear near-instantly — pacing
+    /// must not add meaningful latency when it isn't supposed to throttle.
+    #[tokio::test]
+    async fn writer_default_rate_does_not_pace() {
+        const PAYLOAD: usize = 16 * 1024;
+        const N_FRAMES: usize = 18;
+
+        let (elapsed, _total_bytes) =
+            run_writer_and_measure(PACING_DEFAULT_RATE, N_FRAMES, PAYLOAD).await;
+
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "default pacing rate should not meaningfully delay throughput, took {elapsed:?}"
+        );
     }
 }

@@ -25,7 +25,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::client::TunnelClient;
-use super::config::{PER_CONN_QUEUE, PING_INTERVAL, PING_NONCE_MAP_CAP};
+use super::config::{PACING_DEFAULT_RATE, PER_CONN_QUEUE, PING_INTERVAL, PING_NONCE_MAP_CAP};
 use super::crypto::NoiseTransport;
 use super::flow::{RttEstimator, SendCredit, record_ping_sent};
 use super::frame::{TunnelDestination, TunnelErrorCode, TunnelFrame};
@@ -80,8 +80,12 @@ impl ClientMux {
     pub(crate) fn new(client: TunnelClient, shutdown: CancellationToken) -> Arc<Self> {
         let (transport, reader, writer) = client.into_split();
         let transport = Arc::new(Mutex::new(transport));
+        // Phase A: seed at the effectively-unlimited default; a later
+        // controller task (Task E) can update this cell live to pace the
+        // connection.
+        let pacing_rate = Arc::new(AtomicU64::new(PACING_DEFAULT_RATE));
         let (sink, _writer_handle) =
-            spawn_frame_writer(transport.clone(), writer, shutdown.clone());
+            spawn_frame_writer(transport.clone(), writer, shutdown.clone(), pacing_rate);
 
         let tcp: TcpRoutes = Arc::new(Mutex::new(HashMap::new()));
         let udp: UdpRoutes = Arc::new(Mutex::new(HashMap::new()));

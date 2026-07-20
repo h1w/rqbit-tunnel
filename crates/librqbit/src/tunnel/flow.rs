@@ -207,6 +207,79 @@ fn ewma_step(smooth: Duration, sample: Duration) -> Duration {
     Duration::from_nanos(new_nanos)
 }
 
+// ── Writer-side pacing (token bucket) ───────────────────────────────────────
+//
+// Pure mechanism: no `Instant::now()` inside — the caller (the frame writer in
+// `relay.rs`) supplies `now_nanos` from its own clock so this stays
+// deterministically testable. Phase A wires this into the writer at a very
+// high default rate (`config::PACING_DEFAULT_RATE`), so it never meaningfully
+// delays a frame; a later controller task drives `rate_bytes_per_s` down via
+// `set_rate` from congestion signals (`RttEstimator::queuing_delay`).
+
+/// A token bucket rate limiter: bytes accrue at `rate_bytes_per_s`, capped at
+/// `burst`, and `take` reports how long the caller should wait before sending
+/// `n` more bytes.
+pub(crate) struct TokenBucket {
+    rate_bytes_per_s: u64,
+    burst: u64,
+    /// Bucket fill level in bytes. Never negative — a deficit is reported via
+    /// the returned delay instead of being carried forward as debt, so a
+    /// caller that honors the delay (sleeps before its next `take`) sees the
+    /// bucket refill exactly as if it had been draining in real time.
+    tokens: f64,
+    last_nanos: u64,
+}
+
+impl TokenBucket {
+    /// A fresh bucket, starting full (the initial burst is available
+    /// immediately — there's no reason to pace the very first frame).
+    pub(crate) fn new(rate_bytes_per_s: u64, burst: u64) -> Self {
+        Self {
+            rate_bytes_per_s,
+            burst,
+            tokens: burst as f64,
+            last_nanos: 0,
+        }
+    }
+
+    /// Update the rate in place (the seam a later controller uses to drive
+    /// pacing from congestion signals). Leaves the current fill level and
+    /// clock untouched.
+    pub(crate) fn set_rate(&mut self, rate_bytes_per_s: u64) {
+        self.rate_bytes_per_s = rate_bytes_per_s;
+    }
+
+    /// Refill based on elapsed time since the last call, consume `n` bytes,
+    /// and return the delay (nanoseconds) the caller should sleep before
+    /// sending `n`. `now_nanos` must be monotonically non-decreasing across
+    /// calls (e.g. nanos since some fixed base `Instant`).
+    pub(crate) fn take(&mut self, now_nanos: u64, n: u64) -> u64 {
+        let elapsed_nanos = now_nanos.saturating_sub(self.last_nanos);
+        self.last_nanos = now_nanos;
+
+        if self.rate_bytes_per_s > 0 && elapsed_nanos > 0 {
+            let refill = elapsed_nanos as f64 * self.rate_bytes_per_s as f64 / 1e9;
+            self.tokens = (self.tokens + refill).min(self.burst as f64);
+        }
+
+        let n = n as f64;
+        if self.tokens >= n {
+            self.tokens -= n;
+            return 0;
+        }
+
+        let deficit = n - self.tokens;
+        self.tokens = 0.0;
+        if self.rate_bytes_per_s == 0 {
+            // Fully paused: no finite delay pays off the deficit. Callers
+            // shouldn't configure rate=0 today (the default is a high cap),
+            // but avoid a div-by-zero -> NaN if they ever do.
+            return u64::MAX;
+        }
+        (deficit * 1e9 / self.rate_bytes_per_s as f64) as u64
+    }
+}
+
 // ── Inflight-ping bookkeeping (shared by the client mux + server relay) ─────
 
 /// Record that `nonce` was just sent at `now`, evicting the oldest in-flight
@@ -299,6 +372,34 @@ mod tests {
             est.rtt_min(),
             Duration::from_millis(80),
             "rtt_min should drop to a new lower sample"
+        );
+    }
+
+    #[test]
+    fn token_bucket_burst_then_paces_then_refills() {
+        let mut bucket = TokenBucket::new(1000, 1000);
+
+        // The initial burst allowance covers the first 1000 bytes for free.
+        assert_eq!(
+            bucket.take(0, 1000),
+            0,
+            "burst should cover the first take in full"
+        );
+
+        // Immediately (no elapsed time) asking for another 100 bytes exceeds
+        // the now-exhausted bucket: the delay should be ~100/1000s = 1e8ns.
+        let delay = bucket.take(0, 100);
+        assert!(
+            (delay as i64 - 100_000_000i64).abs() < 1_000_000,
+            "expected ~1e8ns delay for a 100-byte deficit at rate 1000, got {delay}"
+        );
+
+        // After the 0.1s the previous delay demanded has actually elapsed,
+        // the bucket has refilled enough to cover another 100 bytes for free.
+        let delay2 = bucket.take(100_000_000, 100);
+        assert!(
+            delay2 < 1_000_000,
+            "expected ~0ns delay once refilled after waiting out the prior debt, got {delay2}"
         );
     }
 
