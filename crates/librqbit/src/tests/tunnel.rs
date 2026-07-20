@@ -664,13 +664,14 @@ async fn build_real_relay_pair() -> (
 }
 
 /// Transfer more than one flow-control window through the real relay against a
-/// real loopback echo server. A payload larger than `INITIAL_WINDOW` can only
-/// complete if credit is granted and replenished in BOTH directions — so this
-/// exercises the whole credit machinery end-to-end without deadlocking.
+/// real loopback echo server. A payload larger than `OPEN_WINDOW` (the fixed
+/// per-stream open window) can only complete if credit is granted and
+/// replenished in BOTH directions — so this exercises the whole credit
+/// machinery end-to-end without deadlocking.
 #[tokio::test]
 async fn real_relay_transfers_large_payload_with_flow_control() {
     use crate::tunnel::client_mux::{ClientMux, InboundTcp};
-    use crate::tunnel::config::INITIAL_WINDOW;
+    use crate::tunnel::config::OPEN_WINDOW;
     use crate::tunnel::egress::EgressPolicy;
     use crate::tunnel::relay::run_server_relay;
     use std::net::{Ipv4Addr, SocketAddrV4};
@@ -716,7 +717,7 @@ async fn real_relay_transfers_large_payload_with_flow_control() {
 
     // Exceed the flow window so credit must be granted AND replenished in both
     // directions (a single window would complete without any replenishment).
-    let total: usize = 2 * INITIAL_WINDOW + 512 * 1024;
+    let total: usize = 2 * OPEN_WINDOW + 512 * 1024;
     const CHUNK: usize = 16 * 1024;
 
     // Sender: respects flow-control credit.
@@ -901,6 +902,258 @@ async fn client_mux_load_does_not_leak_on_server_tcp_reset() {
     .expect("mux.load() did not return to 0 after server TcpReset (leaked)");
 
     token.cancel();
+}
+
+// ── Per-carrier RTT measurement (Ping/Pong) ─────────────────────────────────
+
+/// The tunnel module has `#![allow(dead_code, unused_variables)]`, so the
+/// compiler will happily accept a ping task that's spawned but never fires,
+/// or an `RttEstimator` that's constructed but never fed. This test proves
+/// the wiring is actually LIVE end-to-end: mirrors `build_real_relay_pair` +
+/// `ClientMux::new` + `run_server_relay` from
+/// `real_relay_transfers_large_payload_with_flow_control` above (a real
+/// Noise-encrypted client/server pair, no echo-fixture indirection), then
+/// polls `ClientMux::rtt_for_test()` until `rtt_smooth()` turns non-zero —
+/// which can only happen if the client's ping task actually sent a `Ping`
+/// and the server actually replied with a matching `Pong` that the reader
+/// actually recorded.
+#[tokio::test]
+async fn client_mux_rtt_estimator_becomes_live_via_ping_pong() {
+    use crate::tunnel::client_mux::ClientMux;
+    use crate::tunnel::egress::EgressPolicy;
+    use crate::tunnel::relay::run_server_relay;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    crate::tests::test_util::setup_test_logging();
+
+    let (client, peer) = build_real_relay_pair().await;
+    let token = CancellationToken::new();
+
+    let relay_token = token.clone();
+    tokio::spawn(async move {
+        run_server_relay(peer, Arc::new(EgressPolicy::default()), relay_token).await;
+    });
+
+    let mux = ClientMux::new(client, token.clone());
+
+    // Before any Pong round-trips, both readings are zero.
+    let (initial_min, initial_smooth) = mux.rtt_for_test();
+    assert_eq!(initial_min, Duration::ZERO);
+    assert_eq!(initial_smooth, Duration::ZERO);
+
+    crate::tests::test_util::wait_until(
+        || {
+            let (_, smooth) = mux.rtt_for_test();
+            if smooth > Duration::ZERO {
+                Ok(())
+            } else {
+                anyhow::bail!("rtt_smooth is still zero")
+            }
+        },
+        Duration::from_secs(3),
+    )
+    .await
+    .expect("rtt_smooth should become non-zero once Ping/Pong round trips are recorded");
+
+    let (rtt_min, rtt_smooth) = mux.rtt_for_test();
+    assert!(
+        rtt_min > Duration::ZERO,
+        "rtt_min should also be non-zero once a sample lands, got {rtt_min:?}"
+    );
+    assert!(
+        rtt_smooth >= rtt_min,
+        "smoothed RTT must never be below the running minimum: smooth={rtt_smooth:?} min={rtt_min:?}"
+    );
+    // Real in-process loopback round trip: should be well under a second.
+    assert!(
+        rtt_smooth < Duration::from_secs(1),
+        "unexpectedly large in-process RTT: {rtt_smooth:?}"
+    );
+
+    token.cancel();
+}
+
+// ── Controller-driven adaptive window + pacing (Task E liveness) ────────────
+
+/// The payoff wiring test. The tunnel module's `#![allow(dead_code,
+/// unused_variables)]` means a controller that's stepped-but-whose-output-never-
+/// reaches-the-actuators, or a `pacing_rate` written to a cell the writer never
+/// reads, compiles clean and silently no-ops. This proves the loop is LIVE
+/// end-to-end: it mirrors the RTT-liveness harness (`build_real_relay_pair` +
+/// `ClientMux::new` + `run_server_relay` — a real Noise-encrypted client/server
+/// pair) and runs a SUSTAINED bulk transfer through one stream to a DRAINING
+/// loopback sink. It asserts:
+///
+///   (a) the control loop drives the SHARED `pacing_rate` cell — the exact
+///       `Arc` the writer re-reads per frame — off `PACING_DEFAULT_RATE` to a
+///       finite, positive `target / rtt`. Driving that cell only happens inside
+///       `drive_flow_control`, which ALSO steps the `WindowController`, so a
+///       driven pacing rate proves the whole RTT→controller→pacing_rate loop
+///       ran and the writer shares the cell. (The controller's growth *logic*
+///       — slow-start doubling, additive post-congestion — is proved
+///       deterministically by the `flow.rs` unit tests; and the writer→`paced`
+///       half of the utilization signal by `relay.rs`'s writer tests, on the
+///       exact same `Arc`. We deliberately do NOT assert a specific grown
+///       `target` here: on lossless in-process loopback the ping shares the
+///       paced bulk writer queue, so RTT self-inflates to seconds under load
+///       and the delay-based controller's ramp is genuinely non-deterministic
+///       — that behaviour is tuned against a real bandwidth-delay harness, not
+///       pinned by a loopback unit test.)
+///
+///   (b) every stream opens with the fixed generous `OPEN_WINDOW` — proving the
+///       generous window actually reaches `SendCredit::with_window` and keeping
+///       the "queue ≥ window" invariant honest — and that the open window is a
+///       FIXED backstop that does not track the controller (pacing, not the
+///       window, is the in-flight control).
+#[tokio::test]
+async fn controller_drives_adaptive_window_and_pacing_live() {
+    use crate::tunnel::client_mux::{ClientMux, InboundTcp};
+    use crate::tunnel::config::{MAX_TARGET, MIN_TARGET, OPEN_WINDOW, PACING_DEFAULT_RATE};
+    use crate::tunnel::egress::EgressPolicy;
+    use crate::tunnel::relay::run_server_relay;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
+
+    crate::tests::test_util::setup_test_logging();
+
+    // Draining loopback sink: read and discard forever, so the server keeps
+    // granting the client credit and the transfer stays sustained (a
+    // non-draining "hold" sink would stall once one window + socket buffers
+    // fill, starving the utilization signal the controller needs).
+    let sink = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let sink_addr = sink.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = sink.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                loop {
+                    match s.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            });
+        }
+    });
+
+    let (client, peer) = build_real_relay_pair().await;
+    let token = CancellationToken::new();
+    let relay_token = token.clone();
+    tokio::spawn(async move {
+        run_server_relay(peer, Arc::new(EgressPolicy::default()), relay_token).await;
+    });
+
+    let mux = ClientMux::new(client, token.clone());
+
+    // Before any data moves or any RTT sample lands, the controller sits at its
+    // floor and the SHARED pacing cell holds the untouched default.
+    assert_eq!(mux.controller_target_for_test(), MIN_TARGET);
+    assert_eq!(mux.pacing_rate_for_test(), PACING_DEFAULT_RATE);
+
+    let (stream_id, mut inbound, credit) = mux
+        .open_tcp(TunnelDestination::Ip(sink_addr))
+        .await
+        .expect("open_tcp");
+    match inbound.recv().await {
+        Some(InboundTcp::Opened(_)) => {}
+        _ => panic!("expected TcpOpened verdict, stream was not established"),
+    }
+    // Every stream opens with the fixed generous `OPEN_WINDOW` (proving the
+    // window actually reaches `SendCredit::with_window`). It does NOT track the
+    // controller — pacing at `target / rtt`, not this window, is the in-flight
+    // control — so it stays `OPEN_WINDOW` even after the target grows below.
+    assert_eq!(mux.last_open_window_for_test(), OPEN_WINDOW);
+
+    // Continuously pump data through the stream, respecting flow-control credit,
+    // until the test cancels the token.
+    let pump_token = token.clone();
+    let send_mux = mux.clone();
+    let pump = tokio::spawn(async move {
+        const CHUNK: usize = 16 * 1024;
+        let chunk = Bytes::from(vec![0u8; CHUNK]);
+        loop {
+            if pump_token.is_cancelled() {
+                break;
+            }
+            let reserved = tokio::select! {
+                _ = pump_token.cancelled() => false,
+                ok = credit.reserve(CHUNK) => ok,
+            };
+            if !reserved {
+                break;
+            }
+            if !send_mux.send_tcp_data(stream_id, chunk.clone()).await {
+                break;
+            }
+        }
+    });
+
+    // (a) Wait until the control loop has driven the SHARED `pacing_rate` cell
+    // off the untouched default. This happens on the first tick after the first
+    // `Pong` lands (`rtt_smooth > 0`), so it's robust: it does not depend on the
+    // delay-based controller's (loopback-unstable) ramp, only on the loop
+    // actually running `drive_flow_control` against a live RTT sample. Settles
+    // within a couple of `PING_INTERVAL` (250 ms) ticks under sustained load.
+    crate::tests::test_util::wait_until(
+        || {
+            let rate = mux.pacing_rate_for_test();
+            if rate != PACING_DEFAULT_RATE {
+                Ok(())
+            } else {
+                anyhow::bail!("pacing_rate still at default {rate}")
+            }
+        },
+        Duration::from_secs(15),
+    )
+    .await
+    .expect("control loop should drive pacing_rate off the default under sustained load");
+
+    // Confirm the actuator the wait gated on: the SHARED cell the writer
+    // re-reads per frame now holds a finite, positive `target / rtt` — not the
+    // effectively-unlimited default. Driving it proves the whole
+    // RTT→controller→pacing_rate loop ran (only `drive_flow_control` writes this
+    // cell, and it also steps the controller).
+    let rate = mux.pacing_rate_for_test();
+    assert_ne!(
+        rate, PACING_DEFAULT_RATE,
+        "pacing_rate (the SHARED cell the writer re-reads) must have been driven \
+         off the default to target/rtt by the control loop"
+    );
+    assert!(rate > 0, "pacing_rate must stay positive, got {rate}");
+    // The controller is being stepped every tick; its target stays within its
+    // clamp bounds. (Its exact value under loopback self-congestion is not
+    // pinned — see the doc comment.)
+    let target = mux.controller_target_for_test();
+    assert!(
+        (MIN_TARGET..=MAX_TARGET).contains(&target),
+        "controller target must stay within [MIN_TARGET, MAX_TARGET], got {target}"
+    );
+
+    // (b) A stream opened now must STILL open at the fixed generous
+    // `OPEN_WINDOW`, unchanged by the controller. This is the regression guard
+    // for the frozen/derived-window bug: the open window is a fixed backstop,
+    // and pacing (driven above) is the sole in-flight control.
+    let (_sid2, _rx2, _cr2) = mux
+        .open_tcp(TunnelDestination::Ip(sink_addr))
+        .await
+        .expect("open second stream");
+    let win2 = mux.last_open_window_for_test();
+    assert_eq!(
+        win2, OPEN_WINDOW,
+        "second stream must open at the fixed generous OPEN_WINDOW regardless of \
+         controller state (got window {win2})"
+    );
+
+    token.cancel();
+    let _ = pump.await;
 }
 
 // ── CarrierPool live-pool distribution + carrier-loss coverage ─────────────

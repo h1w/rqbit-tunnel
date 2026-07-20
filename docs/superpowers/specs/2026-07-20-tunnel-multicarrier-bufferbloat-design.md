@@ -192,6 +192,35 @@ tunnel's own scaling and does NOT reproduce real-path packet loss.
   upload collapse (542→33) and download halving (532→225). Demonstrating it
   needs an actual lossy path (or `tc netem`, which needs root).
 
+## Results (Plan 2 — adaptive window / bufferbloat)
+
+Measured 2026-07-21 on the 100 ms delay-proxy harness, default config (multi-carrier
++ adaptive window + pacing + control-frame priority lane). The mechanism landed in
+two passes: the first cut had a broken queue invariant, a window frozen at open, a
+slow ramp, and — fatally — RTT self-poisoning (Ping queued behind paced data →
+controller locked at MIN_TARGET). The rework fixed all of it:
+
+| Metric | pre-B2 | B2 (reworked) |
+|--------|--------|---------------|
+| Idle latency | 0.205 s | 0.204 s |
+| **Loaded latency (6× bulk saturation)** | **0.652 / 1.902 s** | **0.204 s** (= idle) |
+| Cold single-stream | — | 106 → **218 Mbit/s** (~1 s ramp) |
+| Extra stream *during* saturation | — | **221 Mbit/s** (aggregate ≈ 1 Gbit) |
+
+**Both goals met together:** loaded latency stays pinned at the base RTT (bufferbloat
+gone) while a single stream still reaches ~218 Mbit and the tunnel carries ~1 Gbit
+aggregate. The keys were: (1) size receive queues from the max window (no HOL when the
+window grows); (2) a generous fixed per-stream window with **pacing at `target/RTT`**
+as the sole in-flight control (bounds aggregate → latency; a lone stream still gets the
+full paced rate → throughput); (3) slow-start ramp; (4) `utilized` = pacing actually
+binding; (5) a **priority lane** so Ping/Pong/Credit are never delayed by paced data
+(RTT stays clean). UDP is left unpaced.
+
+Caveat: lossless loopback cannot exercise the delay-driven back-off (queuing delay >
+HIGH → multiplicative decrease); that path is unit-tested but needs a real lossy/slow
+link to validate end-to-end. Tunables (`MAX_TARGET`, `PING_INTERVAL`, delay thresholds)
+may want adjustment against real paths.
+
 ## Future work (out of scope)
 
 - **UDP/QUIC carrier with own (BBR-style) congestion control** — removes
