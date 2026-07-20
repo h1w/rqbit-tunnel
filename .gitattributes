@@ -1,0 +1,4 @@
+# Windows helper scripts must use CRLF line endings, or Windows PowerShell 5.1
+# mis-parses them (e.g. backtick line-continuations break with LF endings).
+scripts/tunnel/*.ps1 text eol=crlf
+scripts/tunnel/*.bat text eol=crlf
