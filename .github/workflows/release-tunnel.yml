@@ -1,0 +1,115 @@
+name: Release rqbit-tunnel
+
+# Builds the single `rqbit` binary (it is both the tunnel server and client —
+# only the flags differ) and packages ready-to-run bundles:
+#   * Linux (amd64, arm64) — usable as server (VPS) or client, with quickstart
+#     + client launcher scripts.
+#   * Windows (amd64) — desktop client, with a double-click launcher.
+# Key generation is built into the binary (`rqbit tunnel keygen`), so the
+# bundles need no Python or other dependency.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag (e.g. tunnel-v0.1.0)"
+        required: true
+        type: string
+      draft:
+        description: "Create as draft release?"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-amd64
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+            target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            platform: windows-amd64
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build rqbit
+        run: cargo build --release --target ${{ matrix.target }} -p rqbit
+
+      - name: Package bundle (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          BUNDLE="rqbit-tunnel-${{ matrix.platform }}"
+          mkdir -p "$BUNDLE"
+          cp "target/${{ matrix.target }}/release/rqbit" "$BUNDLE/rqbit"
+          cp scripts/tunnel/server-quickstart.sh \
+             scripts/tunnel/client-run.sh \
+             scripts/tunnel/client-run.ps1 \
+             scripts/tunnel/client-run.bat \
+             scripts/tunnel/README.md "$BUNDLE/"
+          chmod +x "$BUNDLE/rqbit" "$BUNDLE"/*.sh
+          mkdir -p dist
+          tar -czf "dist/$BUNDLE.tar.gz" "$BUNDLE"
+
+      - name: Package bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bundle = "rqbit-tunnel-${{ matrix.platform }}"
+          New-Item -ItemType Directory -Force -Path $bundle | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/rqbit.exe" "$bundle/rqbit.exe"
+          Copy-Item scripts/tunnel/client-run.ps1, `
+                    scripts/tunnel/client-run.bat, `
+                    scripts/tunnel/README.md $bundle
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path $bundle -DestinationPath "dist/$bundle.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rqbit-tunnel-${{ matrix.platform }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all bundles
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: ${{ github.event.inputs.version }}
+          draft: ${{ github.event.inputs.draft }}
+          generate_release_notes: true
+          files: dist/*
