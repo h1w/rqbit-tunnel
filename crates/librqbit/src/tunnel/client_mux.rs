@@ -63,7 +63,7 @@ pub(crate) struct ClientMux {
     next_assoc_id: AtomicU64,
     shutdown: CancellationToken,
     /// Count of currently-registered TCP streams + UDP associations.
-    load: AtomicUsize,
+    load: Arc<AtomicUsize>,
 }
 
 impl ClientMux {
@@ -76,6 +76,7 @@ impl ClientMux {
 
         let tcp: TcpRoutes = Arc::new(Mutex::new(HashMap::new()));
         let udp: UdpRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let load = Arc::new(AtomicUsize::new(0));
 
         let mux = Arc::new(Self {
             sink,
@@ -85,10 +86,10 @@ impl ClientMux {
             next_stream_id: AtomicU64::new(1),
             next_assoc_id: AtomicU64::new(1),
             shutdown: shutdown.clone(),
-            load: AtomicUsize::new(0),
+            load: load.clone(),
         });
 
-        tokio::spawn(reader_loop(transport, reader, tcp, udp, shutdown));
+        tokio::spawn(reader_loop(transport, reader, tcp, udp, load, shutdown));
 
         mux
     }
@@ -226,6 +227,7 @@ async fn reader_loop(
     mut reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
     tcp: TcpRoutes,
     udp: UdpRoutes,
+    load: Arc<AtomicUsize>,
     shutdown: CancellationToken,
 ) {
     loop {
@@ -253,6 +255,11 @@ async fn reader_loop(
                 route_tcp(&tcp, stream_id, InboundTcp::Reset(code)).await;
                 if let Some(route) = tcp.lock().await.remove(&stream_id) {
                     route.send_credit.close();
+                    // The route is gone now, so the SOCKS handler's later
+                    // `unregister_tcp` will find nothing and no-op — decrement
+                    // `load` here or every server-initiated reset (denied
+                    // destination, refused connection, timeout) leaks +1.
+                    load.fetch_sub(1, Ordering::Relaxed);
                 }
             }
             TunnelFrame::Credit { stream_id, bytes } => {
@@ -283,6 +290,10 @@ async fn reader_loop(
     // Connection gone: dropping every sender makes each handler's `recv()`
     // return `None`, which they treat as a hard reset. Close credit pools so
     // any sender blocked on `reserve` also wakes.
+    //
+    // No `load` decrement here: the mux is shutting down (`shutdown.cancel()`
+    // below sets `is_shutdown()`), and the pool ignores load on a shut-down
+    // mux, so adjusting the counter on the way out is pointless.
     for (_, route) in tcp.lock().await.drain() {
         route.send_credit.close();
     }

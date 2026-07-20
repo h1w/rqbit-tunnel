@@ -827,3 +827,78 @@ async fn client_mux_load_tracks_open_streams() {
 
     token.cancel();
 }
+
+/// Regression: a server-initiated `TcpReset` must not leak `load`.
+///
+/// `reader_loop`'s `TcpReset` branch removes the route directly (so the
+/// SOCKS handler's later `unregister_tcp` finds nothing and no-ops). If the
+/// reader doesn't *also* decrement `load` at that point, every server-side
+/// reset (denied destination, refused connection, timeout — all common)
+/// leaks +1 forever, skewing the `CarrierPool`'s least-loaded selection.
+#[tokio::test]
+async fn client_mux_load_does_not_leak_on_server_tcp_reset() {
+    use crate::tunnel::client_mux::{ClientMux, InboundTcp};
+    use crate::tunnel::egress::EgressPolicy;
+    use crate::tunnel::frame::TunnelErrorCode;
+    use crate::tunnel::relay::run_server_relay;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    crate::tests::test_util::setup_test_logging();
+
+    let (client, peer) = build_real_relay_pair().await;
+    let token = CancellationToken::new();
+
+    // `public_internet_only` denies loopback destinations outright, so the
+    // server rejects the stream with `TcpReset` before ever attempting to
+    // connect — a deterministic, immediate reset with no connect timeout.
+    let relay_token = token.clone();
+    tokio::spawn(async move {
+        run_server_relay(
+            peer,
+            Arc::new(EgressPolicy::public_internet_only()),
+            relay_token,
+        )
+        .await;
+    });
+
+    let mux = ClientMux::new(client, token.clone());
+    assert_eq!(mux.load(), 0);
+
+    let denied_addr: SocketAddr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1).into();
+    let (stream_id, mut inbound, _credit) = mux
+        .open_tcp(TunnelDestination::Ip(denied_addr))
+        .await
+        .expect("open_tcp");
+    assert_eq!(mux.load(), 1);
+
+    match inbound.recv().await {
+        Some(InboundTcp::Reset(code)) => {
+            assert_eq!(code, TunnelErrorCode::DestinationDenied);
+        }
+        Some(InboundTcp::Opened(_)) => panic!("expected TcpReset, got Opened"),
+        Some(InboundTcp::Data(_)) => panic!("expected TcpReset, got Data"),
+        Some(InboundTcp::Fin) => panic!("expected TcpReset, got Fin"),
+        None => panic!("tunnel lost before TcpReset arrived"),
+    }
+
+    // Mirror the SOCKS handler's teardown: it always calls `unregister_tcp`
+    // after observing a terminal inbound event, regardless of whether the
+    // reader already removed the route on `TcpReset`.
+    mux.unregister_tcp(stream_id).await;
+
+    // The load decrement (if any) happens in `reader_loop` before the event
+    // is routed to `inbound`, so it should already be visible — but poll
+    // briefly to avoid a flaky race against the assertion below.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while mux.load() != 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("mux.load() did not return to 0 after server TcpReset (leaked)");
+
+    token.cancel();
+}
