@@ -666,6 +666,7 @@ async fn build_real_relay_pair() -> (
 #[tokio::test]
 async fn real_relay_transfers_large_payload_with_flow_control() {
     use crate::tunnel::client_mux::{ClientMux, InboundTcp};
+    use crate::tunnel::config::INITIAL_WINDOW;
     use crate::tunnel::egress::EgressPolicy;
     use crate::tunnel::relay::run_server_relay;
     use std::net::{Ipv4Addr, SocketAddrV4};
@@ -709,15 +710,17 @@ async fn real_relay_transfers_large_payload_with_flow_control() {
         _ => panic!("expected TcpOpened"),
     }
 
-    const TOTAL: usize = 600 * 1024; // > INITIAL_WINDOW (256 KiB)
+    // Exceed the flow window so credit must be granted AND replenished in both
+    // directions (a single window would complete without any replenishment).
+    let total: usize = 2 * INITIAL_WINDOW + 512 * 1024;
     const CHUNK: usize = 16 * 1024;
 
     // Sender: respects flow-control credit.
     let send_mux = mux.clone();
     let sender = tokio::spawn(async move {
         let mut sent = 0usize;
-        while sent < TOTAL {
-            let n = CHUNK.min(TOTAL - sent);
+        while sent < total {
+            let n = CHUNK.min(total - sent);
             let chunk: Vec<u8> = (0..n)
                 .map(|i| u8::try_from((sent + i) % 256).unwrap())
                 .collect();
@@ -732,8 +735,8 @@ async fn real_relay_transfers_large_payload_with_flow_control() {
     });
 
     // Receiver: grants credit back as it drains.
-    let mut received: Vec<u8> = Vec::with_capacity(TOTAL);
-    while received.len() < TOTAL {
+    let mut received: Vec<u8> = Vec::with_capacity(total);
+    while received.len() < total {
         match inbound.recv().await {
             Some(InboundTcp::Data(bytes)) => {
                 let n = bytes.len();
@@ -750,7 +753,7 @@ async fn real_relay_transfers_large_payload_with_flow_control() {
     }
     sender.await.unwrap();
 
-    assert_eq!(received.len(), TOTAL, "did not receive full payload");
+    assert_eq!(received.len(), total, "did not receive full payload");
     for (i, b) in received.iter().enumerate() {
         assert_eq!(
             *b,
