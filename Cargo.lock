@@ -3036,6 +3036,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "console-subscriber",
+ "curve25519-dalek",
  "dashmap 6.2.1",
  "fast-socks5",
  "futures",

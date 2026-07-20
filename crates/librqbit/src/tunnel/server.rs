@@ -150,6 +150,13 @@ impl TunnelServer {
             &self.options.egress_policy,
         ));
 
+        // Key the MSE/PE carrier by a stable "torrent" identity derived from our
+        // own public key. The client derives the same value from the pinned
+        // server key, so no pairing exchange is needed.
+        let carrier_hash = super::crypto::derive_carrier_hash(&super::crypto::public_key(
+            &self.options.identity_key,
+        ));
+
         loop {
             tokio::select! {
                 result = listener.accept() => {
@@ -158,9 +165,8 @@ impl TunnelServer {
                             let server = Arc::clone(self);
                             let egress = egress.clone();
                             let peer_shutdown = shutdown.child_token();
-                            // TODO: open carrier store and extract handshake_info_hash
                             tokio::spawn(async move {
-                                match server.accept(stream, Id20::new([0u8; 20])).await {
+                                match server.accept(stream, carrier_hash).await {
                                     Ok(peer) => {
                                         let client_key = peer.client_key.clone();
                                         tracing::info!(?client_key, %addr, "tunnel peer admitted");

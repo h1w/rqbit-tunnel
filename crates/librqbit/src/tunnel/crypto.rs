@@ -287,6 +287,31 @@ pub fn generate_keypair() -> (TunnelPrivateKey, TunnelPublicKey) {
     (TunnelPrivateKey(private), TunnelPublicKey(public))
 }
 
+// ── Carrier hash derivation ─────────────────────────────────────────────────
+
+/// Derive the x25519 public key from a private key (Curve25519 base-point
+/// multiplication with standard clamping).
+pub(crate) fn public_key(private: &TunnelPrivateKey) -> TunnelPublicKey {
+    let point = curve25519_dalek::MontgomeryPoint::mul_base_clamped(private.0);
+    TunnelPublicKey(point.0)
+}
+
+/// Derive a stable, random-looking carrier "info hash" (`Id20`) from the
+/// server's public key. Both peers compute it independently — the client from
+/// the pinned server key, the server from its own key — so the MSE/PE carrier
+/// is keyed by a plausible per-server torrent identity instead of an all-zero
+/// hash, with no pairing exchange required.
+pub(crate) fn derive_carrier_hash(server_pub: &TunnelPublicKey) -> librqbit_core::Id20 {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"rqbit-tunnel-carrier-v1");
+    hasher.update(server_pub.0);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&digest[..20]);
+    librqbit_core::Id20::new(out)
+}
+
 // ── Full handshake convenience (test helper) ────────────────────────────────
 
 /// Complete an authenticated IK handshake (both directions in-process).
@@ -318,6 +343,32 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+    /// Linchpin: our `public_key` derivation MUST match the public key snow
+    /// produced for the same private key, otherwise the client (deriving the
+    /// carrier hash from the pinned server *public* key) and the server
+    /// (deriving it from its own *private* key) would disagree and the MSE
+    /// handshake would fail.
+    #[test]
+    fn public_key_matches_generated_keypair() {
+        for _ in 0..16 {
+            let (priv_key, pub_key) = generate_keypair();
+            assert_eq!(
+                public_key(&priv_key),
+                pub_key,
+                "derived public key must equal snow's public key"
+            );
+        }
+    }
+
+    #[test]
+    fn carrier_hash_is_stable_and_nonzero() {
+        let (_priv, pub_key) = generate_keypair();
+        let h1 = derive_carrier_hash(&pub_key);
+        let h2 = derive_carrier_hash(&pub_key);
+        assert_eq!(h1, h2, "carrier hash must be deterministic");
+        assert_ne!(h1.0, [0u8; 20], "carrier hash must not be all zeros");
+    }
 
     // ── Key helpers ─────────────────────────────────────────────────────────
 

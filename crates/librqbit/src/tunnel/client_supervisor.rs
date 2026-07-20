@@ -12,7 +12,6 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use librqbit_core::Id20;
 use tokio_util::sync::CancellationToken;
 
 use super::client::TunnelClient;
@@ -47,11 +46,11 @@ impl TunnelClientSupervisor {
     }
 
     async fn run(self: Arc<Self>, opts: TunnelClientOptions) {
-        let carrier_hash = opts
-            .pairing
-            .as_ref()
-            .map(|p| p.carrier.handshake_info_hash)
-            .unwrap_or_else(|| Id20::new([0u8; 20]));
+        // Key the MSE/PE carrier by a stable per-server "torrent" identity
+        // derived from the pinned server key (matches what the server derives
+        // from its own key) — so the wire looks like a real private-torrent
+        // peer connection rather than an all-zero SKEY.
+        let carrier_hash = super::crypto::derive_carrier_hash(&opts.expected_server_key);
 
         let mut backoff = INITIAL_BACKOFF;
 
