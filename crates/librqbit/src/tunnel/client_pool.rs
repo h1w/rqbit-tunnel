@@ -31,12 +31,16 @@ pub(crate) struct CarrierPool {
 impl CarrierPool {
     /// Spawn `opts.carriers` supervisors, all targeting the same server. The
     /// `opts` are cloned per carrier (each moves its own copy into its task).
+    ///
+    /// The count is clamped to `1..=MAX_CARRIERS` defensively so the pool is
+    /// self-protecting even for a library caller that bypasses
+    /// [`TunnelOptions::validate`] (the CLI/service path validates first).
     pub(crate) fn start(
         opts: TunnelClientOptions,
         dht: Option<Dht>,
         shutdown: CancellationToken,
     ) -> Arc<Self> {
-        let n = opts.carriers.max(1);
+        let n = opts.carriers.clamp(1, super::config::MAX_CARRIERS);
         let carriers = (0..n)
             .map(|_| TunnelClientSupervisor::start(opts.clone(), dht.clone(), shutdown.clone()))
             .collect();
