@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc};
@@ -62,6 +62,8 @@ pub(crate) struct ClientMux {
     next_stream_id: AtomicU64,
     next_assoc_id: AtomicU64,
     shutdown: CancellationToken,
+    /// Count of currently-registered TCP streams + UDP associations.
+    load: AtomicUsize,
 }
 
 impl ClientMux {
@@ -83,6 +85,7 @@ impl ClientMux {
             next_stream_id: AtomicU64::new(1),
             next_assoc_id: AtomicU64::new(1),
             shutdown: shutdown.clone(),
+            load: AtomicUsize::new(0),
         });
 
         tokio::spawn(reader_loop(transport, reader, tcp, udp, shutdown));
@@ -125,6 +128,7 @@ impl ClientMux {
             })
             .await
         {
+            self.load.fetch_add(1, Ordering::Relaxed);
             Some((stream_id, rx, send_credit))
         } else {
             self.tcp.lock().await.remove(&stream_id);
@@ -156,6 +160,7 @@ impl ClientMux {
     pub(crate) async fn unregister_tcp(&self, stream_id: u64) {
         if let Some(route) = self.tcp.lock().await.remove(&stream_id) {
             route.send_credit.close();
+            self.load.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -173,6 +178,7 @@ impl ClientMux {
             })
             .await
         {
+            self.load.fetch_add(1, Ordering::Relaxed);
             Some((assoc_id, rx))
         } else {
             self.udp.lock().await.remove(&assoc_id);
@@ -199,11 +205,18 @@ impl ClientMux {
         self.sink
             .send(TunnelFrame::CloseUdp { association_id })
             .await;
-        self.udp.lock().await.remove(&association_id);
+        if self.udp.lock().await.remove(&association_id).is_some() {
+            self.load.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn is_shutdown(&self) -> bool {
         self.shutdown.is_cancelled()
+    }
+
+    /// Number of currently-registered TCP streams + UDP associations.
+    pub(crate) fn load(&self) -> usize {
+        self.load.load(Ordering::Relaxed)
     }
 }
 

@@ -768,3 +768,62 @@ async fn real_relay_transfers_large_payload_with_flow_control() {
 
     token.cancel();
 }
+
+// ── ClientMux load counter ──────────────────────────────────────────────────
+
+/// `ClientMux::load()` must track currently-registered TCP streams in O(1),
+/// incrementing when `open_tcp` queues its `OpenTcp` frame (not on the
+/// server's verdict) and decrementing when `unregister_tcp` actually removes
+/// a route. Mirrors `build_real_relay_pair` + `ClientMux::new` from
+/// `real_relay_transfers_large_payload_with_flow_control` above — the
+/// in-process harness that yields a real, connected `Arc<ClientMux>`.
+#[tokio::test]
+async fn client_mux_load_tracks_open_streams() {
+    use crate::tunnel::client_mux::ClientMux;
+    use crate::tunnel::egress::EgressPolicy;
+    use crate::tunnel::relay::run_server_relay;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
+
+    crate::tests::test_util::setup_test_logging();
+
+    // Loopback sink server: a real destination so OpenTcp connects succeed on
+    // the server side and no TcpReset races with our load() assertions.
+    let sink = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let sink_addr = sink.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((_s, _)) = sink.accept().await {
+            // Accept and hold; the load counter doesn't depend on data flow.
+        }
+    });
+
+    let (client, peer) = build_real_relay_pair().await;
+    let token = CancellationToken::new();
+
+    let relay_token = token.clone();
+    tokio::spawn(async move {
+        run_server_relay(peer, Arc::new(EgressPolicy::default()), relay_token).await;
+    });
+
+    let mux = ClientMux::new(client, token.clone());
+    assert_eq!(mux.load(), 0);
+
+    let (_id_a, _rx_a, _cr_a) = mux
+        .open_tcp(TunnelDestination::Ip(sink_addr))
+        .await
+        .expect("open_tcp a");
+    let (id_b, _rx_b, _cr_b) = mux
+        .open_tcp(TunnelDestination::Ip(sink_addr))
+        .await
+        .expect("open_tcp b");
+    assert_eq!(mux.load(), 2);
+
+    mux.unregister_tcp(id_b).await;
+    assert_eq!(mux.load(), 1);
+
+    token.cancel();
+}
