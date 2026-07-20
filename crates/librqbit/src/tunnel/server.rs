@@ -56,13 +56,17 @@ pub(crate) struct TunnelServer {
 }
 
 impl TunnelServer {
-    /// Bind the TCP listener and prepare the carrier store.
-    pub async fn bind(options: TunnelServerOptions) -> anyhow::Result<Arc<Self>> {
-        let _listener = TcpListener::bind(options.peer_listen).await?;
-        Ok(Arc::new(Self {
+    /// Construct the server state and prepare the carrier store.
+    ///
+    /// Note: the TCP listener is owned by the caller ([`TunnelService::start`])
+    /// and passed to [`run`](Self::run).  This constructor must NOT bind a
+    /// listener itself — doing so would race the caller's bind on the same
+    /// `peer_listen` address and fail with `EADDRINUSE`.
+    pub fn new(options: TunnelServerOptions) -> Arc<Self> {
+        Arc::new(Self {
             options,
             peers: RwLock::new(HashMap::new()),
-        }))
+        })
     }
 
     /// Admit a single incoming peer connection through the full handshake
@@ -141,21 +145,35 @@ impl TunnelServer {
         listener: TcpListener,
         shutdown: tokio_util::sync::CancellationToken,
     ) {
+        // Build the runtime egress policy once and share it across all peers.
+        let egress = Arc::new(super::egress::EgressPolicy::from_config(
+            &self.options.egress_policy,
+        ));
+
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     match result {
-                        Ok((stream, _addr)) => {
+                        Ok((stream, addr)) => {
                             let server = Arc::clone(self);
+                            let egress = egress.clone();
+                            let peer_shutdown = shutdown.child_token();
                             // TODO: open carrier store and extract handshake_info_hash
                             tokio::spawn(async move {
                                 match server.accept(stream, Id20::new([0u8; 20])).await {
-                                    Ok(_peer) => {
-                                        // TODO: spin up full frame relay for this peer
-                                        tracing::info!("peer admitted");
+                                    Ok(peer) => {
+                                        let client_key = peer.client_key.clone();
+                                        tracing::info!(?client_key, %addr, "tunnel peer admitted");
+                                        super::relay::run_server_relay(
+                                            peer,
+                                            egress,
+                                            peer_shutdown,
+                                        )
+                                        .await;
+                                        server.remove_peer(&client_key).await;
                                     }
                                     Err(e) => {
-                                        tracing::warn!(error = %e, "peer admission failed");
+                                        tracing::warn!(error = %e, %addr, "peer admission failed");
                                     }
                                 }
                             });
@@ -285,16 +303,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_binds_and_has_zero_peers() {
+    async fn server_constructs_with_zero_peers() {
         let opts = test_server_options(allowed_client_keys(&[known_key()]));
-        let server = TunnelServer::bind(opts).await.unwrap();
+        let server = TunnelServer::new(opts);
         assert_eq!(server.peer_count().await, 0);
     }
 
     #[tokio::test]
     async fn server_peer_tracking_api() {
         let opts = test_server_options(allowed_client_keys(&[known_key()]));
-        let server = TunnelServer::bind(opts).await.unwrap();
+        let server = TunnelServer::new(opts);
 
         assert_eq!(server.peer_count().await, 0);
         assert!(!server.is_admitted(&known_key()).await);

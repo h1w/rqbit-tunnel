@@ -428,7 +428,7 @@ pub mod tunnel_fixture {
                     let mut w = writer.lock().await;
                     let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
                     let _ = server::write_frame(
-                        &mut *t,
+                        &mut t,
                         &mut **w,
                         &TunnelFrame::TcpOpened {
                             stream_id,
@@ -443,7 +443,7 @@ pub mod tunnel_fixture {
                     let mut t = transport.lock().await;
                     let mut w = writer.lock().await;
                     if server::write_frame(
-                        &mut *t,
+                        &mut t,
                         &mut **w,
                         &TunnelFrame::TcpData { stream_id, bytes },
                     )
@@ -457,7 +457,7 @@ pub mod tunnel_fixture {
                     let mut t = transport.lock().await;
                     let mut w = writer.lock().await;
                     let _ =
-                        server::write_frame(&mut *t, &mut **w, &TunnelFrame::TcpFin { stream_id })
+                        server::write_frame(&mut t, &mut **w, &TunnelFrame::TcpFin { stream_id })
                             .await;
                 }
                 TunnelFrame::OpenUdp { association_id: _ } => {}
@@ -478,7 +478,7 @@ pub mod tunnel_fixture {
                     let mut t = transport.lock().await;
                     let mut w = writer.lock().await;
                     let _ = server::write_frame(
-                        &mut *t,
+                        &mut t,
                         &mut **w,
                         &TunnelFrame::UdpDatagram {
                             association_id,
@@ -493,7 +493,7 @@ pub mod tunnel_fixture {
                     let mut t = transport.lock().await;
                     let mut w = writer.lock().await;
                     let _ =
-                        server::write_frame(&mut *t, &mut **w, &TunnelFrame::Pong { nonce }).await;
+                        server::write_frame(&mut t, &mut **w, &TunnelFrame::Pong { nonce }).await;
                 }
                 _ => {}
             }

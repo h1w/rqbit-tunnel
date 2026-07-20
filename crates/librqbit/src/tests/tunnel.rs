@@ -174,49 +174,38 @@ async fn client_rejects_wrong_server_key_before_sending_frames() {
     // Spawn an accept task that does the PWC+Noise handshake with the real server key.
     let server_sk_clone = server_sk.clone();
     let accept_handle = tokio::spawn(async move {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let carrier_hash = Id20::new([0xAB; 20]);
-                let encrypted = crate::tunnel::peer_wire_crypto::PeerWireCrypto::responder(
-                    stream,
-                    carrier_hash,
-                )
-                .await;
-                match encrypted {
-                    Ok(mut e) => {
-                        use tokio::io::AsyncReadExt;
-                        // Read Noise initiator message
-                        let mut len_buf = [0u8; 2];
-                        if e.reader.read_exact(&mut len_buf).await.is_err() {
-                            return;
-                        }
-                        let msg_len = u16::from_be_bytes(len_buf) as usize;
-                        let mut noise_msg = vec![0u8; msg_len];
-                        if e.reader.read_exact(&mut noise_msg).await.is_err() {
-                            return;
-                        }
-                        // Accept with real server key (this will succeed at Noise level
-                        // but the client has wrong_server_pk pinned)
-                        let mut allowed = HashSet::new();
-                        allowed.insert(_client_pk);
-                        let result = crate::tunnel::crypto::responder_accept(
-                            &server_sk_clone,
-                            &noise_msg,
-                            &allowed,
-                        );
-                        // Send reply or close — either way, client should detect mismatch
-                        if let Ok((_transport, _ck, reply)) = result {
-                            use tokio::io::AsyncWriteExt;
-                            let reply_len = u16::try_from(reply.len()).unwrap().to_be_bytes();
-                            let _ = e.writer.write_all(&reply_len).await;
-                            let _ = e.writer.write_all(&reply).await;
-                            let _ = e.writer.flush().await;
-                        }
-                    }
-                    Err(_) => {}
+        if let Ok((stream, _)) = listener.accept().await {
+            let carrier_hash = Id20::new([0xAB; 20]);
+            let encrypted =
+                crate::tunnel::peer_wire_crypto::PeerWireCrypto::responder(stream, carrier_hash)
+                    .await;
+            if let Ok(mut e) = encrypted {
+                use tokio::io::AsyncReadExt;
+                // Read Noise initiator message
+                let mut len_buf = [0u8; 2];
+                if e.reader.read_exact(&mut len_buf).await.is_err() {
+                    return;
+                }
+                let msg_len = u16::from_be_bytes(len_buf) as usize;
+                let mut noise_msg = vec![0u8; msg_len];
+                if e.reader.read_exact(&mut noise_msg).await.is_err() {
+                    return;
+                }
+                // Accept with real server key (this will succeed at Noise level
+                // but the client has wrong_server_pk pinned)
+                let mut allowed = HashSet::new();
+                allowed.insert(_client_pk);
+                let result =
+                    crate::tunnel::crypto::responder_accept(&server_sk_clone, &noise_msg, &allowed);
+                // Send reply or close — either way, client should detect mismatch
+                if let Ok((_transport, _ck, reply)) = result {
+                    use tokio::io::AsyncWriteExt;
+                    let reply_len = u16::try_from(reply.len()).unwrap().to_be_bytes();
+                    let _ = e.writer.write_all(&reply_len).await;
+                    let _ = e.writer.write_all(&reply).await;
+                    let _ = e.writer.flush().await;
                 }
             }
-            Err(_) => {}
         }
     });
 
@@ -265,8 +254,7 @@ async fn server_rejects_unknown_client_key_during_noise_handshake() {
         carrier_root: PathBuf::from("/tmp/test-carrier-reject"),
     };
 
-    let server = TunnelServer::bind(opts).await.expect("bind server");
-    let server = std::sync::Arc::new(server);
+    let server = TunnelServer::new(opts);
 
     let server_clone = server.clone();
     let accept_handle = tokio::spawn(async move {
@@ -489,4 +477,59 @@ async fn multiple_concurrent_tcp_streams_through_tunnel() {
     client.close_tcp(sid2).await.expect("close sid2");
 
     assert_eq!(fixture.client_direct_connect_attempts(), 0);
+}
+
+// ── Server startup regression: fixed listen port (no double bind) ────────────
+
+/// Regression for the double-bind bug: `TunnelService::start` bound
+/// `peer_listen`, then `TunnelServer::bind` bound the SAME address again,
+/// failing with `EADDRINUSE` whenever a fixed (non-zero) port was configured —
+/// so the server could never start on a real deployment port. This drives the
+/// full `Session::new_with_opts` → `TunnelService::start` path on a fixed port.
+#[tokio::test]
+async fn server_tunnel_starts_on_fixed_port_without_double_bind() {
+    use crate::tunnel::crypto::generate_keypair;
+    use crate::tunnel::options::{EgressPolicy, TunnelOptions, TunnelServerOptions};
+    use crate::{Session, session::SessionOptions, tests::test_util::setup_test_logging};
+    use std::collections::HashSet;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+    setup_test_logging();
+
+    // Reserve a concrete free port, then release it so the tunnel can claim it.
+    let probe = tokio::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("probe bind");
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let (server_sk, _server_pk) = generate_keypair();
+    let (_client_sk, client_pk) = generate_keypair();
+    let mut allowed = HashSet::new();
+    allowed.insert(client_pk);
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let session = Session::new_with_opts(
+        dir.path().into(),
+        SessionOptions {
+            dht: None,
+            persistence: None,
+            listen: None,
+            tunnel: Some(TunnelOptions::Server(TunnelServerOptions {
+                peer_listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
+                identity_key: server_sk,
+                allowed_client_keys: allowed,
+                egress_policy: EgressPolicy::default(),
+                carrier_root: dir.path().join("carrier"),
+            })),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("session with fixed-port tunnel server must start (double-bind regression)");
+
+    assert!(
+        session.tunnel_service().is_some(),
+        "tunnel service should be started"
+    );
 }

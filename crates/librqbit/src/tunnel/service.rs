@@ -68,12 +68,14 @@ impl TunnelService {
                 let listener = TcpListener::bind(opts.socks_listen).await?;
                 let local_addr = listener.local_addr()?;
 
-                let ingress = SocksIngress::new(local_addr);
-                let client = std::sync::Arc::new(tokio::sync::Mutex::new(client));
+                // Split the client into shared reader/writer tasks so many
+                // SOCKS connections can multiplex over one tunnel.
+                let mux = super::client_mux::ClientMux::new(client, shutdown.clone());
 
+                let ingress = SocksIngress::new(local_addr);
                 let socks_shutdown = shutdown.clone();
                 tokio::spawn(async move {
-                    ingress.run(listener, client, socks_shutdown).await;
+                    ingress.run(listener, mux, socks_shutdown).await;
                 });
 
                 tracing::info!("tunnel client SOCKS5 listening on {local_addr}");
@@ -81,7 +83,7 @@ impl TunnelService {
             TunnelOptions::Server(opts) => {
                 let listener = TcpListener::bind(opts.peer_listen).await?;
                 let local_addr = listener.local_addr()?;
-                let server = TunnelServer::bind(opts).await?;
+                let server = TunnelServer::new(opts);
 
                 let server_shutdown = shutdown.clone();
                 tokio::spawn(async move {
