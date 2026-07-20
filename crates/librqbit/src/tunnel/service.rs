@@ -56,7 +56,10 @@ impl TunnelService {
                 let listener = TcpListener::bind(opts.socks_listen).await?;
                 let local_addr = listener.local_addr()?;
 
-                let supervisor = TunnelClientSupervisor::start(opts, shutdown.clone());
+                // The session's DHT (if enabled) lets the client discover the
+                // server by its carrier hash instead of a fixed address.
+                let dht = session.get_dht().cloned();
+                let supervisor = TunnelClientSupervisor::start(opts, dht, shutdown.clone());
 
                 let ingress = SocksIngress::new(local_addr);
                 let socks_shutdown = shutdown.clone();
@@ -69,8 +72,26 @@ impl TunnelService {
             TunnelOptions::Server(opts) => {
                 let listener = TcpListener::bind(opts.peer_listen).await?;
                 let local_addr = listener.local_addr()?;
-                let server = TunnelServer::new(opts);
 
+                // Announce the carrier hash in the DHT (if enabled) so clients
+                // can discover us without a pre-shared address. The announced
+                // IP is inferred by DHT nodes from our packets; the port is our
+                // tunnel peer-listen port.
+                if let Some(dht) = session.get_dht() {
+                    let carrier_hash = super::crypto::derive_carrier_hash(
+                        &super::crypto::public_key(&opts.identity_key),
+                    );
+                    let announce_port = local_addr.port();
+                    let stream = dht.get_peers(carrier_hash, Some(announce_port));
+                    tokio::spawn(run_dht_announce(stream, shutdown.clone()));
+                    tracing::info!(
+                        ?carrier_hash,
+                        port = announce_port,
+                        "tunnel server announcing carrier in DHT"
+                    );
+                }
+
+                let server = TunnelServer::new(opts);
                 let server_shutdown = shutdown.clone();
                 tokio::spawn(async move {
                     server.run(listener, server_shutdown).await;
@@ -89,6 +110,24 @@ impl TunnelService {
     /// any relay tasks to exit.
     pub async fn shutdown(&self) {
         self.shutdown.cancel();
+    }
+}
+
+/// Keep a DHT announce alive: hold the `get_peers(..., Some(port))` stream so
+/// the periodic `announce_peer` persists (dropping it stops the announce), and
+/// drain discovered peers (the server is the announcer, not a downloader, so
+/// they are ignored — draining just keeps the channel from growing).
+async fn run_dht_announce(mut stream: dht::RequestPeersStream, shutdown: CancellationToken) {
+    use futures::StreamExt;
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            item = stream.next() => {
+                if item.is_none() {
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -116,7 +155,10 @@ mod tests {
     #[tokio::test]
     async fn start_client_with_valid_config() {
         let opts = TunnelOptions::Client(TunnelClientOptions {
-            server_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 9090)),
+            server_addr: Some(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(10, 0, 0, 1),
+                9090,
+            ))),
             expected_server_key: dummy_key(),
             ..Default::default()
         });

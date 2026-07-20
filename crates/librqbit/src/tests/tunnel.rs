@@ -567,7 +567,10 @@ async fn client_tunnel_starts_when_server_unreachable() {
             listen: None,
             tunnel: Some(TunnelOptions::Client(TunnelClientOptions {
                 socks_listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
-                server_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, dead_port)),
+                server_addr: Some(SocketAddr::V4(SocketAddrV4::new(
+                    Ipv4Addr::LOCALHOST,
+                    dead_port,
+                ))),
                 identity_key: client_sk,
                 expected_server_key: server_pk,
                 pairing: None,

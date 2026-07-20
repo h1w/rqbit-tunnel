@@ -48,7 +48,14 @@ curl --socks5-hostname 127.0.0.1:1080 https://checkip.amazonaws.com   # → your
   Regenerate anytime with `rqbit tunnel keygen --output-dir DIR`.
 - **Multiple clients:** generate more client keys and add each `client.pub` line
   to `~/.rqbit-tunnel/keys/allowed-clients.txt` on the server, then restart it.
-- **What this does NOT hide:** the *shape* of the traffic. It is one long-lived,
-  high-throughput connection to one IP with no swarm/DHT — traffic analysis can
-  still tell it apart from real BitTorrent. This blends at the protocol level,
-  not the behavioural level.
+- **DHT discovery.** These scripts leave the DHT enabled: the server announces
+  its carrier hash and the client looks it up, so the connection blends with
+  real BitTorrent DHT traffic. The client still tries `<server-ip:port>` first
+  (fast path), so setup is unchanged — but the client can also find the server
+  purely by the DHT (drop the address argument), which even works if the
+  **server's IP changes**. DHT results are untrusted: the server is always
+  authenticated by its pinned key, so a wrong address just fails and is skipped.
+- **What this does NOT fully hide:** the *shape* of the traffic. It is still one
+  long-lived, high-throughput connection to one peer — traffic analysis can tell
+  it apart from a real multi-peer torrent. DHT participation improves the blend
+  (real, observable BitTorrent behaviour) but does not make it indistinguishable.
