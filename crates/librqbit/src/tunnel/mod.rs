@@ -15,6 +15,7 @@
 #![allow(clippy::while_let_loop)]
 
 pub(crate) mod carrier;
+pub(crate) mod carrier_chunk;
 pub(crate) mod carrier_identity;
 pub(crate) mod carrier_peer;
 pub(crate) mod carrier_wire;
