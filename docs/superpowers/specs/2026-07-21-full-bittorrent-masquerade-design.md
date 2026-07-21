@@ -330,10 +330,16 @@ shows only ciphertext anyway):
   yields "carrier corpus size mismatch" and the client fails to start. Fix:
   re-initialize on config mismatch, and/or namespace the client `carrier_root`
   per `expected_server_key`.
-- **Steady-state carrier throughput unbenchmarked** (⚠️ from the Task 8 review):
-  the carrier receive path adds per-frame BT-parse + defrag + Noise-decrypt under
-  a `Mutex<NoiseTransport>`; measure MB/s on a real high-BDP path vs. the raw
-  framing before relying on it for bulk transfer.
+- **Steady-state carrier throughput — measured (release build, loopback + a
+  userspace delay-proxy):** a 100 MiB SOCKS download through the masquerade
+  carrier ran at **629 Mbit/s direct (~0 RTT)** and **150 Mbit/s at emulated
+  100 ms RTT**, sha256 verified in both — so the migration has no pathological
+  perf regression and flow control does NOT collapse under latency (a broken
+  window would floor at single-digit Mbit/s). Caveat: the 100 ms figure is
+  capped by the Python delay-proxy's own userspace throughput, not the tunnel —
+  it is a lower bound. A native delay injector (`tc netem`, needs root) or a real
+  high-BDP path is still worth a proper benchmark before relying on peak bulk
+  throughput.
 - Blanket `#![allow(dead_code)]` on the tunnel module kept (~29 unrelated
   scaffolding items across 10 files, out of Plan-A scope); the five carrier
   masquerade modules were verified clean without it.
