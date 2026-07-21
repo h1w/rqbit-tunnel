@@ -181,3 +181,27 @@ pub(crate) const DEFAULT_CARRIERS: usize = 4;
 /// Upper bound on `--tunnel-carriers` (beyond this, diminishing returns plus
 /// extra handshakes / DHT noise).
 pub(crate) const MAX_CARRIERS: usize = 16;
+
+// ── Carrier identity (masquerade torrent shape) ──────────────────────────────
+
+/// Piece length for the synthetic carrier torrent. 256 KiB is a common real
+/// value for GiB-scale single-file torrents.
+pub(crate) const CARRIER_PIECE_LENGTH: u32 = 256 * 1024;
+
+/// Corpus size band (bytes). The concrete size is chosen deterministically per
+/// carrier hash within [MIN, MAX] so different servers look like different
+/// torrents while staying cheap to generate/store.
+pub(crate) const CARRIER_CORPUS_MIN: u64 = 8 * 1024 * 1024;
+pub(crate) const CARRIER_CORPUS_MAX: u64 = 24 * 1024 * 1024;
+
+/// Plausible display names; one is chosen deterministically per carrier hash.
+pub(crate) const CARRIER_DISPLAY_NAMES: &[&str] = &[
+    "debian-12.7.0-amd64-netinst.iso",
+    "ubuntu-24.04.1-desktop-amd64.iso",
+    "archlinux-2024.09.01-x86_64.iso",
+    "Fedora-Workstation-Live-x86_64-40.iso",
+    "linuxmint-22-cinnamon-64bit.iso",
+    "manjaro-kde-24.0-240513-linux69.iso",
+    "openSUSE-Leap-15.6-DVD-x86_64.iso",
+    "pop-os_22.04_amd64_intel.iso",
+];
