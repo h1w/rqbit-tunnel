@@ -889,7 +889,15 @@ git commit -m "feat(tunnel): split CarrierWire into read/write halves"
 
 ## Task 7: Server relay through the carrier
 
-Rewire `server.rs::accept` and `relay.rs` so the server runs `CarrierWire::establish` after MSE, does Noise over the carrier, and the relay reads/writes frames through the carrier halves (with piece cover). Guarded by `CarrierMode`.
+Rewire `server.rs::accept` and `relay.rs` so the server runs `CarrierWire::establish` after MSE, does Noise over the carrier, and the relay reads/writes frames through the carrier halves (with piece cover).
+
+**Security hardening (REQUIRED — added after Task 3 review).** `CarrierDefragmenter` (from Task 3) currently trusts the declared `u32` length with no upper bound. This task wires it to a live socket where the rendezvous `info_hash` is public (DHT-discoverable), so a peer that completes MSE + BT handshake but fails Noise auth can still feed the defragmenter. Harden it so an oversized declared length cannot cause unbounded buffering:
+- Change `CarrierDefragmenter::new()` → `CarrierDefragmenter::new(max_msg_len: usize)` and store the cap. Callers pass `crypto::MAX_CIPHERTEXT`-equivalent: the max valid Noise ciphertext is `MAX_FRAME_PAYLOAD + 32` (frame payload 65535 + 8-byte seq + 16-byte tag + small frame header ⇒ use a constant `MAX_CARRIER_CIPHERTEXT = MAX_FRAME_PAYLOAD + 64` for slack). Define this constant in `carrier_chunk.rs`.
+- Change `push(&mut self, chunk: &[u8]) -> Vec<Vec<u8>>` → `push(&mut self, chunk: &[u8]) -> Result<Vec<Vec<u8>>, CarrierChunkError>` where `CarrierChunkError::MessageTooLarge { declared, max }` is a typed error (thiserror). Return it BEFORE buffering when the decoded `len > max_msg_len` (check right after reading the 4-byte prefix, before the `< 4 + len` wait).
+- Update Task 3's tests to the new signatures, and add one test: a declared length `> max` returns `MessageTooLarge` without buffering.
+- In `next_tunnel_frame` / `recv_one_ciphertext`, treat a `push` error as a disconnect (return `None`), logging at debug.
+
+Do this hardening as the FIRST step of this task (before the server rewire), committed separately (`fix(tunnel): bound CarrierDefragmenter declared length`).
 
 **Files:**
 - Modify: `server.rs:80-139` (accept), `relay.rs:226-385` (writer), `relay.rs:428-672` (server relay), `relay.rs:51-73` (reader helper)
