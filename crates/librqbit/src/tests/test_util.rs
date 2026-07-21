@@ -226,8 +226,8 @@ pub mod tunnel_fixture {
 
     use std::collections::VecDeque;
 
+    use crate::tunnel::carrier_peer::CoverMessage;
     use librqbit_core::Id20;
-    use peer_binary_protocol::Message;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
     use tokio::sync::{Mutex, mpsc};
@@ -448,7 +448,7 @@ pub mod tunnel_fixture {
         let mut carrier_peer = carrier_peer;
         // These fixtures never drive piece cover (no Request messages), so the
         // cover lane stays empty; a small buffered channel suffices.
-        let (cover_tx, _cover_rx) = mpsc::channel::<Message<'static>>(16);
+        let (cover_tx, _cover_rx) = mpsc::channel::<CoverMessage>(16);
 
         loop {
             let frame = match next_tunnel_frame(

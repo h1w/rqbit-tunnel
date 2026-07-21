@@ -308,7 +308,7 @@ impl TunnelClient {
                         for a in actions {
                             match a {
                                 CarrierAction::OutgoingMessage(m) => {
-                                    let _ = self.write_half.send_message(&m).await;
+                                    let _ = self.write_half.send_message(&m.to_message()).await;
                                 }
                                 CarrierAction::Disconnect(_) => {
                                     return Err(TunnelClientError::ConnectionLost);

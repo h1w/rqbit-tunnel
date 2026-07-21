@@ -21,11 +21,10 @@ use std::time::Duration;
 use std::time::Instant;
 
 use bytes::Bytes;
-use peer_binary_protocol::Message;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use super::carrier_peer::TunnelCarrierPeer;
+use super::carrier_peer::{CoverMessage, TunnelCarrierPeer};
 use super::carrier_wire::CarrierReadHalf;
 use super::client::TunnelClient;
 use super::config::{
@@ -110,7 +109,7 @@ impl ClientMux {
         let transport = Arc::new(Mutex::new(transport));
         // Cover lane: the reader funnels inbound piece Request→Piece cover here
         // and the writer task drains it (unpaced, below control priority).
-        let (cover_tx, cover_rx) = mpsc::channel::<Message<'static>>(OUTBOUND_QUEUE);
+        let (cover_tx, cover_rx) = mpsc::channel::<CoverMessage>(OUTBOUND_QUEUE);
         // Minimal piece cover so the carrier exhibits real BT Request/Piece
         // traffic (Plan C elaborates the cadence). Cloned here, before
         // `cover_tx` is moved into `reader_loop` below.
@@ -188,9 +187,11 @@ impl ClientMux {
         tokio::spawn(async move {
             for idx in 0u32..2 {
                 let _ = cover_seed
-                    .send(Message::Request(peer_binary_protocol::Request::new(
-                        idx, 0, 16384,
-                    )))
+                    .send(CoverMessage::Request {
+                        index: idx,
+                        begin: 0,
+                        length: 16384,
+                    })
                     .await;
             }
         });
@@ -413,7 +414,7 @@ async fn reader_loop(
     transport: Arc<Mutex<NoiseTransport>>,
     mut read_half: CarrierReadHalf,
     carrier_peer: TunnelCarrierPeer,
-    cover_tx: mpsc::Sender<Message<'static>>,
+    cover_tx: mpsc::Sender<CoverMessage>,
     tcp: TcpRoutes,
     udp: UdpRoutes,
     load: Arc<AtomicUsize>,

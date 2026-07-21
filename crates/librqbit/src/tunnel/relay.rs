@@ -28,6 +28,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use super::carrier_peer::CoverMessage;
 use super::config::{
     CONNECT_TIMEOUT, OPEN_WINDOW, OUTBOUND_QUEUE, PACING_BURST, PER_STREAM_QUEUE, PING_INTERVAL,
     PING_NONCE_MAP_CAP, READ_CHUNK, UDP_READ_BUF,
@@ -62,7 +63,7 @@ pub(crate) async fn next_tunnel_frame(
     pending: &mut VecDeque<Vec<u8>>,
     transport: &Mutex<NoiseTransport>,
     carrier_peer: &mut super::carrier_peer::TunnelCarrierPeer,
-    cover_tx: &mpsc::Sender<Message<'static>>,
+    cover_tx: &mpsc::Sender<CoverMessage>,
 ) -> Option<TunnelFrame> {
     use peer_binary_protocol::extended::ExtendedMessage;
     loop {
@@ -98,7 +99,20 @@ pub(crate) async fn next_tunnel_frame(
                     for a in actions {
                         match a {
                             super::carrier_peer::CarrierAction::OutgoingMessage(m) => {
-                                let _ = cover_tx.send(m).await;
+                                // NON-BLOCKING: the reader must never block on the
+                                // best-effort cover channel — doing so would stall
+                                // inbound tunnel frames, credit, and pong behind
+                                // cover backpressure. Drop the cover message if the
+                                // writer's cover lane is saturated.
+                                match cover_tx.try_send(m) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        tracing::debug!(
+                                            "cover channel full; dropping cover message"
+                                        );
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => return None,
+                                }
                             }
                             super::carrier_peer::CarrierAction::Disconnect(reason) => {
                                 tracing::debug!(%reason, "carrier peer requested disconnect");
@@ -270,7 +284,7 @@ fn tcp_data_wire_len(stream_id: u64, payload_len: usize) -> u64 {
 pub(crate) fn spawn_frame_writer(
     transport: Arc<Mutex<NoiseTransport>>,
     mut write_half: super::carrier_wire::CarrierWriteHalf,
-    mut cover_rx: mpsc::Receiver<Message<'static>>,
+    mut cover_rx: mpsc::Receiver<CoverMessage>,
     shutdown: CancellationToken,
     pacing_rate: Arc<AtomicU64>,
     paced: Arc<AtomicBool>,
@@ -344,13 +358,14 @@ pub(crate) fn spawn_frame_writer(
                 break;
             }
             tokio::select! {
-                // Priority order: shutdown, then the control lane, then the cover
-                // lane, then a due pending data frame, then admitting a new data
-                // frame. `biased` is what makes the control lane preempt paced
-                // data: whenever a control frame is ready it is serviced before
-                // the pending data's deadline arm and before pulling more data.
-                // Cover sits between control and data: unpaced, but never ahead
-                // of a `Ping`/`Pong`/`Credit`.
+                // Priority order: shutdown, then the control lane, then a due
+                // pending data frame, then admitting a new data frame, then the
+                // cover lane LAST. `biased` is what makes the control lane preempt
+                // paced data: whenever a control frame is ready it is serviced
+                // before the pending data's deadline arm and before pulling more
+                // data. Cover is best-effort and is drained only when neither
+                // control nor real tunnel data is ready, so it can never starve
+                // real tunnel data.
                 biased;
 
                 _ = shutdown.cancelled() => break,
@@ -363,21 +378,6 @@ pub(crate) fn spawn_frame_writer(
                         }
                     }
                     None => control_open = false,
-                },
-
-                // Cover lane — piece Request→Piece cover, unpaced, lower priority
-                // than control. A cover message that fails to SERIALIZE (e.g. an
-                // oversized Piece a malicious peer tried to request) must NOT kill
-                // the tunnel — skip it. Only a real write/IO failure breaks.
-                cover = cover_rx.recv(), if cover_open => match cover {
-                    Some(m) => match write_half.send_message(&m).await {
-                        Ok(()) => {}
-                        Err(super::carrier_wire::CarrierWireError::Serialize(_)) => {
-                            tracing::debug!("skipping unserializable cover message");
-                        }
-                        Err(_) => break,
-                    },
-                    None => cover_open = false,
                 },
 
                 // The pending data frame's pace deadline elapsed. `sleep_until`
@@ -444,6 +444,23 @@ pub(crate) fn spawn_frame_writer(
                         }
                     }
                 }
+
+                // Cover lane — piece Request→Piece cover, unpaced, LOWEST priority.
+                // Placed last (below both data arms) so best-effort cover can never
+                // starve real tunnel data: it is only drained when neither control
+                // nor data is ready. A cover message that fails to SERIALIZE (e.g.
+                // an oversized Piece a malicious peer tried to request) must NOT
+                // kill the tunnel — skip it. Only a real write/IO failure breaks.
+                cover = cover_rx.recv(), if cover_open => match cover {
+                    Some(m) => match write_half.send_message(&m.to_message()).await {
+                        Ok(()) => {}
+                        Err(super::carrier_wire::CarrierWireError::Serialize(_)) => {
+                            tracing::debug!("skipping unserializable cover message");
+                        }
+                        Err(_) => break,
+                    },
+                    None => cover_open = false,
+                },
             }
         }
     });
@@ -513,7 +530,7 @@ pub(crate) async fn run_server_relay(
     let transport = Arc::new(Mutex::new(transport));
     // Cover lane: `next_tunnel_frame` funnels piece Request→Piece cover here and
     // the writer task drains it (unpaced, below control priority).
-    let (cover_tx, cover_rx) = mpsc::channel::<Message<'static>>(OUTBOUND_QUEUE);
+    let (cover_tx, cover_rx) = mpsc::channel::<CoverMessage>(OUTBOUND_QUEUE);
     // ONE pacing-rate cell shared by the writer (which re-reads it per frame)
     // and the control task below (which drives it to `target / rtt`). Seeded at
     // the effectively-unlimited default until the first RTT sample lands.
@@ -1121,7 +1138,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let pacing_rate = Arc::new(AtomicU64::new(rate_bytes_per_s));
         let paced = Arc::new(AtomicBool::new(false));
-        let (cover_tx, cover_rx) = mpsc::channel::<Message<'static>>(OUTBOUND_QUEUE);
+        let (cover_tx, cover_rx) = mpsc::channel::<CoverMessage>(OUTBOUND_QUEUE);
         let (sink, _handle) = spawn_frame_writer(
             Arc::new(Mutex::new(client_transport)),
             c_write,
@@ -1150,7 +1167,7 @@ mod tests {
         let mut defrag = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
         let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
         let mut s_peer = s_peer;
-        let (rx_cover_tx, _rx_cover_rx) = mpsc::channel::<Message<'static>>(OUTBOUND_QUEUE);
+        let (rx_cover_tx, _rx_cover_rx) = mpsc::channel::<CoverMessage>(OUTBOUND_QUEUE);
         let mut total_bytes: u64 = 0;
         for _ in 0..n_frames {
             let frame = next_tunnel_frame(
@@ -1272,7 +1289,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let pacing_rate = Arc::new(AtomicU64::new(LOW_RATE));
         let paced = Arc::new(AtomicBool::new(false));
-        let (_cover_tx, cover_rx) = mpsc::channel::<Message<'static>>(OUTBOUND_QUEUE);
+        let (_cover_tx, cover_rx) = mpsc::channel::<CoverMessage>(OUTBOUND_QUEUE);
         let (sink, _handle) = spawn_frame_writer(
             Arc::new(Mutex::new(client_transport)),
             c_write,
@@ -1307,7 +1324,7 @@ mod tests {
         let mut defrag = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
         let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
         let mut s_peer = s_peer;
-        let (rx_cover_tx, _rx_cover_rx) = mpsc::channel::<Message<'static>>(OUTBOUND_QUEUE);
+        let (rx_cover_tx, _rx_cover_rx) = mpsc::channel::<CoverMessage>(OUTBOUND_QUEUE);
         let mut frames = Vec::with_capacity(N_DATA + 1);
         for _ in 0..(N_DATA + 1) {
             frames.push(
@@ -1363,7 +1380,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let pacing_rate = Arc::new(AtomicU64::new(PACING_DEFAULT_RATE));
         let paced = Arc::new(AtomicBool::new(false));
-        let (_cover_tx, cover_rx) = mpsc::channel::<Message<'static>>(OUTBOUND_QUEUE);
+        let (_cover_tx, cover_rx) = mpsc::channel::<CoverMessage>(OUTBOUND_QUEUE);
         let (sink, handle) = spawn_frame_writer(
             Arc::new(Mutex::new(client_transport)),
             c_write,

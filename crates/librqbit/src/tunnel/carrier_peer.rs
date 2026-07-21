@@ -30,11 +30,70 @@ pub(crate) enum TunnelCarrierError {
     Store(#[from] anyhow::Error),
 }
 
+// ── Cover message (owned) ────────────────────────────────────────────────────
+
+/// An OWNED cover-traffic peer message.
+///
+/// The carrier serves plausible BitTorrent cover (Bitfield/Piece/…) on the LIVE
+/// path — on every inbound `Request`, and during the pre-Noise early-cover loop
+/// in [`CarrierWire::establish`]. Carrying a borrowed `Message<'static>` there
+/// forced a permanent heap leak to synthesize the `'static` lifetime,
+/// leaking the block bytes on every request (an unbounded, amplifiable leak).
+///
+/// Instead we carry this owned value across the action/cover channels and turn
+/// it into a borrowed [`Message<'_>`] only at the serialize site via
+/// [`CoverMessage::to_message`] — no leaked `'static` bytes.
+#[derive(Debug)]
+pub(crate) enum CoverMessage {
+    Bitfield(bytes::Bytes),
+    Unchoke,
+    Interested,
+    Choke,
+    NotInterested,
+    Have(u32),
+    Request {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
+    Piece {
+        index: u32,
+        begin: u32,
+        data: bytes::Bytes,
+    },
+    KeepAlive,
+}
+
+impl CoverMessage {
+    /// Borrow this owned cover message as a wire [`Message`] for serialization.
+    pub(crate) fn to_message(&self) -> peer_binary_protocol::Message<'_> {
+        use buffers::ByteBuf;
+        use peer_binary_protocol::{Message, Piece, Request};
+        match self {
+            CoverMessage::Bitfield(b) => Message::Bitfield(ByteBuf(b)),
+            CoverMessage::Unchoke => Message::Unchoke,
+            CoverMessage::Interested => Message::Interested,
+            CoverMessage::Choke => Message::Choke,
+            CoverMessage::NotInterested => Message::NotInterested,
+            CoverMessage::Have(i) => Message::Have(*i),
+            CoverMessage::Request {
+                index,
+                begin,
+                length,
+            } => Message::Request(Request::new(*index, *begin, *length)),
+            CoverMessage::Piece { index, begin, data } => {
+                Message::Piece(Piece::from_data(*index, *begin, data))
+            }
+            CoverMessage::KeepAlive => Message::KeepAlive,
+        }
+    }
+}
+
 // ── Action Type ──────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub(crate) enum CarrierAction {
-    OutgoingMessage(Message<'static>),
+    OutgoingMessage(CoverMessage),
     // Reserved for a future graceful-disconnect signal distinct from a hard
     // protocol error (every `on_message` violation currently surfaces as an
     // `Err(TunnelCarrierError)`, which callers already treat as terminal); no
@@ -141,7 +200,7 @@ impl TunnelCarrierPeer {
 
     // ── Initial messages ──────────────────────────────────────────────────
 
-    pub fn initial_messages(&self) -> Vec<Message<'static>> {
+    pub fn initial_messages(&self) -> Vec<CoverMessage> {
         let have = self.carrier.have_bitfield();
         let bitfield_bytes = have.len().div_ceil(8);
         let mut buf = vec![0u8; bitfield_bytes];
@@ -155,8 +214,10 @@ impl TunnelCarrierPeer {
             }
         }
 
-        let leaked: &'static [u8] = Box::leak(buf.into_boxed_slice());
-        vec![Message::Bitfield(ByteBuf(leaked)), Message::Unchoke]
+        vec![
+            CoverMessage::Bitfield(bytes::Bytes::from(buf)),
+            CoverMessage::Unchoke,
+        ]
     }
 
     // ── Message dispatch ──────────────────────────────────────────────────
@@ -233,8 +294,11 @@ impl TunnelCarrierPeer {
             });
         };
 
-        let leaked: &'static [u8] = Box::leak(block.to_vec().into_boxed_slice());
-        let piece_msg = Message::Piece(Piece::from_data(idx, begin, leaked));
+        let piece_msg = CoverMessage::Piece {
+            index: idx,
+            begin,
+            data: bytes::Bytes::copy_from_slice(block),
+        };
 
         Ok(vec![CarrierAction::OutgoingMessage(piece_msg)])
     }
@@ -438,7 +502,7 @@ mod tests {
 
         // First message should be Bitfield
         let bitfield = match &msgs[0] {
-            Message::Bitfield(bf) => bf.as_ref(),
+            CoverMessage::Bitfield(bf) => bf.as_ref(),
             other => panic!("expected Bitfield, got {other:?}"),
         };
 
@@ -454,7 +518,7 @@ mod tests {
         );
 
         // Second message should be Unchoke
-        assert!(matches!(msgs[1], Message::Unchoke), "expected Unchoke");
+        assert!(matches!(msgs[1], CoverMessage::Unchoke), "expected Unchoke");
     }
 
     // ── Request handling ──────────────────────────────────────────────────
@@ -470,13 +534,11 @@ mod tests {
 
         assert_eq!(actions.len(), 1, "expected one Piece action");
         match &actions[0] {
-            CarrierAction::OutgoingMessage(Message::Piece(piece)) => {
-                assert_eq!(piece.index, 0);
-                assert_eq!(piece.begin, 0);
+            CarrierAction::OutgoingMessage(CoverMessage::Piece { index, begin, data }) => {
+                assert_eq!(*index, 0);
+                assert_eq!(*begin, 0);
                 // Full 16KiB piece
-                let (b0, b1) = piece.data();
-                let total = b0.len() + b1.len();
-                assert_eq!(total, 16384, "expected 16384-byte piece");
+                assert_eq!(data.len(), 16384, "expected 16384-byte piece");
             }
             other => panic!("expected Piece, got {other:?}"),
         }

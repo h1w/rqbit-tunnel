@@ -47,6 +47,19 @@ const CLIENT_VERSION: &[u8] = b"qBittorrent/4.6.5";
 /// Timeout for a single handshake/message read.
 const WIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Overall wall-clock deadline for the ENTIRE pre-auth handshake in
+/// [`CarrierWire::establish`]. `WIRE_TIMEOUT` resets on every message, so a
+/// slowloris peer that dribbles a valid message just under that per-read timeout
+/// could keep the connection in handshake — driving a disk read per `Request` —
+/// indefinitely before Noise auth. This bounds the whole handshake.
+const ESTABLISH_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Cap on the number of non-extended-handshake messages tolerated before the
+/// peer's BEP-10 extended handshake arrives. A peer streaming unbounded early
+/// cover (each message triggering a piece read) that never sends its extended
+/// handshake is rejected once this is exceeded.
+const MAX_PRE_HANDSHAKE_MSGS: usize = 16;
+
 // ── Errors ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -65,6 +78,12 @@ pub(crate) enum CarrierWireError {
 
     #[error("peer did not advertise the rq_tunnel extension")]
     NoRqTunnel,
+
+    #[error("carrier handshake exceeded the overall deadline")]
+    HandshakeTimeout,
+
+    #[error("peer sent too many messages before its extended handshake")]
+    TooManyPreHandshakeMessages,
 
     #[error("serialize error: {0}")]
     Serialize(String),
@@ -172,71 +191,93 @@ impl CarrierWire {
         let mut scratch = vec![0u8; MAX_MSG_LEN];
         let mut read_buf = ReadBuf::new();
 
-        // ── BitTorrent handshake (send ours, read theirs) ───────────────────
-        let ours = Handshake {
-            reserved: HANDSHAKE_RESERVED,
-            info_hash,
-            peer_id: make_peer_id(),
-        };
-        let n = ours.serialize_unchecked_len(&mut scratch);
-        writer.write_all(&scratch[..n]).await?;
-        writer.flush().await?;
+        // The per-read `WIRE_TIMEOUT` resets on every message, so it alone can't
+        // bound the whole handshake against a slowloris peer. Wrap the ENTIRE
+        // pre-auth handshake in one overall deadline; a peer that keeps us in
+        // handshake past it — or floods early cover past `MAX_PRE_HANDSHAKE_MSGS`
+        // — is dropped before Noise auth.
+        let handshake = async {
+            // ── BitTorrent handshake (send ours, read theirs) ───────────────
+            let ours = Handshake {
+                reserved: HANDSHAKE_RESERVED,
+                info_hash,
+                peer_id: make_peer_id(),
+            };
+            let n = ours.serialize_unchecked_len(&mut scratch);
+            writer.write_all(&scratch[..n]).await?;
+            writer.flush().await?;
 
-        let theirs = read_buf
-            .read_handshake(&mut reader, WIRE_TIMEOUT)
-            .await
-            .map_err(|e| CarrierWireError::Wire(format!("read handshake: {e}")))?;
-        if theirs.info_hash != info_hash {
-            return Err(CarrierWireError::InfoHashMismatch);
-        }
-        if !theirs.supports_extended() {
-            return Err(CarrierWireError::NoExtended);
-        }
-
-        // ── BEP10 extended handshake ────────────────────────────────────────
-        let mut ext = ExtendedHandshake::new();
-        ext.v = Some(buffers::ByteBuf(CLIENT_VERSION));
-        write_message(
-            &mut writer,
-            &mut scratch,
-            &Message::Extended(ExtendedMessage::Handshake(ext)),
-            PeerExtendedMessageIds::default(),
-        )
-        .await?;
-
-        // Read messages until we get the peer's extended handshake.
-        let mut carrier_peer = TunnelCarrierPeer::new(carrier)?;
-        let peer_ids = loop {
-            let msg = read_buf
-                .read_message(&mut reader, WIRE_TIMEOUT)
+            let theirs = read_buf
+                .read_handshake(&mut reader, WIRE_TIMEOUT)
                 .await
-                .map_err(|e| CarrierWireError::Wire(format!("read ext handshake: {e}")))?;
-            match msg {
-                Message::Extended(ExtendedMessage::Handshake(h)) => {
-                    break h.peer_extended_messages();
-                }
-                other => {
-                    // Handle any early cover messages (bitfield, etc.).
-                    let actions = carrier_peer.on_message(other).await?;
-                    dispatch_actions(
-                        &mut writer,
-                        &mut scratch,
-                        actions,
-                        PeerExtendedMessageIds::default(),
-                    )
-                    .await?;
-                }
+                .map_err(|e| CarrierWireError::Wire(format!("read handshake: {e}")))?;
+            if theirs.info_hash != info_hash {
+                return Err(CarrierWireError::InfoHashMismatch);
             }
-        };
-        if peer_ids.rq_tunnel.is_none() {
-            return Err(CarrierWireError::NoRqTunnel);
-        }
+            if !theirs.supports_extended() {
+                return Err(CarrierWireError::NoExtended);
+            }
 
-        // ── Initial cover: Bitfield + Unchoke, plus Interested ──────────────
-        for msg in carrier_peer.initial_messages() {
-            write_message(&mut writer, &mut scratch, &msg, peer_ids).await?;
-        }
-        write_message(&mut writer, &mut scratch, &Message::Interested, peer_ids).await?;
+            // ── BEP10 extended handshake ────────────────────────────────────
+            let mut ext = ExtendedHandshake::new();
+            ext.v = Some(buffers::ByteBuf(CLIENT_VERSION));
+            write_message(
+                &mut writer,
+                &mut scratch,
+                &Message::Extended(ExtendedMessage::Handshake(ext)),
+                PeerExtendedMessageIds::default(),
+            )
+            .await?;
+
+            // Read messages until we get the peer's extended handshake, bounded
+            // by `MAX_PRE_HANDSHAKE_MSGS` so an endless early-cover stream (each
+            // message driving a piece read) can't stall us pre-auth.
+            let mut carrier_peer = TunnelCarrierPeer::new(carrier)?;
+            let mut pre_handshake_msgs = 0usize;
+            let peer_ids = loop {
+                let msg = read_buf
+                    .read_message(&mut reader, WIRE_TIMEOUT)
+                    .await
+                    .map_err(|e| CarrierWireError::Wire(format!("read ext handshake: {e}")))?;
+                match msg {
+                    Message::Extended(ExtendedMessage::Handshake(h)) => {
+                        break h.peer_extended_messages();
+                    }
+                    other => {
+                        pre_handshake_msgs += 1;
+                        if pre_handshake_msgs > MAX_PRE_HANDSHAKE_MSGS {
+                            return Err(CarrierWireError::TooManyPreHandshakeMessages);
+                        }
+                        // Handle any early cover messages (bitfield, etc.).
+                        let actions = carrier_peer.on_message(other).await?;
+                        dispatch_actions(
+                            &mut writer,
+                            &mut scratch,
+                            actions,
+                            PeerExtendedMessageIds::default(),
+                        )
+                        .await?;
+                    }
+                }
+            };
+            if peer_ids.rq_tunnel.is_none() {
+                return Err(CarrierWireError::NoRqTunnel);
+            }
+
+            // ── Initial cover: Bitfield + Unchoke, plus Interested ──────────
+            for msg in carrier_peer.initial_messages() {
+                write_message(&mut writer, &mut scratch, &msg.to_message(), peer_ids).await?;
+            }
+            write_message(&mut writer, &mut scratch, &Message::Interested, peer_ids).await?;
+
+            Ok::<_, CarrierWireError>((carrier_peer, peer_ids))
+        };
+
+        let (carrier_peer, peer_ids) =
+            match tokio::time::timeout(ESTABLISH_DEADLINE, handshake).await {
+                Ok(res) => res?,
+                Err(_elapsed) => return Err(CarrierWireError::HandshakeTimeout),
+            };
 
         Ok(Self {
             read_buf,
@@ -387,7 +428,7 @@ async fn dispatch_actions<W: AsyncWrite + Unpin + ?Sized>(
     for action in actions {
         match action {
             CarrierAction::OutgoingMessage(msg) => {
-                write_message(writer, scratch, &msg, peer_ids).await?;
+                write_message(writer, scratch, &msg.to_message(), peer_ids).await?;
             }
             CarrierAction::Disconnect(reason) => {
                 tracing::debug!(%reason, "carrier peer requested disconnect");
