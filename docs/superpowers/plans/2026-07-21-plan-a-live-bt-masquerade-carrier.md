@@ -1058,8 +1058,16 @@ In the `biased` select loop (`relay.rs:291-375`), add a cover branch AFTER the c
             msg = cover_rx.recv() => {
                 match msg {
                     Some(m) => {
-                        if write_half.send_message(&m).await.is_err() {
-                            break;
+                        // A cover message that fails to SERIALIZE (e.g. an
+                        // oversized Piece a malicious peer tried to request) must
+                        // NOT kill the tunnel — skip it. Only a real write/IO
+                        // failure breaks the writer.
+                        match write_half.send_message(&m).await {
+                            Ok(()) => {}
+                            Err(super::carrier_wire::CarrierWireError::Serialize(_)) => {
+                                tracing::debug!("skipping unserializable cover message");
+                            }
+                            Err(_) => break,
                         }
                     }
                     None => { /* cover lane closed; keep serving data/control */ }
