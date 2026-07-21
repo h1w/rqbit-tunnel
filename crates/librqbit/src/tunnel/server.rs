@@ -56,8 +56,8 @@ pub(crate) struct TunnelServer {
     peers: RwLock<HashMap<TunnelPublicKey, bool>>,
     /// Deterministic synthetic carrier torrent shared with clients via the
     /// DHT rendezvous key (`descriptor().handshake_info_hash`). Not yet
-    /// consumed for BT-handshake presentation or relay — that lands in a
-    /// later task.
+    /// consumed for BT-handshake presentation or relay — that lands in Task 7.
+    #[allow(dead_code)] // consumed by CarrierWire::establish in Task 7
     carrier_store: Arc<TunnelCarrierStore>,
 }
 
