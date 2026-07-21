@@ -10,8 +10,8 @@
 //     streams on the dead connection are reset, new ones use the fresh mux.
 //
 // The server is located by a static `server_addr` (fast path) and/or via the
-// DHT: the server announces the carrier hash (derived from its key), and the
-// client looks it up. DHT results are UNTRUSTED — the Noise IK handshake pins
+// DHT: the server announces the carrier torrent's `handshake_info_hash`, and
+// the client looks it up. DHT results are UNTRUSTED — the Noise IK handshake pins
 // the server's static key, so a wrong/poisoned address simply fails to
 // authenticate and the next candidate is tried.
 
