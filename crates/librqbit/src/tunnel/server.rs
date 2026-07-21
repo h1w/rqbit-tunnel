@@ -7,13 +7,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use librqbit_core::Id20;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 
 use super::carrier::TunnelCarrierStore;
 use super::crypto::{self, NoiseTransport, TunnelCryptoError};
-use super::frame::{TunnelFrame, TunnelPublicKey};
+use super::frame::TunnelPublicKey;
 use super::options::TunnelServerOptions;
 use super::peer_wire_crypto::PeerWireCrypto;
 
@@ -39,13 +38,15 @@ pub enum TunnelAdmissionError {
 
 // ── Admitted peer ───────────────────────────────────────────────────────────
 
-/// A successfully admitted tunnel peer carrying the Noise transport and
-/// encrypted I/O halves for frame relay.
+/// A successfully admitted tunnel peer carrying the Noise transport and the
+/// BitTorrent-masquerade carrier halves for frame relay (real BT peer wire +
+/// `rq_tunnel` extended messages carrying Noise chunks, with piece cover).
 pub(crate) struct AdmittedPeer {
     pub client_key: TunnelPublicKey,
     pub transport: NoiseTransport,
-    pub reader: crate::type_aliases::BoxAsyncReadVectored,
-    pub writer: crate::type_aliases::BoxAsyncWrite,
+    pub read_half: super::carrier_wire::CarrierReadHalf,
+    pub write_half: super::carrier_wire::CarrierWriteHalf,
+    pub carrier_peer: super::carrier_peer::TunnelCarrierPeer,
 }
 
 // ── Server ──────────────────────────────────────────────────────────────────
@@ -55,9 +56,9 @@ pub(crate) struct TunnelServer {
     /// Connected peer keys tracked for admission state.
     peers: RwLock<HashMap<TunnelPublicKey, bool>>,
     /// Deterministic synthetic carrier torrent shared with clients via the
-    /// DHT rendezvous key (`descriptor().handshake_info_hash`). Not yet
-    /// consumed for BT-handshake presentation or relay — that lands in Task 7.
-    #[allow(dead_code)] // consumed by CarrierWire::establish in Task 7
+    /// DHT rendezvous key (`descriptor().handshake_info_hash`). Consumed by
+    /// [`CarrierWire::establish`] in [`accept`](Self::accept) to present a real
+    /// BitTorrent peer wire.
     carrier_store: Arc<TunnelCarrierStore>,
 }
 
@@ -89,60 +90,62 @@ impl TunnelServer {
         stream: TcpStream,
         carrier_hash: Id20,
     ) -> Result<AdmittedPeer, TunnelAdmissionError> {
-        // ── Step 1: PeerWireCrypto responder handshake ──────────────────────
-        let encrypted = PeerWireCrypto::responder(stream, carrier_hash)
+        // ── Step 1: MSE responder ───────────────────────────────────────────
+        let enc = PeerWireCrypto::responder(stream, carrier_hash)
             .await
             .map_err(|e| TunnelAdmissionError::CarrierHandshakeFailed(anyhow::anyhow!("{e}")))?;
 
-        let mut reader = encrypted.reader;
-        let mut writer = encrypted.writer;
+        // ── Step 2: BT handshake + BEP-10 + cover (masquerade) ──────────────
+        let info_hash = self.carrier_store.descriptor().handshake_info_hash;
+        let wire = super::carrier_wire::CarrierWire::establish(
+            enc.reader,
+            enc.writer,
+            self.carrier_store.clone(),
+            info_hash,
+        )
+        .await
+        .map_err(|e| TunnelAdmissionError::CarrierHandshakeFailed(anyhow::anyhow!("{e}")))?;
+        let (mut read_half, mut write_half, carrier_peer) = wire.into_halves();
 
-        // ── Step 2: Read Noise IK initiator message ────────────────────────
-        let mut len_buf = [0u8; 2];
-        reader
-            .read_exact(&mut len_buf)
+        // ── Step 3: Noise IK initiator message, carried over rq_tunnel ──────
+        let mut defrag = super::carrier_chunk::CarrierDefragmenter::new(
+            super::carrier_chunk::MAX_CARRIER_CIPHERTEXT,
+        );
+        let noise_msg = super::carrier_chunk::recv_one_ciphertext(&mut read_half, &mut defrag)
             .await
-            .map_err(|_| TunnelAdmissionError::PeerDisconnected)?;
-        let msg_len = u16::from_be_bytes(len_buf) as usize;
-
-        if msg_len > 512 {
+            .ok_or(TunnelAdmissionError::PeerDisconnected)?;
+        if noise_msg.len() > 512 {
             return Err(TunnelAdmissionError::NoiseHandshakeFailed(
                 TunnelCryptoError::HandshakeFailed(format!(
-                    "noise initiator message too large: {msg_len}"
+                    "noise initiator message too large: {}",
+                    noise_msg.len()
                 )),
             ));
         }
 
-        let mut noise_msg = vec![0u8; msg_len];
-        reader
-            .read_exact(&mut noise_msg)
-            .await
-            .map_err(|_| TunnelAdmissionError::PeerDisconnected)?;
-
-        // ── Step 3: Noise IK responder accept (validates allowlist) ────────
+        // ── Step 4: Noise IK responder accept (validates allowlist) ────────
         let (transport, client_key, reply) = crypto::responder_accept(
             &self.options.identity_key,
             &noise_msg,
             &self.options.allowed_client_keys,
         )?;
 
-        // ── Step 4: Send Noise reply back ──────────────────────────────────
-        let reply_len = (reply.len() as u16).to_be_bytes();
-        writer.write_all(&reply_len).await?;
-        writer.write_all(&reply).await?;
-        writer.flush().await?;
+        // ── Step 5: send Noise reply back over rq_tunnel ───────────────────
+        for chunk in super::carrier_chunk::chunk_ciphertext(&reply) {
+            write_half.send_tunnel(&chunk).await.map_err(|e| {
+                TunnelAdmissionError::CarrierHandshakeFailed(anyhow::anyhow!("{e}"))
+            })?;
+        }
 
-        // ── Step 5: Admit and track ────────────────────────────────────────
-        let peer = AdmittedPeer {
-            client_key: client_key.clone(),
+        // ── Step 6: Admit and track ────────────────────────────────────────
+        self.peers.write().await.insert(client_key.clone(), true);
+        Ok(AdmittedPeer {
+            client_key,
             transport,
-            reader,
-            writer,
-        };
-
-        self.peers.write().await.insert(client_key, true);
-
-        Ok(peer)
+            read_half,
+            write_half,
+            carrier_peer,
+        })
     }
 
     /// Run the accept loop on the given listener, spawning relay tasks
@@ -218,58 +221,6 @@ impl TunnelServer {
     pub(crate) async fn is_admitted(&self, key: &TunnelPublicKey) -> bool {
         self.peers.read().await.contains_key(key)
     }
-}
-
-// ── Frame I/O helpers ───────────────────────────────────────────────────────
-
-/// Read a Noise-encrypted `TunnelFrame` from the given reader.
-pub(crate) async fn read_frame(
-    transport: &mut NoiseTransport,
-    reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-) -> Result<TunnelFrame, TunnelCryptoError> {
-    let mut len_buf = [0u8; 2];
-    reader
-        .read_exact(&mut len_buf)
-        .await
-        .map_err(|e| TunnelCryptoError::DecryptFailed(format!("read len: {e}")))?;
-    let len = u16::from_be_bytes(len_buf) as usize;
-
-    if len == 0 || len > super::frame::MAX_FRAME_PAYLOAD + 32 {
-        return Err(TunnelCryptoError::DecryptFailed(format!(
-            "invalid frame length: {len}"
-        )));
-    }
-
-    let mut ciphertext = vec![0u8; len];
-    reader
-        .read_exact(&mut ciphertext)
-        .await
-        .map_err(|e| TunnelCryptoError::DecryptFailed(format!("read frame: {e}")))?;
-
-    transport.decrypt(&ciphertext)
-}
-
-/// Write a `TunnelFrame` through the Noise transport to the given writer.
-pub(crate) async fn write_frame(
-    transport: &mut NoiseTransport,
-    writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
-    frame: &TunnelFrame,
-) -> Result<(), TunnelCryptoError> {
-    let ciphertext = transport.encrypt(frame)?;
-    let len = (ciphertext.len() as u16).to_be_bytes();
-    writer
-        .write_all(&len)
-        .await
-        .map_err(|e| TunnelCryptoError::EncryptFailed(format!("write len: {e}")))?;
-    writer
-        .write_all(&ciphertext)
-        .await
-        .map_err(|e| TunnelCryptoError::EncryptFailed(format!("write frame: {e}")))?;
-    writer
-        .flush()
-        .await
-        .map_err(|e| TunnelCryptoError::EncryptFailed(format!("flush: {e}")))?;
-    Ok(())
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

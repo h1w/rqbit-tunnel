@@ -76,6 +76,37 @@ impl CarrierDefragmenter {
     }
 }
 
+/// Pump carrier messages until one full defragmented ciphertext is available.
+///
+/// Shared by both the client and server during the Noise-over-carrier
+/// handshake. Non-`rq_tunnel` messages (early piece cover such as
+/// Bitfield/Unchoke/Interested) are ignored — the handshake only expects the
+/// peer's Noise chunks. Returns `None` on disconnect or a defrag error (an
+/// oversized declared length is treated as a disconnect, closing a pre-auth
+/// memory-DoS).
+pub(crate) async fn recv_one_ciphertext(
+    read_half: &mut super::carrier_wire::CarrierReadHalf,
+    defrag: &mut CarrierDefragmenter,
+) -> Option<Vec<u8>> {
+    use peer_binary_protocol::{Message, extended::ExtendedMessage};
+    loop {
+        match read_half.recv_message().await.ok()?? {
+            Message::Extended(ExtendedMessage::RqTunnel(rq)) => match defrag.push(rq.as_bytes()) {
+                Ok(mut done) => {
+                    if !done.is_empty() {
+                        return Some(done.remove(0));
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "carrier defrag error during handshake");
+                    return None;
+                }
+            },
+            _ => continue,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

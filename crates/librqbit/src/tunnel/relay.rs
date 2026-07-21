@@ -14,62 +14,106 @@
 // SINGLE writer task drains an mpsc of outbound frames, so frames hit the wire
 // in the exact order their sequence numbers were assigned.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use peer_binary_protocol::Message;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::type_aliases::BoxAsyncWrite;
-
 use super::config::{
     CONNECT_TIMEOUT, OPEN_WINDOW, OUTBOUND_QUEUE, PACING_BURST, PER_STREAM_QUEUE, PING_INTERVAL,
     PING_NONCE_MAP_CAP, READ_CHUNK, UDP_READ_BUF,
 };
-use super::crypto::{NoiseTransport, TunnelCryptoError};
+use super::crypto::NoiseTransport;
 use super::egress::{EgressPolicy, EgressTransport};
 use super::flow::{
     IdleGuard, RttEstimator, SendCredit, TokenBucket, WindowController, drive_flow_control,
     record_ping_sent,
 };
-use super::frame::{MAX_FRAME_PAYLOAD, TunnelDestination, TunnelErrorCode, TunnelFrame};
+use super::frame::{TunnelDestination, TunnelErrorCode, TunnelFrame};
 use super::server::AdmittedPeer;
 
 // ── Shared wire helpers ─────────────────────────────────────────────────────
 
-/// Read one length-prefixed, Noise-encrypted frame.
+/// Read carrier messages until one decrypted tunnel `TunnelFrame` is available,
+/// serving piece cover (Request→Piece) via `cover_tx` along the way.
 ///
-/// The socket read happens WITHOUT the transport lock; the lock is taken only
-/// to decrypt, so a blocked/idle read never starves the writer task.
-pub(crate) async fn read_encrypted_frame<R: AsyncRead + Unpin>(
+/// Shared by BOTH the server relay and the client mux reader. `rq_tunnel`
+/// messages carry chunked Noise ciphertext which is defragmented, then each
+/// complete ciphertext blob is decrypted into a `TunnelFrame`. Because
+/// `defrag.push` can yield MULTIPLE blobs in one call, decoded-but-not-yet-
+/// returned blobs are buffered in `pending` and drained one at a time at the
+/// top of the loop, so no frame is ever lost.
+///
+/// Returns `None` on disconnect, a hard decrypt error, a defrag error (an
+/// oversized declared length — closes a pre-auth memory-DoS), or a carrier peer
+/// disconnect request.
+pub(crate) async fn next_tunnel_frame(
+    read_half: &mut super::carrier_wire::CarrierReadHalf,
+    defrag: &mut super::carrier_chunk::CarrierDefragmenter,
+    pending: &mut VecDeque<Vec<u8>>,
     transport: &Mutex<NoiseTransport>,
-    reader: &mut R,
-) -> Result<TunnelFrame, TunnelCryptoError> {
-    let mut len_buf = [0u8; 2];
-    reader
-        .read_exact(&mut len_buf)
-        .await
-        .map_err(|e| TunnelCryptoError::DecryptFailed(format!("read len: {e}")))?;
-    let len = u16::from_be_bytes(len_buf) as usize;
-    if len == 0 || len > MAX_FRAME_PAYLOAD + 32 {
-        return Err(TunnelCryptoError::DecryptFailed(format!(
-            "invalid frame length: {len}"
-        )));
+    carrier_peer: &mut super::carrier_peer::TunnelCarrierPeer,
+    cover_tx: &mpsc::Sender<Message<'static>>,
+) -> Option<TunnelFrame> {
+    use peer_binary_protocol::extended::ExtendedMessage;
+    loop {
+        // Drain any already-defragmented blob before reading a new message, so a
+        // single `push` that yielded several blobs returns them all in order.
+        if let Some(blob) = pending.pop_front() {
+            let mut t = transport.lock().await;
+            return match t.decrypt(&blob) {
+                Ok(frame) => Some(frame),
+                Err(e) => {
+                    tracing::debug!(error = %e, "carrier frame decrypt failed");
+                    None
+                }
+            };
+        }
+
+        let msg = read_half.recv_message().await.ok()??;
+        match msg {
+            Message::Extended(ExtendedMessage::RqTunnel(rq)) => match defrag.push(rq.as_bytes()) {
+                Ok(blobs) => {
+                    for blob in blobs {
+                        pending.push_back(blob);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "carrier defrag error");
+                    return None;
+                }
+            },
+            Message::KeepAlive => {}
+            other => match carrier_peer.on_message(other).await {
+                Ok(actions) => {
+                    for a in actions {
+                        match a {
+                            super::carrier_peer::CarrierAction::OutgoingMessage(m) => {
+                                let _ = cover_tx.send(m).await;
+                            }
+                            super::carrier_peer::CarrierAction::Disconnect(reason) => {
+                                tracing::debug!(%reason, "carrier peer requested disconnect");
+                                return None;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "carrier cover error");
+                    return None;
+                }
+            },
+        }
     }
-    let mut ciphertext = vec![0u8; len];
-    reader
-        .read_exact(&mut ciphertext)
-        .await
-        .map_err(|e| TunnelCryptoError::DecryptFailed(format!("read frame: {e}")))?;
-    let mut t = transport.lock().await;
-    t.decrypt(&ciphertext)
 }
 
 /// Cloneable handle for submitting frames to the single writer task.
@@ -225,7 +269,8 @@ fn tcp_data_wire_len(stream_id: u64, payload_len: usize) -> u64 {
 /// of traffic. It MUST be the SAME `Arc` handed to the control task.
 pub(crate) fn spawn_frame_writer(
     transport: Arc<Mutex<NoiseTransport>>,
-    mut writer: BoxAsyncWrite,
+    mut write_half: super::carrier_wire::CarrierWriteHalf,
+    mut cover_rx: mpsc::Receiver<Message<'static>>,
     shutdown: CancellationToken,
     pacing_rate: Arc<AtomicU64>,
     paced: Arc<AtomicBool>,
@@ -250,7 +295,7 @@ pub(crate) fn spawn_frame_writer(
         // Returns `false` on any fatal error (encrypt/IO), signalling the loop
         // to break.
         async fn write_frame(
-            writer: &mut BoxAsyncWrite,
+            write_half: &mut super::carrier_wire::CarrierWriteHalf,
             transport: &Mutex<NoiseTransport>,
             frame: &TunnelFrame,
         ) -> bool {
@@ -264,10 +309,14 @@ pub(crate) fn spawn_frame_writer(
                     }
                 }
             };
-            let len = (blob.len() as u16).to_be_bytes();
-            !(writer.write_all(&len).await.is_err()
-                || writer.write_all(&blob).await.is_err()
-                || writer.flush().await.is_err())
+            // The Noise ciphertext is chunked across one or more `rq_tunnel`
+            // extended messages; a write failure on any chunk breaks the writer.
+            for chunk in super::carrier_chunk::chunk_ciphertext(&blob) {
+                if write_half.send_tunnel(&chunk).await.is_err() {
+                    return false;
+                }
+            }
+            true
         }
 
         // A data frame awaiting its pacing deadline (kept PLAINTEXT — see
@@ -282,18 +331,26 @@ pub(crate) fn spawn_frame_writer(
         // check instead.
         let mut control_open = true;
         let mut data_open = true;
+        // The cover lane (piece Request→Piece responses) is best-effort and does
+        // NOT gate writer exit: once it closes we just disable its arm so a
+        // closed `recv()` (instantly-ready `None`) can't livelock the `biased`
+        // select and starve data.
+        let mut cover_open = true;
 
         loop {
-            // Both lanes drained and closed, nothing left to flush: peer gone.
+            // Both PRIMARY lanes drained and closed, nothing left to flush: peer
+            // gone. Cover is secondary and never keeps the writer alive.
             if !control_open && !data_open && pending.is_none() {
                 break;
             }
             tokio::select! {
-                // Priority order: shutdown, then the control lane, then a due
-                // pending data frame, then admitting a new data frame. `biased`
-                // is what makes the control lane preempt paced data: whenever a
-                // control frame is ready it is serviced before the pending
-                // data's deadline arm and before pulling more data.
+                // Priority order: shutdown, then the control lane, then the cover
+                // lane, then a due pending data frame, then admitting a new data
+                // frame. `biased` is what makes the control lane preempt paced
+                // data: whenever a control frame is ready it is serviced before
+                // the pending data's deadline arm and before pulling more data.
+                // Cover sits between control and data: unpaced, but never ahead
+                // of a `Ping`/`Pong`/`Credit`.
                 biased;
 
                 _ = shutdown.cancelled() => break,
@@ -301,11 +358,26 @@ pub(crate) fn spawn_frame_writer(
                 // Control priority lane — never paced, always first.
                 ctrl = control_rx.recv(), if control_open => match ctrl {
                     Some(ctrl) => {
-                        if !write_frame(&mut writer, &transport, &ctrl).await {
+                        if !write_frame(&mut write_half, &transport, &ctrl).await {
                             break;
                         }
                     }
                     None => control_open = false,
+                },
+
+                // Cover lane — piece Request→Piece cover, unpaced, lower priority
+                // than control. A cover message that fails to SERIALIZE (e.g. an
+                // oversized Piece a malicious peer tried to request) must NOT kill
+                // the tunnel — skip it. Only a real write/IO failure breaks.
+                cover = cover_rx.recv(), if cover_open => match cover {
+                    Some(m) => match write_half.send_message(&m).await {
+                        Ok(()) => {}
+                        Err(super::carrier_wire::CarrierWireError::Serialize(_)) => {
+                            tracing::debug!("skipping unserializable cover message");
+                        }
+                        Err(_) => break,
+                    },
+                    None => cover_open = false,
                 },
 
                 // The pending data frame's pace deadline elapsed. `sleep_until`
@@ -316,7 +388,7 @@ pub(crate) fn spawn_frame_writer(
                 _ = async { tokio::time::sleep_until(deadline.unwrap()).await }, if pending.is_some() => {
                     let frame = pending.take().unwrap();
                     deadline = None;
-                    if !write_frame(&mut writer, &transport, &frame).await {
+                    if !write_frame(&mut write_half, &transport, &frame).await {
                         break;
                     }
                 }
@@ -351,7 +423,7 @@ pub(crate) fn spawn_frame_writer(
                             let now_nanos = base.elapsed().as_nanos() as u64;
                             let delay_nanos = bucket.take(now_nanos, pace_len);
                             if delay_nanos == 0 {
-                                if !write_frame(&mut writer, &transport, &data).await {
+                                if !write_frame(&mut write_half, &transport, &data).await {
                                     break;
                                 }
                             } else {
@@ -366,7 +438,7 @@ pub(crate) fn spawn_frame_writer(
                             }
                         }
                         None => {
-                            if !write_frame(&mut writer, &transport, &data).await {
+                            if !write_frame(&mut write_half, &transport, &data).await {
                                 break;
                             }
                         }
@@ -433,11 +505,15 @@ pub(crate) async fn run_server_relay(
     let AdmittedPeer {
         client_key,
         transport,
-        mut reader,
-        writer,
+        mut read_half,
+        write_half,
+        carrier_peer,
     } = peer;
 
     let transport = Arc::new(Mutex::new(transport));
+    // Cover lane: `next_tunnel_frame` funnels piece Request→Piece cover here and
+    // the writer task drains it (unpaced, below control priority).
+    let (cover_tx, cover_rx) = mpsc::channel::<Message<'static>>(OUTBOUND_QUEUE);
     // ONE pacing-rate cell shared by the writer (which re-reads it per frame)
     // and the control task below (which drives it to `target / rtt`). Seeded at
     // the effectively-unlimited default until the first RTT sample lands.
@@ -448,7 +524,8 @@ pub(crate) async fn run_server_relay(
     let paced = Arc::new(AtomicBool::new(false));
     let (sink, writer_handle) = spawn_frame_writer(
         transport.clone(),
-        writer,
+        write_half,
+        cover_rx,
         shutdown.clone(),
         pacing_rate.clone(),
         paced.clone(),
@@ -478,13 +555,29 @@ pub(crate) async fn run_server_relay(
         shutdown.clone(),
     ));
 
+    // Carrier read state: the defragmenter reassembles chunked Noise ciphertext,
+    // `pending` buffers multiple blobs a single `push` can yield, and
+    // `carrier_peer` handles inbound piece cover.
+    let mut defrag = super::carrier_chunk::CarrierDefragmenter::new(
+        super::carrier_chunk::MAX_CARRIER_CIPHERTEXT,
+    );
+    let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut carrier_peer = carrier_peer;
+
     loop {
         let frame = tokio::select! {
             _ = shutdown.cancelled() => break,
-            r = read_encrypted_frame(&transport, &mut reader) => match r {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::debug!(error = %e, "tunnel server relay: peer read ended");
+            f = next_tunnel_frame(
+                &mut read_half,
+                &mut defrag,
+                &mut pending,
+                &transport,
+                &mut carrier_peer,
+                &cover_tx,
+            ) => match f {
+                Some(f) => f,
+                None => {
+                    tracing::debug!("tunnel server relay: peer read ended");
                     break;
                 }
             },
@@ -936,13 +1029,16 @@ async fn udp_recv_loop(
 mod tests {
     use std::collections::HashSet;
 
-    use tokio::io::AsyncReadExt;
-
+    use super::super::carrier::{TunnelCarrierConfig, TunnelCarrierStore};
+    use super::super::carrier_chunk::{CarrierDefragmenter, MAX_CARRIER_CIPHERTEXT};
+    use super::super::carrier_peer::TunnelCarrierPeer;
+    use super::super::carrier_wire::{CarrierReadHalf, CarrierWire, CarrierWriteHalf};
     use super::super::config::PACING_DEFAULT_RATE;
     use super::super::crypto::{
         generate_keypair, initiator_complete, initiator_start, responder_accept,
     };
     use super::super::frame::TunnelPublicKey;
+    use super::super::peer_wire_crypto::PeerWireCrypto;
     use super::*;
 
     /// A real (in-process) authenticated Noise pair, so `spawn_frame_writer`
@@ -960,29 +1056,76 @@ mod tests {
         (client_transport, server_transport)
     }
 
-    /// Run the real writer task over a real Noise transport, send `n` frames
-    /// each carrying `payload_len` bytes, and return (wall-clock elapsed,
-    /// total on-wire bytes written, the shared `paced` flag) by draining the
-    /// raw length-prefixed frames on the other end of an in-memory duplex pipe.
-    /// The returned `paced` Arc is the EXACT one handed to the writer, so a test
-    /// can prove the writer sets it when (and only when) it actually throttles.
+    type CarrierHalves = (CarrierReadHalf, CarrierWriteHalf, TunnelCarrierPeer);
+
+    /// Build a real BitTorrent-masquerade carrier pair over an in-process
+    /// duplex, returning both ends' `(read, write, cover-peer)` halves. The
+    /// writer tests drive the client write half and receive on the server read
+    /// half via `next_tunnel_frame`, so the whole carrier receive path (defrag +
+    /// decrypt) is exercised alongside the pacing/priority logic.
+    async fn carrier_test_pair() -> (CarrierHalves, CarrierHalves) {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Leak the tempdir so the store's files outlive this fn for the test.
+        let path = dir.keep();
+        let config = TunnelCarrierConfig {
+            corpus_bytes: 512 * 1024,
+            piece_length: 128 * 1024,
+            display_name: "debian-12.iso".to_string(),
+            seed: [0u8; 32],
+        };
+        let store = Arc::new(
+            TunnelCarrierStore::open_or_initialize(&path, &config)
+                .await
+                .unwrap(),
+        );
+        let info_hash = store.descriptor().handshake_info_hash;
+        let (client_io, server_io) = tokio::io::duplex(8 * 1024 * 1024);
+        let server_store = store.clone();
+        let server = tokio::spawn(async move {
+            let enc = PeerWireCrypto::responder(server_io, info_hash)
+                .await
+                .unwrap();
+            CarrierWire::establish(enc.reader, enc.writer, server_store, info_hash)
+                .await
+                .unwrap()
+                .into_halves()
+        });
+        let enc = PeerWireCrypto::initiator(client_io, info_hash)
+            .await
+            .unwrap();
+        let client_halves = CarrierWire::establish(enc.reader, enc.writer, store, info_hash)
+            .await
+            .unwrap()
+            .into_halves();
+        let server_halves = server.await.unwrap();
+        (client_halves, server_halves)
+    }
+
+    /// Run the real writer task over a real Noise transport + carrier, send `n`
+    /// frames each carrying `payload_len` bytes, and return (wall-clock elapsed,
+    /// total paced bytes, the shared `paced` flag) by receiving every frame back
+    /// through the carrier read path (`next_tunnel_frame`) on the other end.
+    /// `total_bytes` is the sum of `tcp_data_wire_len` per received `TcpData` —
+    /// the exact byte count the writer's token bucket paced against. The returned
+    /// `paced` Arc is the EXACT one handed to the writer, so a test can prove the
+    /// writer sets it when (and only when) it actually throttles.
     async fn run_writer_and_measure(
         rate_bytes_per_s: u64,
         n_frames: usize,
         payload_len: usize,
     ) -> (Duration, u64, Arc<AtomicBool>) {
-        let (client_transport, _server_transport) = handshake_pair();
-        // Sized generously so `write_all` never blocks on the reader side —
-        // this test only cares about the writer's own internal pacing delay,
-        // not pipe backpressure.
-        let (write_half, mut read_half) = tokio::io::duplex(8 * 1024 * 1024);
+        let (client_transport, server_transport) = handshake_pair();
+        let ((_c_read, c_write, _c_peer), (mut s_read, _s_write, s_peer)) =
+            carrier_test_pair().await;
 
         let shutdown = CancellationToken::new();
         let pacing_rate = Arc::new(AtomicU64::new(rate_bytes_per_s));
         let paced = Arc::new(AtomicBool::new(false));
+        let (cover_tx, cover_rx) = mpsc::channel::<Message<'static>>(OUTBOUND_QUEUE);
         let (sink, _handle) = spawn_frame_writer(
             Arc::new(Mutex::new(client_transport)),
-            Box::new(write_half),
+            c_write,
+            cover_rx,
             shutdown.clone(),
             pacing_rate,
             paced.clone(),
@@ -999,21 +1142,34 @@ mod tests {
             assert!(ok, "frame {i} should have been accepted by the writer");
         }
 
-        // Drain exactly `n_frames` length-prefixed blobs off the wire; this
-        // only completes once the (possibly paced) writer has actually
-        // written every byte, so `start.elapsed()` below captures the full
-        // pacing delay, not just enqueue time.
+        // Receive exactly `n_frames` frames back through the carrier; this only
+        // completes once the (possibly paced) writer has actually written every
+        // byte, so `start.elapsed()` captures the full pacing delay. `cover_tx`
+        // is unused (no inbound Requests), so it never blocks.
+        let s_transport = Arc::new(Mutex::new(server_transport));
+        let mut defrag = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
+        let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
+        let mut s_peer = s_peer;
+        let (rx_cover_tx, _rx_cover_rx) = mpsc::channel::<Message<'static>>(OUTBOUND_QUEUE);
         let mut total_bytes: u64 = 0;
         for _ in 0..n_frames {
-            let mut len_buf = [0u8; 2];
-            read_half.read_exact(&mut len_buf).await.unwrap();
-            let len = u16::from_be_bytes(len_buf) as usize;
-            let mut blob = vec![0u8; len];
-            read_half.read_exact(&mut blob).await.unwrap();
-            total_bytes += (2 + len) as u64;
+            let frame = next_tunnel_frame(
+                &mut s_read,
+                &mut defrag,
+                &mut pending,
+                &s_transport,
+                &mut s_peer,
+                &rx_cover_tx,
+            )
+            .await
+            .expect("frame must arrive");
+            if let TunnelFrame::TcpData { stream_id, bytes } = frame {
+                total_bytes += tcp_data_wire_len(stream_id, bytes.len());
+            }
         }
         let elapsed = start.elapsed();
 
+        let _ = cover_tx;
         shutdown.cancel();
         (elapsed, total_bytes, paced)
     }
@@ -1075,8 +1231,14 @@ mod tests {
         let (elapsed, _total_bytes, paced) =
             run_writer_and_measure(PACING_DEFAULT_RATE, N_FRAMES, PAYLOAD).await;
 
+        // The precise "no throttling" proof is the `!paced` assertion below; this
+        // wall-clock ceiling only rules out a pacing-scale stall. It is generous
+        // because receiving through the real carrier (BT framing + defrag + Noise
+        // decrypt, unoptimized) has a fixed per-frame cost and this runs under
+        // heavy parallel-test contention — far below the multi-second delay a
+        // genuinely-throttled writer would incur for these bytes.
         assert!(
-            elapsed < Duration::from_millis(500),
+            elapsed < Duration::from_secs(3),
             "default pacing rate should not meaningfully delay throughput, took {elapsed:?}"
         );
         // At the effectively-unlimited default rate the writer never sleeps for
@@ -1104,14 +1266,17 @@ mod tests {
         const N_DATA: usize = 18; // > PACING_BURST (256 KiB) so the tail paces
         const LOW_RATE: u64 = 64 * 1024; // 64 KiB/s
 
-        let (client_transport, mut server_transport) = handshake_pair();
-        let (write_half, mut read_half) = tokio::io::duplex(8 * 1024 * 1024);
+        let (client_transport, server_transport) = handshake_pair();
+        let ((_c_read, c_write, _c_peer), (mut s_read, _s_write, s_peer)) =
+            carrier_test_pair().await;
         let shutdown = CancellationToken::new();
         let pacing_rate = Arc::new(AtomicU64::new(LOW_RATE));
         let paced = Arc::new(AtomicBool::new(false));
+        let (_cover_tx, cover_rx) = mpsc::channel::<Message<'static>>(OUTBOUND_QUEUE);
         let (sink, _handle) = spawn_frame_writer(
             Arc::new(Mutex::new(client_transport)),
-            Box::new(write_half),
+            c_write,
+            cover_rx,
             shutdown.clone(),
             pacing_rate,
             paced.clone(),
@@ -1135,18 +1300,27 @@ mod tests {
             "ping should be accepted"
         );
 
-        // Read + decrypt every frame in wire order.
+        // Receive + decrypt every frame in wire order through the carrier read
+        // path. Decrypting in order also proves the writer preserved Noise's
+        // per-message sequence order == wire order despite the reordering.
+        let s_transport = Arc::new(Mutex::new(server_transport));
+        let mut defrag = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
+        let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
+        let mut s_peer = s_peer;
+        let (rx_cover_tx, _rx_cover_rx) = mpsc::channel::<Message<'static>>(OUTBOUND_QUEUE);
         let mut frames = Vec::with_capacity(N_DATA + 1);
         for _ in 0..(N_DATA + 1) {
-            let mut len_buf = [0u8; 2];
-            read_half.read_exact(&mut len_buf).await.unwrap();
-            let len = u16::from_be_bytes(len_buf) as usize;
-            let mut blob = vec![0u8; len];
-            read_half.read_exact(&mut blob).await.unwrap();
             frames.push(
-                server_transport
-                    .decrypt(&blob)
-                    .expect("wire order must equal Noise sequence order"),
+                next_tunnel_frame(
+                    &mut s_read,
+                    &mut defrag,
+                    &mut pending,
+                    &s_transport,
+                    &mut s_peer,
+                    &rx_cover_tx,
+                )
+                .await
+                .expect("wire order must equal Noise sequence order"),
             );
         }
         shutdown.cancel();
@@ -1185,13 +1359,15 @@ mod tests {
     #[tokio::test]
     async fn writer_exits_when_both_lanes_close() {
         let (client_transport, _server_transport) = handshake_pair();
-        let (write_half, _read_half) = tokio::io::duplex(64 * 1024);
+        let ((_c_read, c_write, _c_peer), _server_halves) = carrier_test_pair().await;
         let shutdown = CancellationToken::new();
         let pacing_rate = Arc::new(AtomicU64::new(PACING_DEFAULT_RATE));
         let paced = Arc::new(AtomicBool::new(false));
+        let (_cover_tx, cover_rx) = mpsc::channel::<Message<'static>>(OUTBOUND_QUEUE);
         let (sink, handle) = spawn_frame_writer(
             Arc::new(Mutex::new(client_transport)),
-            Box::new(write_half),
+            c_write,
+            cover_rx,
             shutdown.clone(),
             pacing_rate,
             paced,
