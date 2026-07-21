@@ -7,7 +7,20 @@
 
 use peer_binary_protocol::MAX_RQ_TUNNEL_MESSAGE_LEN;
 
+use super::frame::MAX_FRAME_PAYLOAD;
+
 pub(crate) const CHUNK_MAX: usize = MAX_RQ_TUNNEL_MESSAGE_LEN;
+
+/// Upper bound on a single reassembled ciphertext message. A declared length
+/// above this is rejected before buffering — a legitimate Noise ciphertext of a
+/// max-size frame is `MAX_FRAME_PAYLOAD + 32`; the extra slack is defensive.
+pub(crate) const MAX_CARRIER_CIPHERTEXT: usize = MAX_FRAME_PAYLOAD + 64;
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum CarrierChunkError {
+    #[error("declared message length {declared} exceeds max {max}")]
+    MessageTooLarge { declared: usize, max: usize },
+}
 
 /// Split one ciphertext blob into ordered <= CHUNK_MAX chunks (with a 4-byte
 /// length prefix on the logical message).
@@ -23,16 +36,21 @@ pub(crate) fn chunk_ciphertext(blob: &[u8]) -> Vec<Vec<u8>> {
 /// `chunk_ciphertext`.
 pub(crate) struct CarrierDefragmenter {
     buf: Vec<u8>,
+    max: usize,
 }
 
 impl CarrierDefragmenter {
-    pub(crate) fn new() -> Self {
-        Self { buf: Vec::new() }
+    pub(crate) fn new(max_msg_len: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            max: max_msg_len,
+        }
     }
 
     /// Push one received rq_tunnel payload; return zero or more complete
-    /// ciphertext messages now available.
-    pub(crate) fn push(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
+    /// ciphertext messages now available. Returns `MessageTooLarge` (before
+    /// buffering the rest) if a declared length exceeds `max`.
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> Result<Vec<Vec<u8>>, CarrierChunkError> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
         loop {
@@ -41,6 +59,12 @@ impl CarrierDefragmenter {
             }
             let len =
                 u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
+            if len > self.max {
+                return Err(CarrierChunkError::MessageTooLarge {
+                    declared: len,
+                    max: self.max,
+                });
+            }
             if self.buf.len() < 4 + len {
                 break;
             }
@@ -48,7 +72,7 @@ impl CarrierDefragmenter {
             self.buf.drain(..4 + len);
             out.push(msg);
         }
-        out
+        Ok(out)
     }
 }
 
@@ -61,10 +85,10 @@ mod tests {
         for c in &chunks {
             assert!(c.len() <= CHUNK_MAX, "chunk {} > CHUNK_MAX", c.len());
         }
-        let mut d = CarrierDefragmenter::new();
+        let mut d = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
         let mut out = Vec::new();
         for c in chunks {
-            out.extend(d.push(&c));
+            out.extend(d.push(&c).unwrap());
         }
         assert_eq!(out.len(), 1, "exactly one message reassembled");
         assert_eq!(out[0], blob);
@@ -92,10 +116,10 @@ mod tests {
         let mut stream = chunk_ciphertext(&a);
         stream.extend(chunk_ciphertext(&b));
 
-        let mut d = CarrierDefragmenter::new();
+        let mut d = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
         let mut out = Vec::new();
         for c in stream {
-            out.extend(d.push(&c));
+            out.extend(d.push(&c).unwrap());
         }
         assert_eq!(out, vec![a, b]);
     }
@@ -106,11 +130,27 @@ mod tests {
         let blob = vec![9u8; 5000];
         let chunks = chunk_ciphertext(&blob);
         let joined: Vec<u8> = chunks.into_iter().flatten().collect();
-        let mut d = CarrierDefragmenter::new();
+        let mut d = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
         let mut out = Vec::new();
         for byte in joined {
-            out.extend(d.push(&[byte]));
+            out.extend(d.push(&[byte]).unwrap());
         }
         assert_eq!(out, vec![blob]);
+    }
+
+    #[test]
+    fn rejects_oversized_declared_length() {
+        // A 4-byte prefix declaring a length just over the cap, with no payload,
+        // must return MessageTooLarge without buffering.
+        let mut d = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
+        let declared = (MAX_CARRIER_CIPHERTEXT + 1) as u32;
+        let err = d.push(&declared.to_be_bytes()).unwrap_err();
+        assert_eq!(
+            err,
+            CarrierChunkError::MessageTooLarge {
+                declared: MAX_CARRIER_CIPHERTEXT + 1,
+                max: MAX_CARRIER_CIPHERTEXT
+            }
+        );
     }
 }
