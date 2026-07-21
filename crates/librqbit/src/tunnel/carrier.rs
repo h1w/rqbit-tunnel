@@ -282,11 +282,13 @@ impl TunnelCarrierStore {
             .get(&pieces_root)
             .ok_or_else(|| anyhow::anyhow!("carrier piece layers missing root"))?;
         let stored_bytes_ref = stored_bytes.as_ref();
+        // Return a recoverable error (not panic) on a misaligned stored layer so
+        // `open_or_initialize`'s self-heal path can re-initialize a corrupt dir.
         let stored_hashes: Vec<Id32> = stored_bytes_ref
             .chunks(32)
             .map(|chunk| {
                 if chunk.len() != 32 {
-                    panic!(
+                    bail!(
                         "carrier piece layer has trailing bytes: {} total, {} remainder",
                         stored_bytes_ref.len(),
                         stored_bytes_ref.len() % 32
@@ -294,9 +296,9 @@ impl TunnelCarrierStore {
                 }
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(chunk);
-                Id32::new(arr)
+                Ok(Id32::new(arr))
             })
-            .collect();
+            .collect::<anyhow::Result<Vec<Id32>>>()?;
 
         if computed_hashes != stored_hashes {
             bail!("carrier piece hash mismatch on reopen");
