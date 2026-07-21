@@ -223,11 +223,16 @@ pub(crate) const MAX_SEEDER_PIECES_PER_CONN: usize = 64;
 /// across ALL connections, not just one (that's `MAX_SEEDER_PIECES_PER_CONN`).
 pub(crate) const SEEDER_UPLOAD_SLOTS: usize = 4;
 
-/// Per-source-IP cap on concurrent pre-auth seeder connections (checked in
-/// `server.rs::run`'s accept loop, before the MSE/BT handshake even starts).
-/// Bounds one address from opening unbounded parallel connections to
-/// multiply its resource draw.
-pub(crate) const MAX_SEEDER_CONNS_PER_IP: usize = 8;
+/// Per-source-IP cap on concurrent PRE-AUTH seeder connections, checked in
+/// `server.rs::run`'s accept loop before the MSE/BT handshake starts.
+/// Authenticated connections RELEASE their slot on promotion, so this bounds
+/// only handshaking/probing peers — never trusted long-lived relay carriers.
+/// Kept comfortably above `MAX_CARRIERS` (16) so a single legitimate client's
+/// concurrent carrier handshakes never trip it, with headroom for several
+/// clients sharing one CGNAT/VPN egress IP (a common case for circumvention
+/// users), while still bounding a single-IP pre-auth flood — each such
+/// connection is itself bounded by the seed-window deadline + pieces cap.
+pub(crate) const MAX_SEEDER_CONNS_PER_IP: usize = 64;
 
 /// Global cap on concurrent pre-auth seeder connections, across all source
 /// IPs (checked alongside `MAX_SEEDER_CONNS_PER_IP` in `server.rs::run`).

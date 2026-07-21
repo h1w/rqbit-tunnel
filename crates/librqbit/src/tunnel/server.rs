@@ -463,6 +463,16 @@ impl TunnelServer {
                                 let _guard = guard;
                                 match server.accept(stream, carrier_hash).await {
                                     Ok(AcceptOutcome::Admitted(peer)) => {
+                                        // Authenticated (allowlisted): release the
+                                        // pre-auth seeder slot BEFORE relaying. The
+                                        // per-IP/global caps bound pre-auth probers,
+                                        // not trusted long-lived carriers — a legit
+                                        // client opens up to MAX_CARRIERS from one IP,
+                                        // and circumvention users routinely share a
+                                        // CGNAT/VPN egress IP, so counting authenticated
+                                        // carriers against the per-IP cap would lock out
+                                        // legitimate users.
+                                        drop(_guard);
                                         let client_key = peer.client_key.clone();
                                         tracing::info!(?client_key, %addr, "tunnel peer admitted");
                                         super::relay::run_server_relay(
@@ -956,6 +966,84 @@ mod tests {
         drop(write_half);
         let _ = accept_task.await;
         drop(held_permits);
+    }
+
+    #[tokio::test]
+    async fn promotion_clears_pre_auth_choke_even_with_slots_exhausted() {
+        // Regression (Task 2 review): a connection that lost the optimistic
+        // upload-slot race is choked pre-auth, but once it promotes with a valid
+        // allowlisted Noise handshake it MUST be unchoked so the authenticated
+        // relay still serves its post-auth cover traffic.
+        use super::super::carrier_chunk::{
+            CarrierDefragmenter, MAX_CARRIER_CIPHERTEXT, chunk_ciphertext, recv_one_ciphertext,
+        };
+        use super::super::carrier_wire::CarrierWire;
+        use std::net::{Ipv4Addr, SocketAddrV4};
+
+        let identity_key = server_key();
+        let server_pub = crypto::public_key(&identity_key);
+        let (client_sk, client_pk) = crypto::generate_keypair();
+        let (_dir, store) = test_carrier_store(&identity_key).await;
+        let info_hash = store.descriptor().handshake_info_hash;
+        let opts = test_server_options(allowed_client_keys(std::slice::from_ref(&client_pk)));
+        let server = TunnelServer::new(opts, store.clone());
+
+        // Exhaust every upload slot so `accept` re-chokes this peer pre-auth.
+        let held: Vec<_> = (0..super::super::config::SEEDER_UPLOAD_SLOTS)
+            .map(|_| server.upload_slots.clone().try_acquire_owned().unwrap())
+            .collect();
+
+        let listener = tokio::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let listen_addr = listener.local_addr().unwrap();
+        let carrier_hash = Id20::new([0xD3; 20]);
+
+        let server_clone = server.clone();
+        let accept_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("listener accept");
+            server_clone.accept(stream, carrier_hash).await
+        });
+
+        let client_stream = tokio::net::TcpStream::connect(listen_addr)
+            .await
+            .expect("client connect");
+        let enc = PeerWireCrypto::initiator(client_stream, carrier_hash)
+            .await
+            .expect("client MSE initiator");
+        let wire = CarrierWire::establish(enc.reader, enc.writer, store.clone(), info_hash)
+            .await
+            .expect("client carrier establish");
+        let (mut read_half, mut write_half, _client_peer) = wire.into_halves();
+
+        // Promote with a valid allowlisted Noise init.
+        let (handshake, noise_msg) =
+            crypto::initiator_start(&client_sk, &server_pub).expect("initiator_start");
+        for chunk in chunk_ciphertext(&noise_msg) {
+            write_half
+                .send_tunnel(&chunk)
+                .await
+                .expect("send noise init");
+        }
+        let mut defrag = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
+        let reply = recv_one_ciphertext(&mut read_half, &mut defrag)
+            .await
+            .expect("noise reply");
+        let _ = crypto::initiator_complete(handshake, &reply).expect("initiator_complete");
+
+        let outcome = accept_task
+            .await
+            .expect("accept task join")
+            .expect("accept must not error");
+        match outcome {
+            AcceptOutcome::Admitted(peer) => assert!(
+                !peer.carrier_peer.is_local_choked(),
+                "a promoted (authenticated) peer must not stay choked even when \
+                 upload slots were exhausted at connect time"
+            ),
+            AcceptOutcome::Seeded => panic!("a valid allowlisted client must be Admitted"),
+        }
+        drop(held);
     }
 
     // ── Pre-auth connection admission caps (Plan B, Task 2) ──────────────────
