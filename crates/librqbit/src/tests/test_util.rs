@@ -224,15 +224,24 @@ pub mod tunnel_fixture {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use std::collections::VecDeque;
+
     use librqbit_core::Id20;
+    use peer_binary_protocol::Message;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, mpsc};
 
+    use crate::tunnel::carrier_chunk::{
+        CarrierDefragmenter, MAX_CARRIER_CIPHERTEXT, chunk_ciphertext, recv_one_ciphertext,
+    };
+    use crate::tunnel::carrier_peer::TunnelCarrierPeer;
+    use crate::tunnel::carrier_wire::{CarrierReadHalf, CarrierWire, CarrierWriteHalf};
     use crate::tunnel::client::TunnelClient;
     use crate::tunnel::crypto::{NoiseTransport, generate_keypair};
     use crate::tunnel::frame::{TunnelDestination, TunnelFrame, TunnelPublicKey};
-    use crate::tunnel::server;
+    use crate::tunnel::peer_wire_crypto::PeerWireCrypto;
+    use crate::tunnel::relay::next_tunnel_frame;
 
     #[allow(dead_code)]
     pub struct TunnelFixture {
@@ -292,71 +301,71 @@ pub mod tunnel_fixture {
                 }
             });
 
-            // Tunnel pair
+            // Tunnel pair over the live BitTorrent-masquerade carrier.
             let carrier_hash = Id20::new([0xAB; 20]);
-            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let (client_io, server_io) = tokio::io::duplex(256 * 1024);
             let client_pk_c = client_pk.clone();
 
+            // Deterministic carrier store shared by both ends (same `info_hash`).
+            let carrier_store =
+                crate::tunnel::carrier_identity::build_carrier_store(temp_dir.path(), &server_pk)
+                    .await
+                    .expect("build carrier store");
+            let info_hash = carrier_store.descriptor().handshake_info_hash;
+            let server_store = carrier_store.clone();
+
             let server_handle = tokio::spawn(async move {
-                let encrypted = crate::tunnel::peer_wire_crypto::PeerWireCrypto::responder(
-                    server_io,
-                    carrier_hash,
-                )
-                .await
-                .unwrap();
-                let mut reader = encrypted.reader;
-                let mut writer = encrypted.writer;
+                let enc = PeerWireCrypto::responder(server_io, carrier_hash)
+                    .await
+                    .unwrap();
+                let wire = CarrierWire::establish(enc.reader, enc.writer, server_store, info_hash)
+                    .await
+                    .unwrap();
+                let (mut read_half, mut write_half, carrier_peer) = wire.into_halves();
 
-                let mut len_buf = [0u8; 2];
-                reader.read_exact(&mut len_buf).await.unwrap();
-                let msg_len = u16::from_be_bytes(len_buf) as usize;
-                let mut noise_msg = vec![0u8; msg_len];
-                reader.read_exact(&mut noise_msg).await.unwrap();
-
+                let mut defrag = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
+                let noise_msg = recv_one_ciphertext(&mut read_half, &mut defrag)
+                    .await
+                    .unwrap();
                 let mut allowed = std::collections::HashSet::new();
                 allowed.insert(client_pk_c);
                 let (transport, _ck, reply) =
                     crate::tunnel::crypto::responder_accept(&server_sk, &noise_msg, &allowed)
                         .unwrap();
-
-                let reply_len = u16::try_from(reply.len()).unwrap().to_be_bytes();
-                writer.write_all(&reply_len).await.unwrap();
-                writer.write_all(&reply).await.unwrap();
-                writer.flush().await.unwrap();
-
-                (transport, reader, writer)
+                for chunk in chunk_ciphertext(&reply) {
+                    write_half.send_tunnel(&chunk).await.unwrap();
+                }
+                (transport, read_half, write_half, carrier_peer)
             });
 
-            let encrypted =
-                crate::tunnel::peer_wire_crypto::PeerWireCrypto::initiator(client_io, carrier_hash)
-                    .await
-                    .unwrap();
-            let mut client_reader = encrypted.reader;
-            let mut client_writer = encrypted.writer;
+            let enc = PeerWireCrypto::initiator(client_io, carrier_hash)
+                .await
+                .unwrap();
+            let wire = CarrierWire::establish(enc.reader, enc.writer, carrier_store, info_hash)
+                .await
+                .unwrap();
+            let (mut read_half, mut write_half, carrier_peer) = wire.into_halves();
 
             let (handshake, noise_msg) =
                 crate::tunnel::crypto::initiator_start(&client_sk, &server_pk).unwrap();
-
-            let msg_len = u16::try_from(noise_msg.len()).unwrap().to_be_bytes();
-            client_writer.write_all(&msg_len).await.unwrap();
-            client_writer.write_all(&noise_msg).await.unwrap();
-            client_writer.flush().await.unwrap();
-
-            let mut len_buf = [0u8; 2];
-            client_reader.read_exact(&mut len_buf).await.unwrap();
-            let reply_len = u16::from_be_bytes(len_buf) as usize;
-            let mut reply_buf = vec![0u8; reply_len];
-            client_reader.read_exact(&mut reply_buf).await.unwrap();
-
+            for chunk in chunk_ciphertext(&noise_msg) {
+                write_half.send_tunnel(&chunk).await.unwrap();
+            }
+            let mut defrag = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
+            let reply = recv_one_ciphertext(&mut read_half, &mut defrag)
+                .await
+                .unwrap();
             let client_transport =
-                crate::tunnel::crypto::initiator_complete(handshake, &reply_buf).unwrap();
+                crate::tunnel::crypto::initiator_complete(handshake, &reply).unwrap();
 
-            let (server_transport, server_reader, server_writer) = server_handle.await.unwrap();
+            let (server_transport, server_read, server_write, server_peer) =
+                server_handle.await.unwrap();
 
-            let client = TunnelClient::from_raw_parts(
+            let client = TunnelClient::from_carrier_parts(
                 client_transport,
-                Box::new(client_reader),
-                Box::new(client_writer),
+                read_half,
+                write_half,
+                carrier_peer,
             );
 
             let server_transport: Arc<Mutex<NoiseTransport>> =
@@ -367,8 +376,9 @@ pub mod tunnel_fixture {
             let relay_handle = tokio::spawn(async move {
                 run_server_relay(
                     st,
-                    Box::new(server_reader),
-                    Box::new(server_writer),
+                    server_read,
+                    server_write,
+                    server_peer,
                     tcp_echo_port,
                     udp_echo_port,
                 )
@@ -401,35 +411,66 @@ pub mod tunnel_fixture {
         }
     }
 
+    /// Minimal echo relay running over the BitTorrent-masquerade carrier:
+    /// reads decrypted tunnel frames via [`next_tunnel_frame`] and echoes them
+    /// back by encrypting + chunking over the carrier write half.
     async fn run_server_relay(
         transport: Arc<Mutex<NoiseTransport>>,
-        reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-        writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+        mut read_half: CarrierReadHalf,
+        mut write_half: CarrierWriteHalf,
+        carrier_peer: TunnelCarrierPeer,
         _tcp_echo_port: u16,
         _udp_echo_port: u16,
     ) {
-        let reader = Arc::new(Mutex::new(reader));
-        let writer = Arc::new(Mutex::new(writer));
+        // Encrypt one frame and write it as chunked `rq_tunnel` messages.
+        async fn send_frame(
+            write_half: &mut CarrierWriteHalf,
+            transport: &Mutex<NoiseTransport>,
+            frame: &TunnelFrame,
+        ) -> bool {
+            let blob = {
+                let mut t = transport.lock().await;
+                match t.encrypt(frame) {
+                    Ok(b) => b,
+                    Err(_) => return false,
+                }
+            };
+            for chunk in chunk_ciphertext(&blob) {
+                if write_half.send_tunnel(&chunk).await.is_err() {
+                    return false;
+                }
+            }
+            true
+        }
+
+        let mut defrag = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
+        let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
+        let mut carrier_peer = carrier_peer;
+        // These fixtures never drive piece cover (no Request messages), so the
+        // cover lane stays empty; a small buffered channel suffices.
+        let (cover_tx, _cover_rx) = mpsc::channel::<Message<'static>>(16);
 
         loop {
-            let frame = {
-                let mut t = transport.lock().await;
-                let mut r = reader.lock().await;
-                #[allow(clippy::explicit_auto_deref)]
-                match server::read_frame(&mut *t, &mut **r).await {
-                    Ok(f) => f,
-                    Err(_) => break,
-                }
+            let frame = match next_tunnel_frame(
+                &mut read_half,
+                &mut defrag,
+                &mut pending,
+                &transport,
+                &mut carrier_peer,
+                &cover_tx,
+            )
+            .await
+            {
+                Some(f) => f,
+                None => break,
             };
 
             match frame {
                 TunnelFrame::OpenTcp { stream_id, .. } => {
-                    let mut t = transport.lock().await;
-                    let mut w = writer.lock().await;
                     let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
-                    let _ = server::write_frame(
-                        &mut t,
-                        &mut **w,
+                    let _ = send_frame(
+                        &mut write_half,
+                        &transport,
                         &TunnelFrame::TcpOpened {
                             stream_id,
                             bind_addr,
@@ -438,27 +479,24 @@ pub mod tunnel_fixture {
                     .await;
                 }
                 TunnelFrame::TcpData { stream_id, bytes } => {
-                    eprintln!("relay: TcpData stream={} len={}", stream_id, bytes.len());
-                    // Echo data back directly
-                    let mut t = transport.lock().await;
-                    let mut w = writer.lock().await;
-                    if server::write_frame(
-                        &mut t,
-                        &mut **w,
+                    // Echo data back directly.
+                    if !send_frame(
+                        &mut write_half,
+                        &transport,
                         &TunnelFrame::TcpData { stream_id, bytes },
                     )
                     .await
-                    .is_err()
                     {
                         break;
                     }
                 }
                 TunnelFrame::TcpFin { stream_id } => {
-                    let mut t = transport.lock().await;
-                    let mut w = writer.lock().await;
-                    let _ =
-                        server::write_frame(&mut t, &mut **w, &TunnelFrame::TcpFin { stream_id })
-                            .await;
+                    let _ = send_frame(
+                        &mut write_half,
+                        &transport,
+                        &TunnelFrame::TcpFin { stream_id },
+                    )
+                    .await;
                 }
                 TunnelFrame::OpenUdp { association_id: _ } => {}
                 TunnelFrame::UdpDatagram {
@@ -466,20 +504,13 @@ pub mod tunnel_fixture {
                     bytes,
                     ..
                 } => {
-                    eprintln!(
-                        "relay: UdpDatagram assoc={} len={}",
-                        association_id,
-                        bytes.len()
-                    );
                     let dest = TunnelDestination::Ip(SocketAddr::V4(SocketAddrV4::new(
                         Ipv4Addr::LOCALHOST,
                         0,
                     )));
-                    let mut t = transport.lock().await;
-                    let mut w = writer.lock().await;
-                    let _ = server::write_frame(
-                        &mut t,
-                        &mut **w,
+                    let _ = send_frame(
+                        &mut write_half,
+                        &transport,
                         &TunnelFrame::UdpDatagram {
                             association_id,
                             destination: dest,
@@ -490,10 +521,8 @@ pub mod tunnel_fixture {
                 }
                 TunnelFrame::CloseUdp { association_id: _ } => {}
                 TunnelFrame::Ping { nonce } => {
-                    let mut t = transport.lock().await;
-                    let mut w = writer.lock().await;
                     let _ =
-                        server::write_frame(&mut t, &mut **w, &TunnelFrame::Pong { nonce }).await;
+                        send_frame(&mut write_half, &transport, &TunnelFrame::Pong { nonce }).await;
                 }
                 _ => {}
             }
