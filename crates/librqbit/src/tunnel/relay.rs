@@ -30,8 +30,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::carrier_peer::CoverMessage;
 use super::config::{
-    CONNECT_TIMEOUT, OPEN_WINDOW, OUTBOUND_QUEUE, PACING_BURST, PER_STREAM_QUEUE, PING_INTERVAL,
-    PING_NONCE_MAP_CAP, READ_CHUNK, UDP_READ_BUF,
+    CONNECT_TIMEOUT, KEEPALIVE_INTERVAL, OPEN_WINDOW, OUTBOUND_QUEUE, PACING_BURST,
+    PER_STREAM_QUEUE, PING_INTERVAL, PING_NONCE_MAP_CAP, READ_CHUNK, UDP_READ_BUF,
 };
 use super::crypto::NoiseTransport;
 use super::egress::{EgressPolicy, EgressTransport};
@@ -351,6 +351,21 @@ pub(crate) fn spawn_frame_writer(
         // select and starve data.
         let mut cover_open = true;
 
+        // Periodic BitTorrent `KeepAlive` cadence so an idle-but-open masquerade
+        // connection sends keepalives like a real BT peer (no "never sends a
+        // keepalive" tell). `interval_at` starts the FIRST tick one full interval
+        // out — a real peer doesn't fire a keepalive the instant after its
+        // handshake — after which it ticks every `KEEPALIVE_INTERVAL`. Emitted at
+        // the LOWEST priority (below control, data, and cover); a keepalive is
+        // best-effort, so it never preempts real traffic. The default
+        // `MissedTickBehavior::Burst` is harmless here: a keepalive on a busy
+        // connection is realistic, and skipped ticks never accumulate work worth
+        // reasoning about.
+        let mut keepalive = tokio::time::interval_at(
+            tokio::time::Instant::now() + KEEPALIVE_INTERVAL,
+            KEEPALIVE_INTERVAL,
+        );
+
         loop {
             // Both PRIMARY lanes drained and closed, nothing left to flush: peer
             // gone. Cover is secondary and never keeps the writer alive.
@@ -461,6 +476,20 @@ pub(crate) fn spawn_frame_writer(
                     },
                     None => cover_open = false,
                 },
+
+                // Keepalive cadence — LOWEST priority, best-effort. Placed last so
+                // it can never preempt control, data, or cover. A `KeepAlive` is a
+                // plain BT message (NOT a tunnel frame), so it does NOT touch
+                // `NoiseTransport` and cannot perturb the Noise sequence order —
+                // which is exactly why a serialize OR write failure here is
+                // swallowed (never breaks the writer): unlike the ordered lanes,
+                // a dropped keepalive desyncs nothing. If the connection is truly
+                // dead, the next control/data write breaks the writer instead.
+                _ = keepalive.tick() => {
+                    if let Err(e) = write_half.send_message(&Message::KeepAlive).await {
+                        tracing::debug!(error = %e, "skipping keepalive");
+                    }
+                }
             }
         }
     });
@@ -1399,5 +1428,97 @@ mod tests {
             !shutdown.is_cancelled(),
             "writer must exit on channel close, not by relying on shutdown"
         );
+    }
+
+    /// Plan C Task 2: a real BitTorrent peer sends a periodic `KeepAlive` on an
+    /// otherwise-idle-but-open connection (~every 2 min). The carrier writer
+    /// must do the same, or a passive observer watching a quiet open connection
+    /// that NEVER sends a keepalive has a tell no real peer exhibits.
+    ///
+    /// This exercises the SINGLE shared writer (`spawn_frame_writer`), which is
+    /// the outbound path for BOTH the server relay and the client mux, so one
+    /// test covers both endpoints' keepalive cadence.
+    ///
+    /// Observed via the message-level `CarrierTrace` tap on `write_message` (the
+    /// single outgoing serialization choke point). `start_paused` freezes the
+    /// clock so the 110 s cadence is driven with `tokio::time::advance` instead
+    /// of a real wait. The keepalive is a plain BT message (NOT a tunnel frame),
+    /// so it never touches `NoiseTransport`; we therefore assert on the emitted
+    /// `CarrierEvent::KeepAlive` directly rather than round-tripping a frame.
+    #[tokio::test(start_paused = true)]
+    async fn writer_emits_periodic_keepalive_when_idle() {
+        use super::super::carrier_wire::{clear_carrier_trace, install_carrier_trace};
+        use super::super::config::KEEPALIVE_INTERVAL;
+        use super::super::test_capture::CarrierEvent;
+
+        let trace = install_carrier_trace();
+        // RAII: always clear the thread-local trace so it can't leak events into
+        // a later test scheduled on this same current-thread runtime worker.
+        struct ClearTraceGuard;
+        impl Drop for ClearTraceGuard {
+            fn drop(&mut self) {
+                clear_carrier_trace();
+            }
+        }
+        let _clear_trace_guard = ClearTraceGuard;
+
+        let keepalive_count =
+            |trace: &Arc<parking_lot::Mutex<super::super::test_capture::CarrierTrace>>| {
+                trace
+                    .lock()
+                    .events()
+                    .iter()
+                    .filter(|e| **e == CarrierEvent::KeepAlive)
+                    .count()
+            };
+
+        let (client_transport, _server_transport) = handshake_pair();
+        let ((_c_read, c_write, _c_peer), _server_halves) = carrier_test_pair().await;
+        let shutdown = CancellationToken::new();
+        let pacing_rate = Arc::new(AtomicU64::new(PACING_DEFAULT_RATE));
+        let paced = Arc::new(AtomicBool::new(false));
+        // Idle writer: no control/data/cover frames are ever enqueued.
+        let (_cover_tx, cover_rx) = mpsc::channel::<CoverMessage>(OUTBOUND_QUEUE);
+        let (_sink, _handle) = spawn_frame_writer(
+            Arc::new(Mutex::new(client_transport)),
+            c_write,
+            cover_rx,
+            shutdown.clone(),
+            pacing_rate,
+            paced,
+        );
+
+        // Let the writer task run once at t=0 so it registers its keepalive
+        // interval (first tick due one full interval out). Yielding keeps this
+        // test task runnable, so the paused clock never auto-advances here.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        // Baseline: the handshake wrote Bitfield/Unchoke/Interested/
+        // ExtendedHandshake but no KeepAlive, and the first keepalive tick is one
+        // full interval out, so none is present yet — proving the writer does NOT
+        // fire a keepalive the instant it starts.
+        assert_eq!(
+            keepalive_count(&trace),
+            0,
+            "no keepalive should be sent before the interval elapses"
+        );
+
+        // Advance one full keepalive interval (plus slack past the exact
+        // deadline); the idle writer's timer arm must fire and put a `KeepAlive`
+        // on the wire.
+        tokio::time::advance(KEEPALIVE_INTERVAL + Duration::from_secs(1)).await;
+        // Yield so the woken writer task runs and serializes the keepalive.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            keepalive_count(&trace) >= 1,
+            "an idle carrier writer must emit a BT KeepAlive within KEEPALIVE_INTERVAL"
+        );
+
+        shutdown.cancel();
     }
 }

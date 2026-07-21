@@ -171,6 +171,20 @@ pub(crate) const PACING_BURST: u64 = 256 * 1024;
 /// this much, so forward progress (and thus fresh RTT samples) is guaranteed.
 pub(crate) const MIN_PACING_RATE: u64 = MIN_TARGET as u64;
 
+// ── Keepalive cadence (carrier realism) ─────────────────────────────────────
+
+/// How often the carrier writer sends a BitTorrent `KeepAlive` on an otherwise
+/// idle-but-open connection. A real BT client sends a keepalive roughly every
+/// ~2 min of idle (the de-facto convention is ~110–120 s, comfortably under the
+/// common 2-minute peer inactivity drop), so a quiet open masquerade connection
+/// must do the same — a passive observer watching a silent open connection that
+/// never sends a keepalive would have a tell that no real peer exhibits. The
+/// writer emits one on every interval tick regardless of activity: a keepalive
+/// on a busy connection is harmless and realistic, and it is a plain BT message
+/// (NOT a tunnel frame), so it never touches `NoiseTransport` / the Noise
+/// sequence. Best-effort and lowest priority — below control, data, and cover.
+pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(110);
+
 // ── Carriers ─────────────────────────────────────────────────────────────────
 
 /// Default number of parallel carrier connections a client opens to the server.
