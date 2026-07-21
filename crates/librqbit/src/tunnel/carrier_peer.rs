@@ -227,6 +227,21 @@ impl TunnelCarrierPeer {
         self.local_choked
     }
 
+    /// Reset the per-connection pieces-served counter (Plan B, Fix M1). Called
+    /// by `server.rs`'s `accept` on promotion so the PRE-AUTH pieces cap
+    /// (`MAX_SEEDER_PIECES_PER_CONN`) never carries into the authenticated relay
+    /// and self-chokes post-auth cover mid-session if its cadence ever grows.
+    pub(crate) fn reset_pieces_served(&mut self) {
+        self.pieces_served = 0;
+    }
+
+    /// The number of `Piece`s served to this peer this connection. Test-only:
+    /// used to assert the pre-auth counter is reset on promotion (Fix M1).
+    #[cfg(test)]
+    pub(crate) fn pieces_served(&self) -> usize {
+        self.pieces_served
+    }
+
     // ── Initial messages ──────────────────────────────────────────────────
 
     pub fn initial_messages(&mut self) -> Vec<CoverMessage> {

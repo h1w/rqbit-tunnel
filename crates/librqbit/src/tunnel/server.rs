@@ -119,6 +119,12 @@ async fn seed_until_promoted(
         let mut defrag = super::carrier_chunk::CarrierDefragmenter::new(
             super::carrier_chunk::MAX_CARRIER_CIPHERTEXT,
         );
+        // Per-connection Noise-attempt counter (Fix C1). Incremented ONLY when a
+        // blob is actually handed to `responder_accept` (a fresh snow IK
+        // responder + one X25519 DH). Persists across every inbound message for
+        // the whole connection, hard-bounding total DH ops at
+        // `MAX_NOISE_ATTEMPTS`.
+        let mut noise_attempts: usize = 0;
 
         loop {
             let msg = match tokio::time::timeout(idle, read_half.recv_message()).await {
@@ -134,11 +140,28 @@ async fn seed_until_promoted(
                         Err(_) => return Ok(None), // oversized: drop like a misbehaving peer
                     };
                     for ciphertext in blobs {
-                        if ciphertext.len() > 512 {
-                            // Not a plausible Noise IK initiator message; ignore
-                            // and keep seeding rather than tell a prober anything.
+                        // Cheap length gate (Fix C1): a real Noise IK initiator
+                        // message with an empty payload is a small fixed size (96
+                        // bytes for Noise_IK_25519_ChaChaPoly_SHA256). A blob
+                        // outside this tight band cannot be one, so skip it
+                        // WITHOUT building a snow responder / doing a DH — and
+                        // WITHOUT counting it against the attempt cap (it is
+                        // cheap-rejected on length alone). Keep seeding, no tell.
+                        if ciphertext.len() < super::config::NOISE_INIT_MIN
+                            || ciphertext.len() > super::config::NOISE_INIT_MAX
+                        {
                             continue;
                         }
+                        // Attempt cap (Fix C1): once we have spent
+                        // `MAX_NOISE_ATTEMPTS` real `responder_accept` calls on
+                        // this connection, stop calling it entirely for the rest
+                        // of the connection but KEEP SEEDING — no drop, no tell. A
+                        // legitimate client authenticates on its FIRST blob, so
+                        // this never rejects a real client.
+                        if noise_attempts >= super::config::MAX_NOISE_ATTEMPTS {
+                            continue;
+                        }
+                        noise_attempts += 1;
                         match crypto::responder_accept(identity_key, &ciphertext, allowed) {
                             Ok((transport, key, reply)) => {
                                 for chunk in super::carrier_chunk::chunk_ciphertext(&reply) {
@@ -156,6 +179,12 @@ async fn seed_until_promoted(
                             }
                         }
                     }
+                }
+                Message::Piece(_) => {
+                    // A seeder that already has the whole torrent needs no
+                    // uploads (Fix I1): ignore inbound Piece pre-auth — no
+                    // `verify_block` (no 256 KiB alloc, no corpus disk read), no
+                    // drop, no tell. Keep seeding.
                 }
                 other => {
                     // Serve cover exactly like the pre-establish early-cover path.
@@ -397,6 +426,10 @@ impl TunnelServer {
                 // its post-auth cover Request/Piece traffic normally in the
                 // relay — the pre-auth slot bound does not apply post-promotion.
                 carrier_peer.set_local_choked(false);
+                // Reset the pre-auth pieces-served counter (Fix M1) so the
+                // pre-auth cap (`MAX_SEEDER_PIECES_PER_CONN`) never carries into
+                // the authenticated relay and self-chokes cover mid-session.
+                carrier_peer.reset_pieces_served();
                 self.peers.write().await.insert(client_key.clone(), true);
                 Ok(AcceptOutcome::Admitted(Box::new(AdmittedPeer {
                     client_key,
@@ -801,6 +834,394 @@ mod tests {
         match outcome {
             Some((_transport, key)) => assert_eq!(key, client_pk, "promoted client key mismatch"),
             None => panic!("expected promotion for a valid allowlisted Noise handshake"),
+        }
+    }
+
+    // ── Pre-auth Noise-attempt bound + size band (Plan B, Fix C1) ────────────
+
+    /// The real Noise IK initiator message (empty payload) must fall inside the
+    /// `[NOISE_INIT_MIN, NOISE_INIT_MAX]` band, or the cheap length gate in
+    /// `seed_until_promoted` would reject a legitimate client. Also pins the
+    /// measured length so a future crypto change that alters it can't silently
+    /// drift a real init out of the band.
+    #[test]
+    fn noise_init_length_falls_within_seed_band() {
+        let server_pub = crypto::public_key(&server_key());
+        let (client_sk, _client_pk) = crypto::generate_keypair();
+        let (_handshake, noise_msg) =
+            crypto::initiator_start(&client_sk, &server_pub).expect("initiator_start");
+        assert_eq!(
+            noise_msg.len(),
+            96,
+            "Noise_IK_25519_ChaChaPoly_SHA256 init with empty payload must be 96 bytes"
+        );
+        assert!(
+            noise_msg.len() >= super::super::config::NOISE_INIT_MIN
+                && noise_msg.len() <= super::super::config::NOISE_INIT_MAX,
+            "real Noise init ({} bytes) must fall inside the seed band [{}, {}]",
+            noise_msg.len(),
+            super::super::config::NOISE_INIT_MIN,
+            super::super::config::NOISE_INIT_MAX,
+        );
+    }
+
+    /// Out-of-band blobs (too short to be a Noise init) are cheap-rejected on
+    /// length alone and MUST NOT consume the per-connection attempt cap: after a
+    /// flood of them, a valid Noise init sent afterwards still promotes.
+    #[tokio::test]
+    async fn seed_until_promoted_out_of_band_blobs_do_not_consume_attempt_cap() {
+        use super::super::carrier_chunk::{
+            CarrierDefragmenter, MAX_CARRIER_CIPHERTEXT, chunk_ciphertext, recv_one_ciphertext,
+        };
+        use super::super::carrier_wire::CarrierWire;
+
+        let identity_key = server_key();
+        let server_pub = crypto::public_key(&identity_key);
+        let (client_sk, client_pk) = crypto::generate_keypair();
+        let (_dir, store) = test_carrier_store(&identity_key).await;
+        let info_hash = store.descriptor().handshake_info_hash;
+        let carrier_hash = Id20::new([0xE1; 20]);
+        let allowed = allowed_client_keys(std::slice::from_ref(&client_pk));
+
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let server_store = store.clone();
+
+        let server_task = tokio::spawn(async move {
+            let enc = PeerWireCrypto::responder(server_io, carrier_hash)
+                .await
+                .expect("server MSE responder");
+            let wire = CarrierWire::establish(enc.reader, enc.writer, server_store, info_hash)
+                .await
+                .expect("server carrier establish");
+            let (mut read_half, mut write_half, mut carrier_peer) = wire.into_halves();
+            seed_until_promoted(
+                &mut read_half,
+                &mut write_half,
+                &mut carrier_peer,
+                &identity_key,
+                &allowed,
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(30),
+            )
+            .await
+        });
+
+        let enc = PeerWireCrypto::initiator(client_io, carrier_hash)
+            .await
+            .expect("client MSE initiator");
+        let wire = CarrierWire::establish(enc.reader, enc.writer, store.clone(), info_hash)
+            .await
+            .expect("client carrier establish");
+        let (mut read_half, mut write_half, _client_carrier_peer) = wire.into_halves();
+
+        // Flood many blobs just UNDER the band's minimum — well more than
+        // MAX_NOISE_ATTEMPTS of them. Each must be skipped without consuming an
+        // attempt.
+        let short = vec![0x11u8; super::super::config::NOISE_INIT_MIN - 1];
+        for _ in 0..(super::super::config::MAX_NOISE_ATTEMPTS * 4) {
+            for chunk in chunk_ciphertext(&short) {
+                write_half
+                    .send_tunnel(&chunk)
+                    .await
+                    .expect("send short blob");
+            }
+        }
+
+        // A valid Noise init afterwards must STILL promote (the cap was never
+        // touched by the out-of-band flood).
+        let (handshake, noise_msg) =
+            crypto::initiator_start(&client_sk, &server_pub).expect("initiator_start");
+        for chunk in chunk_ciphertext(&noise_msg) {
+            write_half
+                .send_tunnel(&chunk)
+                .await
+                .expect("send noise init");
+        }
+        let mut defrag = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
+        let reply = recv_one_ciphertext(&mut read_half, &mut defrag)
+            .await
+            .expect("noise reply");
+        let _ = crypto::initiator_complete(handshake, &reply).expect("initiator_complete");
+
+        let outcome = server_task
+            .await
+            .expect("server task join")
+            .expect("seed_until_promoted must not error");
+        match outcome {
+            Some((_t, key)) => assert_eq!(key, client_pk, "promoted client key mismatch"),
+            None => panic!("a valid init after an out-of-band flood must still promote"),
+        }
+    }
+
+    /// In-band blobs (plausible size, but garbage) DO consume the attempt cap.
+    /// Once `MAX_NOISE_ATTEMPTS` are spent, `responder_accept` is no longer
+    /// called for the rest of the connection — even a subsequent VALID init is
+    /// ignored — but the server KEEPS SEEDING (no drop, no tell). A legitimate
+    /// client is unaffected because it authenticates on its FIRST blob.
+    #[tokio::test]
+    async fn seed_until_promoted_bounds_in_band_noise_attempts() {
+        use super::super::carrier_chunk::chunk_ciphertext;
+        use super::super::carrier_wire::CarrierWire;
+        use peer_binary_protocol::{Message, Request};
+
+        let identity_key = server_key();
+        let server_pub = crypto::public_key(&identity_key);
+        let (client_sk, client_pk) = crypto::generate_keypair();
+        let (_dir, store) = test_carrier_store(&identity_key).await;
+        let info_hash = store.descriptor().handshake_info_hash;
+        let carrier_hash = Id20::new([0xE2; 20]);
+        let allowed = allowed_client_keys(std::slice::from_ref(&client_pk));
+
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let server_store = store.clone();
+
+        let server_task = tokio::spawn(async move {
+            let enc = PeerWireCrypto::responder(server_io, carrier_hash)
+                .await
+                .expect("server MSE responder");
+            let wire = CarrierWire::establish(enc.reader, enc.writer, server_store, info_hash)
+                .await
+                .expect("server carrier establish");
+            let (mut read_half, mut write_half, mut carrier_peer) = wire.into_halves();
+            seed_until_promoted(
+                &mut read_half,
+                &mut write_half,
+                &mut carrier_peer,
+                &identity_key,
+                &allowed,
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(30),
+            )
+            .await
+        });
+
+        let enc = PeerWireCrypto::initiator(client_io, carrier_hash)
+            .await
+            .expect("client MSE initiator");
+        let wire = CarrierWire::establish(enc.reader, enc.writer, store.clone(), info_hash)
+            .await
+            .expect("client carrier establish");
+        let (mut read_half, mut write_half, _client_carrier_peer) = wire.into_halves();
+
+        // Exhaust the attempt cap with in-band (plausible-size) garbage — more
+        // than MAX_NOISE_ATTEMPTS of them.
+        let garbage = vec![0x42u8; super::super::config::NOISE_INIT_MIN + 16];
+        for _ in 0..(super::super::config::MAX_NOISE_ATTEMPTS + 2) {
+            for chunk in chunk_ciphertext(&garbage) {
+                write_half
+                    .send_tunnel(&chunk)
+                    .await
+                    .expect("send in-band garbage");
+            }
+        }
+
+        // Now a VALID init — but the cap is already spent, so responder_accept
+        // is never called for it: no promotion.
+        let (_handshake, noise_msg) =
+            crypto::initiator_start(&client_sk, &server_pub).expect("initiator_start");
+        for chunk in chunk_ciphertext(&noise_msg) {
+            write_half
+                .send_tunnel(&chunk)
+                .await
+                .expect("send noise init");
+        }
+
+        // The server must still be seeding: a plain Request still gets a Piece.
+        write_half
+            .send_message(&Message::Request(Request::new(0, 0, 16384)))
+            .await
+            .expect("send Request");
+        let still_seeding = loop {
+            match read_half.recv_message().await.expect("recv") {
+                Some(Message::Piece(_)) => break true,
+                Some(_) => continue,
+                None => break false,
+            }
+        };
+        assert!(
+            still_seeding,
+            "server must keep seeding after the Noise-attempt cap is reached"
+        );
+
+        // Disconnect: the connection must end as ordinary churn (no promotion).
+        drop(read_half);
+        drop(write_half);
+        let outcome = server_task
+            .await
+            .expect("server task join")
+            .expect("seed_until_promoted must not error");
+        assert!(
+            outcome.is_none(),
+            "a valid init sent AFTER the attempt cap is spent must not promote, got {outcome:?}"
+        );
+    }
+
+    /// Inbound `Piece` messages pre-auth are ignored (Fix I1): a seeder needs no
+    /// uploads, so it does no `verify_block` (no 256 KiB alloc, no corpus disk
+    /// read) and — critically — never drops the connection. After a Piece, a
+    /// following Request still gets served.
+    #[tokio::test]
+    async fn seed_until_promoted_ignores_inbound_piece_pre_auth() {
+        use super::super::carrier_wire::CarrierWire;
+        use peer_binary_protocol::{Message, Piece, Request};
+
+        let identity_key = server_key();
+        let (_dir, store) = test_carrier_store(&identity_key).await;
+        let info_hash = store.descriptor().handshake_info_hash;
+        let carrier_hash = Id20::new([0xE3; 20]);
+        let allowed = allowed_client_keys(&[known_key()]);
+
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let server_store = store.clone();
+
+        let server_task = tokio::spawn(async move {
+            let enc = PeerWireCrypto::responder(server_io, carrier_hash)
+                .await
+                .expect("server MSE responder");
+            let wire = CarrierWire::establish(enc.reader, enc.writer, server_store, info_hash)
+                .await
+                .expect("server carrier establish");
+            let (mut read_half, mut write_half, mut carrier_peer) = wire.into_halves();
+            seed_until_promoted(
+                &mut read_half,
+                &mut write_half,
+                &mut carrier_peer,
+                &identity_key,
+                &allowed,
+                std::time::Duration::from_millis(500),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+        });
+
+        let enc = PeerWireCrypto::initiator(client_io, carrier_hash)
+            .await
+            .expect("client MSE initiator");
+        let wire = CarrierWire::establish(enc.reader, enc.writer, store.clone(), info_hash)
+            .await
+            .expect("client carrier establish");
+        let (mut read_half, mut write_half, _client_carrier_peer) = wire.into_halves();
+
+        // Send an unsolicited Piece pre-auth. The server must ignore it (no
+        // verify, no drop) rather than treat it as an upload.
+        let junk = vec![0x42u8; 64];
+        write_half
+            .send_message(&Message::Piece(Piece::from_data(0, 0, &junk)))
+            .await
+            .expect("send Piece");
+
+        // A Request afterwards must still be served — proof the connection was
+        // neither dropped nor wedged by the inbound Piece.
+        write_half
+            .send_message(&Message::Request(Request::new(0, 0, 16384)))
+            .await
+            .expect("send Request");
+        let got_piece = loop {
+            match read_half.recv_message().await.expect("recv") {
+                Some(Message::Piece(_)) => break true,
+                Some(_) => continue,
+                None => break false,
+            }
+        };
+        assert!(
+            got_piece,
+            "server must keep seeding after an ignored inbound Piece (no drop, no tell)"
+        );
+
+        drop(read_half);
+        drop(write_half);
+        let outcome = server_task
+            .await
+            .expect("server task join")
+            .expect("seed_until_promoted must not error");
+        assert!(outcome.is_none(), "no promotion expected, got {outcome:?}");
+    }
+
+    /// A promoted (authenticated) peer must have its PRE-AUTH pieces-served
+    /// counter reset to 0 (Fix M1), so the pre-auth cap never carries into the
+    /// authenticated relay. Drives the full `accept` path, serving one pre-auth
+    /// Piece first, then promoting.
+    #[tokio::test]
+    async fn accept_resets_pieces_served_on_promotion() {
+        use super::super::carrier_chunk::{
+            CarrierDefragmenter, MAX_CARRIER_CIPHERTEXT, chunk_ciphertext, recv_one_ciphertext,
+        };
+        use super::super::carrier_wire::CarrierWire;
+        use peer_binary_protocol::{Message, Request};
+        use std::net::{Ipv4Addr, SocketAddrV4};
+
+        let identity_key = server_key();
+        let server_pub = crypto::public_key(&identity_key);
+        let (client_sk, client_pk) = crypto::generate_keypair();
+        let (_dir, store) = test_carrier_store(&identity_key).await;
+        let info_hash = store.descriptor().handshake_info_hash;
+        let opts = test_server_options(allowed_client_keys(std::slice::from_ref(&client_pk)));
+        let server = TunnelServer::new(opts, store.clone());
+
+        let listener = tokio::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let listen_addr = listener.local_addr().unwrap();
+        let carrier_hash = Id20::new([0xE4; 20]);
+
+        let server_clone = server.clone();
+        let accept_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("listener accept");
+            server_clone.accept(stream, carrier_hash).await
+        });
+
+        let client_stream = tokio::net::TcpStream::connect(listen_addr)
+            .await
+            .expect("client connect");
+        let enc = PeerWireCrypto::initiator(client_stream, carrier_hash)
+            .await
+            .expect("client MSE initiator");
+        let wire = CarrierWire::establish(enc.reader, enc.writer, store.clone(), info_hash)
+            .await
+            .expect("client carrier establish");
+        let (mut read_half, mut write_half, _client_peer) = wire.into_halves();
+
+        // Serve at least one pre-auth Piece so pieces_served becomes non-zero
+        // on the server before promotion.
+        write_half
+            .send_message(&Message::Request(Request::new(0, 0, 16384)))
+            .await
+            .expect("send Request");
+        let got_piece = loop {
+            match read_half.recv_message().await.expect("recv") {
+                Some(Message::Piece(_)) => break true,
+                Some(_) => continue,
+                None => break false,
+            }
+        };
+        assert!(got_piece, "expected a pre-auth Piece cover response");
+
+        // Now promote with a valid allowlisted Noise init.
+        let (handshake, noise_msg) =
+            crypto::initiator_start(&client_sk, &server_pub).expect("initiator_start");
+        for chunk in chunk_ciphertext(&noise_msg) {
+            write_half
+                .send_tunnel(&chunk)
+                .await
+                .expect("send noise init");
+        }
+        let mut defrag = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
+        let reply = recv_one_ciphertext(&mut read_half, &mut defrag)
+            .await
+            .expect("noise reply");
+        let _ = crypto::initiator_complete(handshake, &reply).expect("initiator_complete");
+
+        let outcome = accept_task
+            .await
+            .expect("accept task join")
+            .expect("accept must not error");
+        match outcome {
+            AcceptOutcome::Admitted(peer) => assert_eq!(
+                peer.carrier_peer.pieces_served(),
+                0,
+                "a promoted peer must have its pre-auth pieces-served counter reset to 0"
+            ),
+            AcceptOutcome::Seeded => panic!("a valid allowlisted client must be Admitted"),
         }
     }
 

@@ -238,6 +238,32 @@ pub(crate) const MAX_SEEDER_CONNS_PER_IP: usize = 64;
 /// IPs (checked alongside `MAX_SEEDER_CONNS_PER_IP` in `server.rs::run`).
 pub(crate) const MAX_SEEDER_CONNS_TOTAL: usize = 256;
 
+/// Plausible size band (bytes) for a Noise IK initiator message, used in
+/// `server.rs::seed_until_promoted` as a CHEAP length gate before ever building
+/// a `snow` IK responder / doing an X25519 DH. A
+/// `Noise_IK_25519_ChaChaPoly_SHA256` first message with an empty payload is a
+/// small fixed size — exactly 96 bytes: 32 (ephemeral `e`) + 48 (encrypted
+/// static `s`: 32 + 16-byte AEAD tag) + 16 (encrypted empty payload tag) — so a
+/// blob outside this tight band cannot be a real client's Noise init. Such a
+/// blob is skipped WITHOUT calling `responder_accept` and WITHOUT counting
+/// against `MAX_NOISE_ATTEMPTS` (rejected on length alone). The band is
+/// deliberately a little wider than 96 so a real client is never rejected.
+pub(crate) const NOISE_INIT_MIN: usize = 48;
+pub(crate) const NOISE_INIT_MAX: usize = 160;
+
+/// Per-connection cap on the number of Noise IK handshake ATTEMPTS
+/// (`crypto::responder_accept` calls — each builds a fresh `snow` IK responder
+/// and does one X25519 DH) served to a not-yet-authenticated peer in
+/// `server.rs::seed_until_promoted`. `CarrierDefragmenter::push` returns EVERY
+/// complete unit from a single `rq_tunnel` message at once, so one 16 KiB
+/// message packed with ~36-byte units would otherwise drive ~455 inline DH ops
+/// on the tokio worker. A legitimate client sends exactly ONE Noise init (as its
+/// first blob), so a tight cap never rejects a real client; once the cap is
+/// reached we stop calling `responder_accept` for the rest of the connection but
+/// KEEP SEEDING (no drop, no tell). Hard bound: ≤ `MAX_NOISE_ATTEMPTS` X25519
+/// ops per connection.
+pub(crate) const MAX_NOISE_ATTEMPTS: usize = 8;
+
 // ── Carrier identity (masquerade torrent shape) ──────────────────────────────
 
 /// Piece length for the synthetic carrier torrent. 256 KiB is a common real
