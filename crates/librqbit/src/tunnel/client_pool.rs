@@ -35,16 +35,36 @@ impl CarrierPool {
     /// The count is clamped to `1..=MAX_CARRIERS` defensively so the pool is
     /// self-protecting even for a library caller that bypasses
     /// [`TunnelOptions::validate`] (the CLI/service path validates first).
-    pub(crate) fn start(
+    ///
+    /// Builds the deterministic carrier store once (from
+    /// `opts.expected_server_key`) before spawning any supervisor, and shares
+    /// the resulting `Arc<TunnelCarrierStore>` across all of them — its
+    /// `handshake_info_hash` is the DHT rendezvous key each supervisor
+    /// discovers the server by (NOT the MSE `carrier_hash`, which each
+    /// supervisor still derives separately). This is async (and fallible)
+    /// because it does real disk I/O to open-or-initialize the store.
+    pub(crate) async fn start(
         opts: TunnelClientOptions,
         dht: Option<Dht>,
         shutdown: CancellationToken,
-    ) -> Arc<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
         let n = opts.carriers.clamp(1, super::config::MAX_CARRIERS);
+        let carrier_store = super::carrier_identity::build_carrier_store(
+            &opts.carrier_root,
+            &opts.expected_server_key,
+        )
+        .await?;
         let carriers = (0..n)
-            .map(|_| TunnelClientSupervisor::start(opts.clone(), dht.clone(), shutdown.clone()))
+            .map(|_| {
+                TunnelClientSupervisor::start(
+                    opts.clone(),
+                    dht.clone(),
+                    shutdown.clone(),
+                    carrier_store.clone(),
+                )
+            })
             .collect();
-        Arc::new(Self { carriers })
+        Ok(Arc::new(Self { carriers }))
     }
 
     /// Total configured carriers (live or not).
@@ -101,7 +121,9 @@ mod tests {
             ..Default::default()
         };
         opts.carriers = 3;
-        let pool = super::CarrierPool::start(opts, None, CancellationToken::new());
+        let pool = super::CarrierPool::start(opts, None, CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(pool.carrier_count(), 3);
         assert_eq!(pool.live_count(), 0);
         assert!(pool.pick().is_none());

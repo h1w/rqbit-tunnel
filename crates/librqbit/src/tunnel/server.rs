@@ -11,6 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 
+use super::carrier::TunnelCarrierStore;
 use super::crypto::{self, NoiseTransport, TunnelCryptoError};
 use super::frame::{TunnelFrame, TunnelPublicKey};
 use super::options::TunnelServerOptions;
@@ -53,19 +54,25 @@ pub(crate) struct TunnelServer {
     options: TunnelServerOptions,
     /// Connected peer keys tracked for admission state.
     peers: RwLock<HashMap<TunnelPublicKey, bool>>,
+    /// Deterministic synthetic carrier torrent shared with clients via the
+    /// DHT rendezvous key (`descriptor().handshake_info_hash`). Not yet
+    /// consumed for BT-handshake presentation or relay — that lands in a
+    /// later task.
+    carrier_store: Arc<TunnelCarrierStore>,
 }
 
 impl TunnelServer {
-    /// Construct the server state and prepare the carrier store.
+    /// Construct the server state from the already-built carrier store.
     ///
     /// Note: the TCP listener is owned by the caller ([`TunnelService::start`])
     /// and passed to [`run`](Self::run).  This constructor must NOT bind a
     /// listener itself — doing so would race the caller's bind on the same
     /// `peer_listen` address and fail with `EADDRINUSE`.
-    pub fn new(options: TunnelServerOptions) -> Arc<Self> {
+    pub fn new(options: TunnelServerOptions, carrier_store: Arc<TunnelCarrierStore>) -> Arc<Self> {
         Arc::new(Self {
             options,
             peers: RwLock::new(HashMap::new()),
+            carrier_store,
         })
     }
 
@@ -308,17 +315,33 @@ mod tests {
         }
     }
 
+    /// Build a real carrier store in a fresh temp dir for the given identity
+    /// key. The returned `TempDir` must be kept alive for the store's
+    /// lifetime (it holds `root` for later piece I/O).
+    async fn test_carrier_store(
+        identity: &TunnelPrivateKey,
+    ) -> (tempfile::TempDir, Arc<TunnelCarrierStore>) {
+        let dir = tempfile::tempdir().unwrap();
+        let server_pub = super::super::crypto::public_key(identity);
+        let store = super::super::carrier_identity::build_carrier_store(dir.path(), &server_pub)
+            .await
+            .unwrap();
+        (dir, store)
+    }
+
     #[tokio::test]
     async fn server_constructs_with_zero_peers() {
         let opts = test_server_options(allowed_client_keys(&[known_key()]));
-        let server = TunnelServer::new(opts);
+        let (_dir, store) = test_carrier_store(&opts.identity_key).await;
+        let server = TunnelServer::new(opts, store);
         assert_eq!(server.peer_count().await, 0);
     }
 
     #[tokio::test]
     async fn server_peer_tracking_api() {
         let opts = test_server_options(allowed_client_keys(&[known_key()]));
-        let server = TunnelServer::new(opts);
+        let (_dir, store) = test_carrier_store(&opts.identity_key).await;
+        let server = TunnelServer::new(opts, store);
 
         assert_eq!(server.peer_count().await, 0);
         assert!(!server.is_admitted(&known_key()).await);

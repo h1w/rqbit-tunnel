@@ -59,7 +59,7 @@ impl TunnelService {
                 // The session's DHT (if enabled) lets the client discover the
                 // server by its carrier hash instead of a fixed address.
                 let dht = session.get_dht().cloned();
-                let pool = CarrierPool::start(opts, dht, shutdown.clone());
+                let pool = CarrierPool::start(opts, dht, shutdown.clone()).await?;
 
                 let ingress = SocksIngress::new(local_addr);
                 let socks_shutdown = shutdown.clone();
@@ -73,25 +73,32 @@ impl TunnelService {
                 let listener = TcpListener::bind(opts.peer_listen).await?;
                 let local_addr = listener.local_addr()?;
 
-                // Announce the carrier hash in the DHT (if enabled) so clients
-                // can discover us without a pre-shared address. The announced
-                // IP is inferred by DHT nodes from our packets; the port is our
-                // tunnel peer-listen port.
+                // Build the deterministic carrier store from our own identity
+                // key. The DHT rendezvous key is the store's
+                // `handshake_info_hash` — NOT the MSE `carrier_hash` (which the
+                // server still derives separately for the PeerWireCrypto
+                // responder handshake in `TunnelServer::run`). Announcing a
+                // different value than the BT handshake presents would be a
+                // fingerprint; unifying them here is the whole point of this
+                // change.
+                let server_pub = super::crypto::public_key(&opts.identity_key);
+                let carrier_store =
+                    super::carrier_identity::build_carrier_store(&opts.carrier_root, &server_pub)
+                        .await?;
+                let announce_hash = carrier_store.descriptor().handshake_info_hash;
+
                 if let Some(dht) = session.get_dht() {
-                    let carrier_hash = super::crypto::derive_carrier_hash(
-                        &super::crypto::public_key(&opts.identity_key),
-                    );
                     let announce_port = local_addr.port();
-                    let stream = dht.get_peers(carrier_hash, Some(announce_port));
+                    let stream = dht.get_peers(announce_hash, Some(announce_port));
                     tokio::spawn(run_dht_announce(stream, shutdown.clone()));
                     tracing::info!(
-                        ?carrier_hash,
+                        ?announce_hash,
                         port = announce_port,
                         "tunnel server announcing carrier in DHT"
                     );
                 }
 
-                let server = TunnelServer::new(opts);
+                let server = TunnelServer::new(opts, carrier_store);
                 let server_shutdown = shutdown.clone();
                 tokio::spawn(async move {
                     server.run(listener, server_shutdown).await;

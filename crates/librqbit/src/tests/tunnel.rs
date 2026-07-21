@@ -233,7 +233,6 @@ async fn server_rejects_unknown_client_key_during_noise_handshake() {
     use librqbit_core::Id20;
     use std::collections::HashSet;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-    use std::path::PathBuf;
 
     let (server_sk, server_pk) = generate_keypair();
     let (_known_client_sk, known_client_pk) = generate_keypair();
@@ -246,15 +245,24 @@ async fn server_rejects_unknown_client_key_during_noise_handshake() {
 
     let mut allowed = HashSet::new();
     allowed.insert(known_client_pk);
+    // Fresh temp dir per run (not a fixed shared `/tmp` path): `server_sk` is
+    // freshly random per test run, and the deterministic carrier store's
+    // content depends on it, so a fixed path reused across process runs
+    // would race/fail reopen validation against a stale descriptor.
+    let carrier_dir = tempfile::tempdir().expect("carrier temp dir");
     let opts = TunnelServerOptions {
         peer_listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
         identity_key: server_sk,
         allowed_client_keys: allowed,
         egress_policy: EgressPolicy::default(),
-        carrier_root: PathBuf::from("/tmp/test-carrier-reject"),
+        carrier_root: carrier_dir.path().to_path_buf(),
     };
 
-    let server = TunnelServer::new(opts);
+    let carrier_store =
+        crate::tunnel::carrier_identity::build_carrier_store(&opts.carrier_root, &server_pk)
+            .await
+            .expect("build carrier store");
+    let server = TunnelServer::new(opts, carrier_store);
 
     let server_clone = server.clone();
     let accept_handle = tokio::spawn(async move {
@@ -575,7 +583,12 @@ async fn client_tunnel_starts_when_server_unreachable() {
                 expected_server_key: server_pk,
                 pairing: None,
                 carriers: crate::tunnel::config::DEFAULT_CARRIERS,
-                ..Default::default()
+                // Dedicated dir (not the shared `TunnelClientOptions::default()`
+                // path): `server_pk` above is freshly random per test run, and
+                // the deterministic carrier store's content depends on it, so
+                // reusing the fixed default path across test runs/processes
+                // would race and fail reopen validation.
+                carrier_root: dir.path().join("client-carrier"),
             })),
             ..Default::default()
         },
@@ -1206,6 +1219,7 @@ async fn start_live_carrier_pool(
 
     let mut allowed_client_keys = HashSet::new();
     allowed_client_keys.insert(client_pk);
+    let server_carrier_root = carrier_dir.path().join("server");
     let server_opts = TunnelServerOptions {
         peer_listen: server_addr,
         identity_key: server_sk,
@@ -1214,9 +1228,13 @@ async fn start_live_carrier_pool(
             allow_loopback: true,
             ..Default::default()
         },
-        carrier_root: carrier_dir.path().to_path_buf(),
+        carrier_root: server_carrier_root.clone(),
     };
-    let server = TunnelServer::new(server_opts);
+    let server_carrier_store =
+        crate::tunnel::carrier_identity::build_carrier_store(&server_carrier_root, &server_pk)
+            .await
+            .expect("build server carrier store");
+    let server = TunnelServer::new(server_opts, server_carrier_store);
     let server_shutdown = CancellationToken::new();
     let server_for_run = server.clone();
     let run_shutdown = server_shutdown.clone();
@@ -1246,9 +1264,17 @@ async fn start_live_carrier_pool(
         expected_server_key: server_pk,
         pairing: None,
         carriers,
-        ..Default::default()
+        // Dedicated subdir of the same temp root as the server (NOT the
+        // shared `TunnelClientOptions::default()` path): each invocation of
+        // this helper uses a fresh random `server_pk`, and the deterministic
+        // carrier store's content depends on it, so sharing a fixed path
+        // across concurrently-running tests would race and fail reopen
+        // validation.
+        carrier_root: carrier_dir.path().join("client"),
     };
-    let pool = CarrierPool::start(client_opts, None, client_shutdown.clone());
+    let pool = CarrierPool::start(client_opts, None, client_shutdown.clone())
+        .await
+        .expect("build client carrier pool");
 
     (
         pool,

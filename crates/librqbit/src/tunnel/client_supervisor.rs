@@ -23,6 +23,7 @@ use dht::Dht;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
+use super::carrier::TunnelCarrierStore;
 use super::client::TunnelClient;
 use super::client_mux::ClientMux;
 use super::config::{CLIENT_CONNECT_TIMEOUT, DHT_PEER_CACHE, INITIAL_BACKOFF, MAX_BACKOFF};
@@ -32,20 +33,30 @@ use super::options::TunnelClientOptions;
 pub(crate) struct TunnelClientSupervisor {
     current: ArcSwapOption<ClientMux>,
     session_shutdown: CancellationToken,
+    /// Deterministic synthetic carrier torrent shared with the server via the
+    /// DHT rendezvous key (`descriptor().handshake_info_hash`). Built once by
+    /// the pool and shared across supervisors. Not yet consumed by
+    /// `TunnelClient::connect` / `ClientMux::new` — that lands in a later
+    /// task; today it is only used to derive the DHT discovery key below.
+    carrier_store: Arc<TunnelCarrierStore>,
 }
 
 impl TunnelClientSupervisor {
     /// Start the supervisor. Returns immediately; connection happens in a
     /// background task tied to `session_shutdown`. `dht`, when present, is the
-    /// session's DHT — used to discover the server by its carrier hash.
+    /// session's DHT — used to discover the server via the carrier store's
+    /// `handshake_info_hash`. `carrier_store` is built once by the pool and
+    /// shared (as an `Arc`) across all carriers.
     pub(crate) fn start(
         opts: TunnelClientOptions,
         dht: Option<Dht>,
         session_shutdown: CancellationToken,
+        carrier_store: Arc<TunnelCarrierStore>,
     ) -> Arc<Self> {
         let sup = Arc::new(Self {
             current: ArcSwapOption::empty(),
             session_shutdown: session_shutdown.clone(),
+            carrier_store,
         });
         tokio::spawn(sup.clone().run(opts, dht));
         sup
@@ -58,9 +69,15 @@ impl TunnelClientSupervisor {
 
     async fn run(self: Arc<Self>, opts: TunnelClientOptions, dht: Option<Dht>) {
         // Stable per-server "torrent" identity, derived from the pinned server
-        // key (matches what the server derives from its own key). Used both to
-        // key the MSE/PE carrier and as the DHT lookup key.
+        // key (matches what the server derives from its own key). This keys
+        // the MSE/PE carrier ONLY — it must NOT be used for DHT rendezvous
+        // (that would announce one info_hash while presenting another in the
+        // BT handshake, a fingerprint).
         let carrier_hash = super::crypto::derive_carrier_hash(&opts.expected_server_key);
+
+        // DHT rendezvous key: the deterministic carrier torrent's
+        // `handshake_info_hash`, matching what the server announces.
+        let discover_hash = self.carrier_store.descriptor().handshake_info_hash;
 
         // Continuously drain the DHT lookup into a small, deduped, bounded cache
         // of recent candidate addresses. The lookup itself is what generates the
@@ -69,9 +86,9 @@ impl TunnelClientSupervisor {
         let dht_cache: Arc<Mutex<Vec<SocketAddr>>> = Arc::new(Mutex::new(Vec::new()));
         if let Some(dht) = dht.as_ref() {
             self.clone()
-                .spawn_dht_drainer(dht.get_peers(carrier_hash, None), dht_cache.clone());
+                .spawn_dht_drainer(dht.get_peers(discover_hash, None), dht_cache.clone());
             tracing::info!(
-                ?carrier_hash,
+                ?discover_hash,
                 "tunnel client discovering the server via DHT"
             );
         } else if opts.server_addr.is_none() {

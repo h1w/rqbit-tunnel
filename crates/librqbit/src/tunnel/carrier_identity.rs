@@ -4,13 +4,18 @@
 // carrier hash, so the synthetic v2 torrent (and thus its info_hash / piece
 // data) is the same on both sides with no exchange.
 
+use std::path::Path;
+use std::sync::Arc;
+
 use librqbit_core::Id20;
 use sha2::{Digest, Sha256};
 
-use super::carrier::TunnelCarrierConfig;
+use super::carrier::{TunnelCarrierConfig, TunnelCarrierStore};
 use super::config::{
     CARRIER_CORPUS_MAX, CARRIER_CORPUS_MIN, CARRIER_DISPLAY_NAMES, CARRIER_PIECE_LENGTH,
 };
+use super::crypto::derive_carrier_hash;
+use super::frame::TunnelPublicKey;
 
 fn tagged_hash(tag: &[u8], carrier_hash: &Id20) -> [u8; 32] {
     let mut h = Sha256::new();
@@ -48,6 +53,24 @@ pub(crate) fn carrier_config_for(carrier_hash: &Id20) -> TunnelCarrierConfig {
     }
 }
 
+/// Open-or-initialize the deterministic carrier store for a given server key.
+///
+/// Both endpoints call this with the same `server_pub` (the server derives it
+/// from its own identity key; the client uses the pinned `expected_server_key`),
+/// so they build byte-identical synthetic v2 torrents with no exchange. The
+/// resulting store's `descriptor().handshake_info_hash` is the shared DHT
+/// rendezvous key. The MSE/PE carrier hash (`derive_carrier_hash`) stays a
+/// separate value — do not conflate the two.
+pub(crate) async fn build_carrier_store(
+    root: &Path,
+    server_pub: &TunnelPublicKey,
+) -> anyhow::Result<Arc<TunnelCarrierStore>> {
+    let carrier_hash = derive_carrier_hash(server_pub);
+    let config = carrier_config_for(&carrier_hash);
+    let store = TunnelCarrierStore::open_or_initialize(root, &config).await?;
+    Ok(Arc::new(store))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +100,32 @@ mod tests {
         let cfg = carrier_config_for(&Id20::new([42u8; 20]));
         assert!(cfg.corpus_bytes >= super::super::config::CARRIER_CORPUS_MIN);
         assert!(cfg.corpus_bytes <= super::super::config::CARRIER_CORPUS_MAX);
+    }
+
+    #[tokio::test]
+    async fn both_sides_derive_same_handshake_info_hash() {
+        use super::super::crypto::{derive_carrier_hash, generate_keypair, public_key};
+
+        let (server_priv, server_pub) = generate_keypair();
+
+        // Server derives from its own key; client from the pinned server pub key.
+        let server_pub_from_priv = public_key(&server_priv);
+        assert_eq!(server_pub_from_priv, server_pub);
+
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        let server_store = build_carrier_store(d1.path(), &server_pub_from_priv)
+            .await
+            .unwrap();
+        let client_store = build_carrier_store(d2.path(), &server_pub).await.unwrap();
+
+        assert_eq!(
+            server_store.descriptor().handshake_info_hash,
+            client_store.descriptor().handshake_info_hash,
+            "DHT rendezvous key must match on both sides"
+        );
+        // Sanity: carrier hash (MSE key) is a different value.
+        let carrier_hash = derive_carrier_hash(&server_pub);
+        assert_ne!(carrier_hash, server_store.descriptor().handshake_info_hash);
     }
 }
