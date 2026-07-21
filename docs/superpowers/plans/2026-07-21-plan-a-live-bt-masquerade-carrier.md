@@ -893,6 +893,8 @@ git commit -m "feat(tunnel): split CarrierWire into read/write halves"
 
 ## Task 7: Server relay through the carrier
 
+> **⚠️ EXECUTION RE-DECOMPOSITION (applied during execution).** During execution this section was split: the **defrag length-cap hardening** (the "Security hardening" block below) shipped independently as its own task/commit (`865546c8`, `fix(tunnel): bound CarrierDefragmenter declared length`) — `CarrierDefragmenter` is now `new(MAX_CARRIER_CIPHERTEXT)` with `push(...) -> Result<_, CarrierChunkError>`. The **server-relay migration steps** in the rest of this section were executed **atomically together with Task 8's client migration** as one task, because `spawn_frame_writer` and `read_encrypted_frame` are shared by both client and server and changing their signatures cannot compile split across two tasks. Read the rest of Task 7 + all of Task 8 as a single atomic unit whose gate is the full `cargo test -p librqbit tunnel` integration suite passing through the carrier.
+
 Rewire `server.rs::accept` and `relay.rs` so the server runs `CarrierWire::establish` after MSE, does Noise over the carrier, and the relay reads/writes frames through the carrier halves (with piece cover).
 
 **Security hardening (REQUIRED — added after Task 3 review).** `CarrierDefragmenter` (from Task 3) currently trusts the declared `u32` length with no upper bound. This task wires it to a live socket where the rendezvous `info_hash` is public (DHT-discoverable), so a peer that completes MSE + BT handshake but fails Noise auth can still feed the defragmenter. Harden it so an oversized declared length cannot cause unbounded buffering:
@@ -1190,6 +1192,8 @@ git commit -m "feat(tunnel): server relay over BT masquerade carrier with piece 
 ---
 
 ## Task 8: Client connect + mux through the carrier
+
+> **⚠️ EXECUTION NOTE.** Executed as ONE atomic task together with Task 7's server-relay migration steps (shared `spawn_frame_writer`/`read_encrypted_frame`/`next_tunnel_frame` plumbing). Defrag API is now `CarrierDefragmenter::new(carrier_chunk::MAX_CARRIER_CIPHERTEXT)` + `push -> Result<_, CarrierChunkError>`; in `next_tunnel_frame`/`recv_one_ciphertext` treat `Err(MessageTooLarge)` as a disconnect (return `None`, debug-log). Cover-lane `send_message` serialize errors are non-fatal (skip, don't break). Gate: the full `cargo test -p librqbit tunnel` suite passes through the carrier.
 
 Mirror Task 7 on the client: `TunnelClient::connect` runs `CarrierWire::establish` and Noise over the carrier; `ClientMux` reader loop uses `next_tunnel_frame`; the writer uses the carrier write half + cover lane.
 
