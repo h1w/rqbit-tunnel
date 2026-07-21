@@ -270,3 +270,79 @@ terminates in its E2E gate; G is the final comprehensive test.
 - Multi-exit infrastructure for Plan F (several real exit IPs vs. decoys to real
   peers): default to decoys-to-real-peers first, multi-exit optional — finalise
   in Plan F.
+
+## Results (Plan A — live BitTorrent masquerade carrier)
+
+Status: **COMPLETE.** The live tunnel now speaks the BitTorrent masquerade
+carrier end-to-end (real BT handshake + BEP-10 extended handshake + `rq_tunnel`
+messages carrying Noise chunks + piece cover), rendezvous on the fake torrent's
+`handshake_info_hash`, replacing the raw `[u16 len][Noise ciphertext]` framing.
+Implemented as Tasks 1–9 (plan
+`docs/superpowers/plans/2026-07-21-plan-a-live-bt-masquerade-carrier.md`),
+re-decomposed during execution (defrag hardening split out; client+server
+transport swap done atomically because `spawn_frame_writer`/`read_encrypted_frame`
+are shared).
+
+**Automated verification (the E2E gate):**
+- Full `cargo test -p librqbit tunnel` = **172 passed, 0 failed** (independently
+  re-run by the controller, ~28 s), all through the masquerade carrier: SOCKS
+  TCP CONNECT + UDP ASSOCIATE, concurrent streams, large-payload flow control,
+  wrong-key rejection, carrier-pool striping.
+- Message-layer capture gate (`wire_shows_real_bittorrent_events`): asserts real
+  `ExtendedHandshake` + `Bitfield` + (`Piece`/`Request`) events on the wire. The
+  masquerade rides *inside* the MSE/RC4 layer (like a real encrypted BT peer), so
+  the tap is at the decoded-message layer, not the raw bytes.
+
+**Real-binary milestone run** (substitute for a raw pcap — no `tcpdump`/`sudo`
+available in this environment, and the masquerade is MSE-encrypted so a raw pcap
+shows only ciphertext anyway):
+- Built the `rqbit` CLI; ran a real loopback tunnel (server + client processes)
+  and `curl --socks5-hostname 127.0.0.1:<socks>` to a local HTTP server. Result:
+  the destination body was returned through the tunnel — traffic really flowed
+  `app → SOCKS5 → masquerade carrier → exit → destination`.
+- Logs confirmed via the real binary: server `tunnel peer admitted` ×4 (full
+  MSE → `CarrierWire::establish` → Noise IK → admit), client `tunnel client
+  connected` ×4, and DHT rendezvous `announce_hash == discover_hash ==
+  handshake_info_hash`.
+- Default egress correctly denied the loopback destination until an explicit
+  `--tunnel-egress-policy` with `allow_loopback:true` was supplied — the exit's
+  `allow_private/allow_loopback = false` default behaves as designed.
+
+**Security hardening that landed with Plan A:**
+- Deterministic corpus (both ends generate byte-identical torrents from a shared
+  seed) and `info_hash` unification (DHT announce + BT handshake both use
+  `handshake_info_hash`; MSE key stays `carrier_hash`).
+- `CarrierDefragmenter` length cap → rejects oversized declared lengths before
+  buffering (pre-auth memory-DoS closed on all read paths).
+- `verify_block` overflow guard → `checked_add` + `usize` bound-check before
+  slicing (fixed a confirmed pre-auth panic-DoS on crafted `Piece.begin`).
+- Cover-lane `send_message` serialize errors are non-fatal (an oversized cover
+  Piece cannot kill the tunnel).
+- Fixed a pre-existing carrier_peer bug: block validation hashed a 16 KiB block
+  against a whole-256 KiB-piece hash (always mismatched); now byte-compares the
+  block against the local deterministic corpus.
+
+**Known follow-ups (not Plan-A blockers):**
+- **Client carrier store is brittle across servers.** The client's default
+  `carrier_root` is a FIXED path (not keyed per server), and
+  `TunnelCarrierStore::reopen` hard-fails on a corpus-size mismatch instead of
+  re-initializing. Reconnecting to a different server (or a stale carrier dir)
+  yields "carrier corpus size mismatch" and the client fails to start. Fix:
+  re-initialize on config mismatch, and/or namespace the client `carrier_root`
+  per `expected_server_key`.
+- **Steady-state carrier throughput unbenchmarked** (⚠️ from the Task 8 review):
+  the carrier receive path adds per-frame BT-parse + defrag + Noise-decrypt under
+  a `Mutex<NoiseTransport>`; measure MB/s on a real high-BDP path vs. the raw
+  framing before relying on it for bulk transfer.
+- Blanket `#![allow(dead_code)]` on the tunnel module kept (~29 unrelated
+  scaffolding items across 10 files, out of Plan-A scope); the five carrier
+  masquerade modules were verified clean without it.
+- Minor: `verify_block` reads the whole 256 KiB piece to validate a 16 KiB block
+  (fine at Plan-A's minimal cover cadence; revisit in Plan C);
+  `recv_one_ciphertext` drops any extra blobs from one `push` (safe today —
+  `chunk_ciphertext` never packs two logical messages into one BT message).
+
+**Where this leaves the ladder:** rung 2 (protocol-aware DPI) is now met for the
+plaintext-BT-handshake identity, with real piece cover. Rungs 3 (active-probe
+resistance), 4 (spec-accurate MSE/PE identity), 5 (swarm/DHT realism) and 6
+(statistical shaping) remain for Plans B–F.
