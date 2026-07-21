@@ -182,6 +182,19 @@ pub(crate) const DEFAULT_CARRIERS: usize = 4;
 /// extra handshakes / DHT noise).
 pub(crate) const MAX_CARRIERS: usize = 16;
 
+// ── Seeder (pre-auth active-probe resistance) ───────────────────────────────
+
+/// Idle timeout for the pre-Noise seeder loop
+/// (`server.rs::seed_until_promoted`): how long the server keeps serving
+/// BitTorrent cover (`Request` → `Piece`) to an unauthenticated peer before
+/// treating it as an ordinary BT peer that came and went. This — not a
+/// dropped connection on bad/absent Noise traffic — is the only way an
+/// unpromoted connection ever ends, so a censor probing the public
+/// rendezvous cannot distinguish "real BT peer churn" from "tunnel server
+/// rejected my handshake". Long enough to look like a real idle BT peer, not
+/// a deliberately short leash.
+pub(crate) const SEEDER_IDLE: Duration = Duration::from_secs(120);
+
 // ── Carrier identity (masquerade torrent shape) ──────────────────────────────
 
 /// Piece length for the synthetic carrier torrent. 256 KiB is a common real
