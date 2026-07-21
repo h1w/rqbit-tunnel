@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use librqbit_core::Id20;
 use peer_binary_protocol::{Message, extended::ExtendedMessage};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, Semaphore};
@@ -355,18 +354,35 @@ impl TunnelServer {
     /// latter is a normal outcome, not an error: this is the active-probe
     /// resistance (Plan B). The caller should spawn a relay task on
     /// `Admitted` and just close the socket on `Seeded`.
-    pub async fn accept(
-        &self,
-        stream: TcpStream,
-        carrier_hash: Id20,
-    ) -> Result<AcceptOutcome, TunnelAdmissionError> {
+    pub async fn accept(&self, stream: TcpStream) -> Result<AcceptOutcome, TunnelAdmissionError> {
         // ── Step 1: MSE responder ───────────────────────────────────────────
-        let enc = PeerWireCrypto::responder(stream, carrier_hash)
-            .await
-            .map_err(|e| TunnelAdmissionError::CarrierHandshakeFailed(anyhow::anyhow!("{e}")))?;
+        //
+        // The MSE/PE SKEY is the carrier torrent's public `handshake_info_hash`
+        // — exactly the info hash a real BitTorrent peer requesting this torrent
+        // would key its MSE handshake by. The client derives the SAME value from
+        // its independently-built (deterministic) carrier store, so both ends
+        // agree with no exchange. A wall-clock deadline bounds the whole MSE
+        // handshake so a peer that sends `Ya` then stalls can't pin this accept
+        // task on a blocking `read_exact`; on elapse we drop exactly like any
+        // other failed carrier handshake (no tell).
+        let info_hash = self.carrier_store.descriptor().handshake_info_hash;
+        let enc = match tokio::time::timeout(
+            super::config::MSE_HANDSHAKE_DEADLINE,
+            PeerWireCrypto::responder(stream, info_hash),
+        )
+        .await
+        {
+            Ok(res) => res.map_err(|e| {
+                TunnelAdmissionError::CarrierHandshakeFailed(anyhow::anyhow!("{e}"))
+            })?,
+            Err(_elapsed) => {
+                return Err(TunnelAdmissionError::CarrierHandshakeFailed(
+                    anyhow::anyhow!("MSE handshake timed out"),
+                ));
+            }
+        };
 
         // ── Step 2: BT handshake + BEP-10 + cover (masquerade) ──────────────
-        let info_hash = self.carrier_store.descriptor().handshake_info_hash;
         let wire = super::carrier_wire::CarrierWire::establish(
             enc.reader,
             enc.writer,
@@ -460,13 +476,6 @@ impl TunnelServer {
             &self.options.egress_policy,
         ));
 
-        // Key the MSE/PE carrier by a stable "torrent" identity derived from our
-        // own public key. The client derives the same value from the pinned
-        // server key, so no pairing exchange is needed.
-        let carrier_hash = super::crypto::derive_carrier_hash(&super::crypto::public_key(
-            &self.options.identity_key,
-        ));
-
         loop {
             tokio::select! {
                 result = listener.accept() => {
@@ -499,7 +508,7 @@ impl TunnelServer {
                                 // decrements the per-IP/global counts on every
                                 // exit path (promoted, seeded-out, error).
                                 let _guard = guard;
-                                match server.accept(stream, carrier_hash).await {
+                                match server.accept(stream).await {
                                     Ok(AcceptOutcome::Admitted(peer)) => {
                                         // Authenticated (allowlisted): release the
                                         // pre-auth seeder slot BEFORE relaying. The
@@ -575,6 +584,7 @@ mod tests {
     use super::super::frame::{TunnelPrivateKey, TunnelPublicKey};
     use super::super::options::{EgressPolicy, TunnelServerOptions};
     use super::*;
+    use librqbit_core::Id20;
 
     fn known_key() -> TunnelPublicKey {
         let mut key = [0u8; 32];
@@ -620,6 +630,47 @@ mod tests {
             .await
             .unwrap();
         (dir, store)
+    }
+
+    /// A peer that completes the TCP connect but never sends `Ya` would, without
+    /// a bound, pin the accept task on the MSE responder's `read_exact` forever.
+    /// `MSE_HANDSHAKE_DEADLINE` bounds the whole handshake: on elapse `accept`
+    /// returns `CarrierHandshakeFailed` (the connection is then just dropped —
+    /// the same normal MSE rejection as any bad carrier handshake, no tell).
+    /// Uses paused virtual time so the real 30 s deadline resolves instantly.
+    #[tokio::test(start_paused = true)]
+    async fn accept_times_out_on_stalled_mse_peer() {
+        let opts = test_server_options(allowed_client_keys(&[known_key()]));
+        let (_dir, store) = test_carrier_store(&opts.identity_key).await;
+        let server = TunnelServer::new(opts, store);
+
+        let listener = tokio::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().unwrap();
+
+        // Connect but send NOTHING — the MSE responder blocks on `read_exact(Ya)`.
+        let _stall = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("stall connect");
+        let (stream, _) = listener.accept().await.expect("listener accept");
+
+        let accept_task = tokio::spawn(async move { server.accept(stream).await });
+
+        // Let the accept task poll to its blocking read and ARM the MSE deadline
+        // timer, then blow past the deadline in virtual time.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(
+            super::super::config::MSE_HANDSHAKE_DEADLINE + std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        let res = accept_task.await.expect("accept task join");
+        assert!(
+            matches!(res, Err(TunnelAdmissionError::CarrierHandshakeFailed(_))),
+            "a stalled MSE peer must hit the handshake deadline (CarrierHandshakeFailed)",
+        );
     }
 
     #[tokio::test]
@@ -1167,18 +1218,19 @@ mod tests {
             .await
             .expect("bind");
         let listen_addr = listener.local_addr().unwrap();
-        let carrier_hash = Id20::new([0xE4; 20]);
 
         let server_clone = server.clone();
         let accept_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("listener accept");
-            server_clone.accept(stream, carrier_hash).await
+            server_clone.accept(stream).await
         });
 
         let client_stream = tokio::net::TcpStream::connect(listen_addr)
             .await
             .expect("client connect");
-        let enc = PeerWireCrypto::initiator(client_stream, carrier_hash)
+        // MSE is keyed by the carrier's public `handshake_info_hash` — the same
+        // value the server derives from its own store — so the client uses it too.
+        let enc = PeerWireCrypto::initiator(client_stream, info_hash)
             .await
             .expect("client MSE initiator");
         let wire = CarrierWire::establish(enc.reader, enc.writer, store.clone(), info_hash)
@@ -1357,18 +1409,17 @@ mod tests {
             .await
             .expect("bind");
         let listen_addr = listener.local_addr().unwrap();
-        let carrier_hash = Id20::new([0xD2; 20]);
 
         let server_clone = server.clone();
         let accept_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("listener accept");
-            server_clone.accept(stream, carrier_hash).await
+            server_clone.accept(stream).await
         });
 
         let client_stream = tokio::net::TcpStream::connect(listen_addr)
             .await
             .expect("client connect");
-        let enc = PeerWireCrypto::initiator(client_stream, carrier_hash)
+        let enc = PeerWireCrypto::initiator(client_stream, info_hash)
             .await
             .expect("client MSE initiator");
         let wire = CarrierWire::establish(enc.reader, enc.writer, store, info_hash)
@@ -1430,18 +1481,17 @@ mod tests {
             .await
             .expect("bind");
         let listen_addr = listener.local_addr().unwrap();
-        let carrier_hash = Id20::new([0xD3; 20]);
 
         let server_clone = server.clone();
         let accept_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("listener accept");
-            server_clone.accept(stream, carrier_hash).await
+            server_clone.accept(stream).await
         });
 
         let client_stream = tokio::net::TcpStream::connect(listen_addr)
             .await
             .expect("client connect");
-        let enc = PeerWireCrypto::initiator(client_stream, carrier_hash)
+        let enc = PeerWireCrypto::initiator(client_stream, info_hash)
             .await
             .expect("client MSE initiator");
         let wire = CarrierWire::establish(enc.reader, enc.writer, store.clone(), info_hash)

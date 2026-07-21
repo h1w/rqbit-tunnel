@@ -227,7 +227,6 @@ pub mod tunnel_fixture {
     use std::collections::VecDeque;
 
     use crate::tunnel::carrier_peer::CoverMessage;
-    use librqbit_core::Id20;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
     use tokio::sync::{Mutex, mpsc};
@@ -301,8 +300,9 @@ pub mod tunnel_fixture {
                 }
             });
 
-            // Tunnel pair over the live BitTorrent-masquerade carrier.
-            let carrier_hash = Id20::new([0xAB; 20]);
+            // Tunnel pair over the live BitTorrent-masquerade carrier. The MSE
+            // SKEY is the carrier's public `handshake_info_hash` (`info_hash`
+            // below), exactly as production keys it.
             let (client_io, server_io) = tokio::io::duplex(256 * 1024);
             let client_pk_c = client_pk.clone();
 
@@ -315,7 +315,7 @@ pub mod tunnel_fixture {
             let server_store = carrier_store.clone();
 
             let server_handle = tokio::spawn(async move {
-                let enc = PeerWireCrypto::responder(server_io, carrier_hash)
+                let enc = PeerWireCrypto::responder(server_io, info_hash)
                     .await
                     .unwrap();
                 let wire = CarrierWire::establish(enc.reader, enc.writer, server_store, info_hash)
@@ -338,7 +338,7 @@ pub mod tunnel_fixture {
                 (transport, read_half, write_half, carrier_peer)
             });
 
-            let enc = PeerWireCrypto::initiator(client_io, carrier_hash)
+            let enc = PeerWireCrypto::initiator(client_io, info_hash)
                 .await
                 .unwrap();
             let wire = CarrierWire::establish(enc.reader, enc.writer, carrier_store, info_hash)

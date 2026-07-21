@@ -162,7 +162,6 @@ async fn client_rejects_wrong_server_key_before_sending_frames() {
     use crate::tunnel::carrier_wire::CarrierWire;
     use crate::tunnel::client::TunnelClient;
     use crate::tunnel::crypto::generate_keypair;
-    use librqbit_core::Id20;
     use std::collections::HashSet;
     use std::net::{Ipv4Addr, SocketAddrV4};
 
@@ -192,9 +191,12 @@ async fn client_rejects_wrong_server_key_before_sending_frames() {
         let Ok((stream, _)) = listener.accept().await else {
             return;
         };
-        let carrier_hash = Id20::new([0xAB; 20]);
+        // MSE is keyed by the carrier's public `handshake_info_hash` (what
+        // `TunnelClient::connect` derives from the same store), so both ends
+        // complete the carrier handshake and the wrong pinned key is caught at
+        // the Noise stage — the point of this test.
         let Ok(enc) =
-            crate::tunnel::peer_wire_crypto::PeerWireCrypto::responder(stream, carrier_hash).await
+            crate::tunnel::peer_wire_crypto::PeerWireCrypto::responder(stream, info_hash).await
         else {
             return;
         };
@@ -221,15 +223,7 @@ async fn client_rejects_wrong_server_key_before_sending_frames() {
         }
     });
 
-    let carrier_hash = Id20::new([0xAB; 20]);
-    let result = TunnelClient::connect(
-        server_addr,
-        &client_sk,
-        &wrong_server_pk,
-        carrier_hash,
-        store,
-    )
-    .await;
+    let result = TunnelClient::connect(server_addr, &client_sk, &wrong_server_pk, store).await;
 
     assert!(
         result.is_err(),
@@ -265,7 +259,6 @@ async fn server_seeds_unknown_client_key_instead_of_dropping() {
     use crate::tunnel::options::{EgressPolicy, TunnelServerOptions};
     use crate::tunnel::peer_wire_crypto::PeerWireCrypto;
     use crate::tunnel::server::{AcceptOutcome, TunnelServer};
-    use librqbit_core::Id20;
     use std::collections::HashSet;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
@@ -303,15 +296,15 @@ async fn server_seeds_unknown_client_key_instead_of_dropping() {
     let server_clone = server.clone();
     let accept_handle = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("listener accept");
-        let carrier_hash = Id20::new([0xAB; 20]);
-        server_clone.accept(stream, carrier_hash).await
+        server_clone.accept(stream).await
     });
 
-    let carrier_hash = Id20::new([0xAB; 20]);
     let client_stream = tokio::net::TcpStream::connect(listen_addr)
         .await
         .expect("client TCP connect");
-    let enc = PeerWireCrypto::initiator(client_stream, carrier_hash)
+    // MSE is keyed by the carrier's public `handshake_info_hash`, matching what
+    // the server derives from its own store.
+    let enc = PeerWireCrypto::initiator(client_stream, info_hash)
         .await
         .expect("client MSE initiator");
     // Same (correct) pinned server key, built from the server's OWN carrier
@@ -372,7 +365,6 @@ async fn server_admits_valid_allowlisted_client_via_accept() {
     use crate::tunnel::crypto::generate_keypair;
     use crate::tunnel::options::{EgressPolicy, TunnelServerOptions};
     use crate::tunnel::server::{AcceptOutcome, TunnelServer};
-    use librqbit_core::Id20;
     use std::collections::HashSet;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
@@ -407,23 +399,20 @@ async fn server_admits_valid_allowlisted_client_via_accept() {
             .await
             .expect("build client carrier store");
 
+    // NOTE: server and client build SEPARATE carrier stores (above) from the
+    // same `server_pk`. Both endpoints now key MSE by their own store's
+    // `handshake_info_hash`, so this end-to-end admission only succeeds if the
+    // two independently-derived hashes agree — this test is the guard for that
+    // invariant (a mismatch would fail the MSE handshake here).
     let server_clone = server.clone();
     let accept_handle = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("listener accept");
-        let carrier_hash = Id20::new([0xAB; 20]);
-        server_clone.accept(stream, carrier_hash).await
+        server_clone.accept(stream).await
     });
 
-    let carrier_hash = Id20::new([0xAB; 20]);
-    let _client = TunnelClient::connect(
-        listen_addr,
-        &client_sk,
-        &server_pk,
-        carrier_hash,
-        client_carrier_store,
-    )
-    .await
-    .expect("valid allowlisted client must connect");
+    let _client = TunnelClient::connect(listen_addr, &client_sk, &server_pk, client_carrier_store)
+        .await
+        .expect("valid allowlisted client must connect");
 
     let admission_result = accept_handle.await.expect("accept handle join");
     match admission_result {
@@ -478,7 +467,6 @@ async fn active_probe_gets_seeded_and_stays_connected() {
     use crate::tunnel::options::{EgressPolicy, TunnelServerOptions};
     use crate::tunnel::peer_wire_crypto::PeerWireCrypto;
     use crate::tunnel::server::{AcceptOutcome, TunnelServer};
-    use librqbit_core::Id20;
     use peer_binary_protocol::{Message, Request};
     use std::collections::HashSet;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -520,21 +508,20 @@ async fn active_probe_gets_seeded_and_stays_connected() {
     let server_clone = server.clone();
     let accept_handle = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("listener accept");
-        let carrier_hash = Id20::new([0xAB; 20]);
-        server_clone.accept(stream, carrier_hash).await
+        server_clone.accept(stream).await
     });
 
     // ── Stub BitTorrent peer ("plain, unauthenticated") ─────────────────────
     // Exactly the primitives `CarrierWire::establish` uses on the initiator
-    // side: MSE-initiate keyed by the (public) carrier hash, then complete
-    // the real BT handshake + BEP-10 extended handshake. Nothing beyond that
-    // is tunnel-specific — a genuine BT client (or a censor's active probe)
+    // side: MSE-initiate keyed by the carrier's public `handshake_info_hash`
+    // (what the server derives from its own store), then complete the real BT
+    // handshake + BEP-10 extended handshake. Nothing beyond that is
+    // tunnel-specific — a genuine BT client (or a censor's active probe)
     // connecting to any discovered peer looks exactly like this.
-    let carrier_hash = Id20::new([0xAB; 20]);
     let probe_stream = tokio::net::TcpStream::connect(listen_addr)
         .await
         .expect("probe TCP connect");
-    let enc = PeerWireCrypto::initiator(probe_stream, carrier_hash)
+    let enc = PeerWireCrypto::initiator(probe_stream, info_hash)
         .await
         .expect("probe MSE initiator");
 
@@ -1020,12 +1007,10 @@ async fn build_real_relay_pair() -> (
     use crate::tunnel::crypto::{self, generate_keypair};
     use crate::tunnel::peer_wire_crypto::PeerWireCrypto;
     use crate::tunnel::server::AdmittedPeer;
-    use librqbit_core::Id20;
     use std::collections::HashSet;
 
     let (client_sk, client_pk) = generate_keypair();
     let (server_sk, server_pk) = generate_keypair();
-    let carrier_hash = Id20::new([0xAB; 20]);
     let (client_io, server_io) = tokio::io::duplex(256 * 1024);
     let client_pk_c = client_pk.clone();
 
@@ -1038,7 +1023,7 @@ async fn build_real_relay_pair() -> (
     let server_store = carrier_store.clone();
 
     let server_handle = tokio::spawn(async move {
-        let enc = PeerWireCrypto::responder(server_io, carrier_hash)
+        let enc = PeerWireCrypto::responder(server_io, info_hash)
             .await
             .unwrap();
         let wire = CarrierWire::establish(enc.reader, enc.writer, server_store, info_hash)
@@ -1072,7 +1057,7 @@ async fn build_real_relay_pair() -> (
         }
     });
 
-    let enc = PeerWireCrypto::initiator(client_io, carrier_hash)
+    let enc = PeerWireCrypto::initiator(client_io, info_hash)
         .await
         .unwrap();
     let wire = CarrierWire::establish(enc.reader, enc.writer, carrier_store, info_hash)

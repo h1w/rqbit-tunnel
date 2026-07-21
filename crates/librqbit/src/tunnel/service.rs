@@ -74,13 +74,13 @@ impl TunnelService {
                 let local_addr = listener.local_addr()?;
 
                 // Build the deterministic carrier store from our own identity
-                // key. The DHT rendezvous key is the store's
-                // `handshake_info_hash` — NOT the MSE `carrier_hash` (which the
-                // server still derives separately for the PeerWireCrypto
-                // responder handshake in `TunnelServer::run`). Announcing a
-                // different value than the BT handshake presents would be a
-                // fingerprint; unifying them here is the whole point of this
-                // change.
+                // key. The store's `handshake_info_hash` is now the single
+                // rendezvous/identity value: it is the DHT rendezvous key, the
+                // BT-handshake info_hash, AND (as of Plan D) the MSE/PE SKEY.
+                // Announcing, handshaking, and MSE-keying on one and the same
+                // public info hash is exactly what a real seeder does —
+                // presenting different values for any of them would be a
+                // fingerprint.
                 let server_pub = super::crypto::public_key(&opts.identity_key);
                 let carrier_store =
                     super::carrier_identity::build_carrier_store(&opts.carrier_root, &server_pub)

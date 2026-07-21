@@ -39,10 +39,11 @@ impl CarrierPool {
     /// Builds the deterministic carrier store once (from
     /// `opts.expected_server_key`) before spawning any supervisor, and shares
     /// the resulting `Arc<TunnelCarrierStore>` across all of them — its
-    /// `handshake_info_hash` is the DHT rendezvous key each supervisor
-    /// discovers the server by (NOT the MSE `carrier_hash`, which each
-    /// supervisor still derives separately). This is async (and fallible)
-    /// because it does real disk I/O to open-or-initialize the store.
+    /// `handshake_info_hash` is BOTH the DHT rendezvous key each supervisor
+    /// discovers the server by AND the MSE/PE SKEY each connection keys its
+    /// carrier handshake by (a real BitTorrent peer keys both by the public
+    /// info hash). This is async (and fallible) because it does real disk I/O
+    /// to open-or-initialize the store.
     pub(crate) async fn start(
         opts: TunnelClientOptions,
         dht: Option<Dht>,

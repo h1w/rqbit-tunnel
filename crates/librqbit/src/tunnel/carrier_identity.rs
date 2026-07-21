@@ -58,9 +58,12 @@ pub(crate) fn carrier_config_for(carrier_hash: &Id20) -> TunnelCarrierConfig {
 /// Both endpoints call this with the same `server_pub` (the server derives it
 /// from its own identity key; the client uses the pinned `expected_server_key`),
 /// so they build byte-identical synthetic v2 torrents with no exchange. The
-/// resulting store's `descriptor().handshake_info_hash` is the shared DHT
-/// rendezvous key. The MSE/PE carrier hash (`derive_carrier_hash`) stays a
-/// separate value — do not conflate the two.
+/// resulting store's `descriptor().handshake_info_hash` is BOTH the shared DHT
+/// rendezvous key AND the MSE/PE SKEY (see `server.rs::accept` /
+/// `client.rs::connect`) — exactly as a real BitTorrent peer keys both by the
+/// public info hash. `derive_carrier_hash` here is used ONLY as the private
+/// seed that shapes the synthetic corpus (display name, size, piece data); it
+/// is NOT the MSE key and never goes on the wire.
 pub(crate) async fn build_carrier_store(
     root: &Path,
     server_pub: &TunnelPublicKey,
@@ -166,7 +169,9 @@ mod tests {
             client_store.descriptor().handshake_info_hash,
             "DHT rendezvous key must match on both sides"
         );
-        // Sanity: carrier hash (MSE key) is a different value.
+        // Sanity: the private corpus seed (`derive_carrier_hash`) is a distinct
+        // value from the public `handshake_info_hash` — it shapes the synthetic
+        // torrent but is neither the DHT key nor (now) the MSE SKEY.
         let carrier_hash = derive_carrier_hash(&server_pub);
         assert_ne!(carrier_hash, server_store.descriptor().handshake_info_hash);
     }

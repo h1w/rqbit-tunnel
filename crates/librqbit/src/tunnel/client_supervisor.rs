@@ -10,8 +10,8 @@
 //     streams on the dead connection are reset, new ones use the fresh mux.
 //
 // The server is located by a static `server_addr` (fast path) and/or via the
-// DHT: the server announces the carrier hash (derived from its key), and the
-// client looks it up. DHT results are UNTRUSTED — the Noise IK handshake pins
+// DHT: the server announces the carrier torrent's `handshake_info_hash`, and
+// the client looks it up. DHT results are UNTRUSTED — the Noise IK handshake pins
 // the server's static key, so a wrong/poisoned address simply fails to
 // authenticate and the next candidate is tried.
 
@@ -68,15 +68,11 @@ impl TunnelClientSupervisor {
     }
 
     async fn run(self: Arc<Self>, opts: TunnelClientOptions, dht: Option<Dht>) {
-        // Stable per-server "torrent" identity, derived from the pinned server
-        // key (matches what the server derives from its own key). This keys
-        // the MSE/PE carrier ONLY — it must NOT be used for DHT rendezvous
-        // (that would announce one info_hash while presenting another in the
-        // BT handshake, a fingerprint).
-        let carrier_hash = super::crypto::derive_carrier_hash(&opts.expected_server_key);
-
         // DHT rendezvous key: the deterministic carrier torrent's
-        // `handshake_info_hash`, matching what the server announces.
+        // `handshake_info_hash`, matching what the server announces. This is
+        // ALSO the MSE/PE SKEY (`TunnelClient::connect` derives it from the same
+        // carrier store) — a real BitTorrent peer keys both DHT lookup and MSE
+        // by the public info hash, so we do too.
         let discover_hash = self.carrier_store.descriptor().handshake_info_hash;
 
         // Continuously drain the DHT lookup into a small, deduped, bounded cache
@@ -140,7 +136,7 @@ impl TunnelClientSupervisor {
                 if self.session_shutdown.is_cancelled() {
                     break;
                 }
-                if let Some(client) = self.attempt(addr, &opts, carrier_hash).await {
+                if let Some(client) = self.attempt(addr, &opts).await {
                     connected = Some((addr, client));
                     break;
                 }
@@ -188,12 +184,7 @@ impl TunnelClientSupervisor {
 
     /// One connection attempt to `addr`, bounded by a timeout and the session
     /// shutdown. Returns the authenticated client on success.
-    async fn attempt(
-        &self,
-        addr: SocketAddr,
-        opts: &TunnelClientOptions,
-        carrier_hash: librqbit_core::Id20,
-    ) -> Option<TunnelClient> {
+    async fn attempt(&self, addr: SocketAddr, opts: &TunnelClientOptions) -> Option<TunnelClient> {
         let result = tokio::select! {
             _ = self.session_shutdown.cancelled() => return None,
             r = tokio::time::timeout(
@@ -202,7 +193,6 @@ impl TunnelClientSupervisor {
                     addr,
                     &opts.identity_key,
                     &opts.expected_server_key,
-                    carrier_hash,
                     self.carrier_store.clone(),
                 ),
             ) => r,

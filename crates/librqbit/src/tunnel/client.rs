@@ -89,19 +89,35 @@ impl TunnelClient {
         server_addr: SocketAddr,
         identity_key: &TunnelPrivateKey,
         expected_server_key: &TunnelPublicKey,
-        carrier_hash: librqbit_core::Id20,
         carrier_store: Arc<TunnelCarrierStore>,
     ) -> Result<Self, TunnelClientError> {
         // ── Step 1: TCP connect ──────────────────────────────────────────
         let stream = TcpStream::connect(server_addr).await?;
 
         // ── Step 2: MSE initiator ────────────────────────────────────────
-        let enc = PeerWireCrypto::initiator(stream, carrier_hash)
-            .await
-            .map_err(|e| TunnelClientError::CarrierHandshake(e.to_string()))?;
+        //
+        // Key the MSE/PE handshake by the carrier torrent's public
+        // `handshake_info_hash` — the same value a real BitTorrent client would
+        // request this torrent by. The server derives the identical hash from
+        // its own (deterministic) carrier store, so both ends agree with no
+        // exchange. Bound the whole handshake by a wall-clock deadline so a
+        // stalled/hostile server can't pin us on a blocking `read_exact`.
+        let info_hash = carrier_store.descriptor().handshake_info_hash;
+        let enc = match tokio::time::timeout(
+            super::config::MSE_HANDSHAKE_DEADLINE,
+            PeerWireCrypto::initiator(stream, info_hash),
+        )
+        .await
+        {
+            Ok(res) => res.map_err(|e| TunnelClientError::CarrierHandshake(e.to_string()))?,
+            Err(_elapsed) => {
+                return Err(TunnelClientError::CarrierHandshake(
+                    "MSE handshake timed out".to_string(),
+                ));
+            }
+        };
 
         // ── Step 3: BT handshake + BEP-10 + cover ────────────────────────
-        let info_hash = carrier_store.descriptor().handshake_info_hash;
         let wire = CarrierWire::establish(enc.reader, enc.writer, carrier_store, info_hash)
             .await
             .map_err(|e| TunnelClientError::CarrierHandshake(e.to_string()))?;
@@ -379,7 +395,6 @@ impl TunnelClient {
 mod tests {
     use super::*;
     use crate::tunnel::crypto::generate_keypair;
-    use librqbit_core::Id20;
     use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -400,9 +415,9 @@ mod tests {
 
         let (client_key, client_pub) = generate_keypair();
         let (server_key, server_pub) = generate_keypair();
-        let carrier_hash = Id20::new([0xAB; 20]);
 
         // Deterministic carrier store shared by both ends (same `info_hash`).
+        // The MSE SKEY is that public `handshake_info_hash`, as in production.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.keep();
         let carrier_store = build_carrier_store(&path, &server_pub).await.unwrap();
@@ -413,7 +428,7 @@ mod tests {
         let client_pub_clone = client_pub.clone();
 
         let server_handle = tokio::spawn(async move {
-            let enc = PeerWireCrypto::responder(server_stream, carrier_hash)
+            let enc = PeerWireCrypto::responder(server_stream, info_hash)
                 .await
                 .unwrap();
             let wire = CarrierWire::establish(enc.reader, enc.writer, server_store, info_hash)
@@ -436,7 +451,7 @@ mod tests {
         });
 
         // Client side: MSE + BT + Noise over the carrier.
-        let enc = PeerWireCrypto::initiator(client_stream, carrier_hash)
+        let enc = PeerWireCrypto::initiator(client_stream, info_hash)
             .await
             .unwrap();
         let wire = CarrierWire::establish(enc.reader, enc.writer, carrier_store, info_hash)

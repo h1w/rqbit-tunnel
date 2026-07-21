@@ -45,6 +45,19 @@ const VC_LEN: usize = 8;
 /// The verification constant value (all zeros as per MSE spec)
 const VC_VALUE: [u8; VC_LEN] = [0u8; VC_LEN];
 
+/// MSE crypto-method bit for RC4.
+const CRYPTO_RC4: u32 = 0x0000_0002;
+/// `crypto_provide` advertised by our initiator: plaintext (0x01) | RC4 (0x02).
+const CRYPTO_PROVIDE: u32 = 0x0000_0003;
+/// `crypto_select` chosen by our responder: RC4.
+const CRYPTO_SELECT: u32 = 0x0000_0002;
+
+/// Length of the SHA1 sync markers (`req1`, `sync_marker`) in bytes.
+const MARKER_LEN: usize = 20;
+
+/// Extra slack over `MAX_PADDING + marker.len()` for the bounded resync scan.
+const RESYNC_SLACK: usize = 16;
+
 // ---------------------------------------------------------------------------
 // Error
 // ---------------------------------------------------------------------------
@@ -57,6 +70,12 @@ pub(crate) enum TunnelCryptoError {
     PaddingTooLarge(usize),
     #[error("verification constant mismatch")]
     VerificationFailed,
+    #[error("sync marker mismatch (unknown SKEY)")]
+    MarkerMismatch,
+    #[error("resync marker not found within scan bound")]
+    ResyncNotFound,
+    #[error("crypto negotiation failed: no mutually supported method")]
+    CryptoNegotiationFailed,
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
 }
@@ -165,41 +184,65 @@ fn sha1(data: &[u8]) -> [u8; 20] {
     hasher.finish()
 }
 
-/// Derive directional RC4 keys from the shared secret and carrier hash.
+/// Spec-accurate MSE/PE key derivation.
 ///
-/// Returns `(encrypt_key, decrypt_key)` — each 20 bytes.
-/// For the initiator: `encrypt_key` encrypts data TO the responder.
-/// For the responder: `encrypt_key` encrypts data TO the initiator.
-fn derive_rc4_keys(
-    shared_secret: &[u8; DH_KEY_BYTES],
-    carrier_hash: &Id20,
-    is_initiator: bool,
+/// `keyA = SHA1("keyA" || S || SKEY)` and `keyB = SHA1("keyB" || S || SKEY)`,
+/// where `S` is the 96-byte DH shared secret and `SKEY` is the 20-byte torrent
+/// info hash. Returns `(keyA, keyB)`.
+///
+/// Per the MSE spec the initiator (A) encrypts A->B with `keyA` and decrypts
+/// B->A with `keyB`; the responder (B) mirrors this (encrypt with `keyB`,
+/// decrypt with `keyA`).
+fn mse_keys(
+    s: &[u8; DH_KEY_BYTES],
+    skey: &[u8; RC4_KEY_LEN],
 ) -> ([u8; RC4_KEY_LEN], [u8; RC4_KEY_LEN]) {
-    // SKEY = SHA1(S)
-    let skey = sha1(shared_secret);
-
-    // req_seed = SHA1(SKEY || info_hash)
-    let mut req_input = Vec::with_capacity(40);
-    req_input.extend_from_slice(&skey);
-    req_input.extend_from_slice(&carrier_hash.0);
-    let req_seed = sha1(&req_input);
-
-    // Directional keys using "keyA" / "keyB" markers
-    let (local_marker, remote_marker) = if is_initiator {
-        (b"keyB", b"keyA") // Initiator: local=encrypt=keyB, remote=decrypt=keyA
-    } else {
-        (b"keyA", b"keyB") // Responder:  local=encrypt=keyA, remote=decrypt=keyB
+    let derive = |tag: &[u8; 4]| -> [u8; RC4_KEY_LEN] {
+        let mut input = Vec::with_capacity(tag.len() + DH_KEY_BYTES + RC4_KEY_LEN);
+        input.extend_from_slice(tag);
+        input.extend_from_slice(s);
+        input.extend_from_slice(skey);
+        sha1(&input)
     };
+    (derive(b"keyA"), derive(b"keyB"))
+}
 
-    let mut encrypt_input = req_seed.to_vec();
-    encrypt_input.extend_from_slice(local_marker);
-    let encrypt_key = sha1(&encrypt_input);
+/// `req1 = SHA1("req1" || S)` — the 20-byte hash of the shared secret.
+fn req1(s: &[u8; DH_KEY_BYTES]) -> [u8; 20] {
+    let mut input = Vec::with_capacity(4 + DH_KEY_BYTES);
+    input.extend_from_slice(b"req1");
+    input.extend_from_slice(s);
+    sha1(&input)
+}
 
-    let mut decrypt_input = req_seed.to_vec();
-    decrypt_input.extend_from_slice(remote_marker);
-    let decrypt_key = sha1(&decrypt_input);
+/// `req2 = SHA1("req2" || SKEY)` — the 20-byte hash of the info hash.
+fn req2(skey: &[u8; RC4_KEY_LEN]) -> [u8; 20] {
+    let mut input = Vec::with_capacity(4 + RC4_KEY_LEN);
+    input.extend_from_slice(b"req2");
+    input.extend_from_slice(skey);
+    sha1(&input)
+}
 
-    (encrypt_key, decrypt_key)
+/// `req3 = SHA1("req3" || S)` — the 20-byte hash of the shared secret.
+fn req3(s: &[u8; DH_KEY_BYTES]) -> [u8; 20] {
+    let mut input = Vec::with_capacity(4 + DH_KEY_BYTES);
+    input.extend_from_slice(b"req3");
+    input.extend_from_slice(s);
+    sha1(&input)
+}
+
+/// The MSE sync marker sent in the handshake: `req2(SKEY) xor req3(S)`.
+///
+/// A responder recovers `req2(SKEY)` from a received marker as
+/// `marker xor req3(S)`.
+fn sync_marker(skey: &[u8; RC4_KEY_LEN], s: &[u8; DH_KEY_BYTES]) -> [u8; 20] {
+    let a = req2(skey);
+    let b = req3(s);
+    let mut out = [0u8; 20];
+    for (o, (x, y)) in out.iter_mut().zip(a.iter().zip(b.iter())) {
+        *o = x ^ y;
+    }
+    out
 }
 
 // ===========================================================================
@@ -226,45 +269,72 @@ fn rc4_discard(cipher: &mut Rc4Cipher, n: usize) {
 // I/O helpers
 // ===========================================================================
 
-/// Read exactly `N` bytes or 0-length padding from stream.
-async fn read_padding<S>(stream: &mut S, pad_len: usize) -> Result<(), TunnelCryptoError>
-where
-    S: AsyncRead + Unpin,
-{
-    if pad_len > MAX_PADDING {
-        return Err(TunnelCryptoError::PaddingTooLarge(pad_len));
-    }
-    if pad_len > 0 {
-        let mut discard = vec![0u8; pad_len];
-        stream.read_exact(&mut discard).await?;
-    }
-    Ok(())
-}
-
-/// Write padding with a 2-byte big-endian length prefix.
-async fn write_padding<S>(stream: &mut S) -> Result<(), TunnelCryptoError>
+/// Write a raw MSE padding field (`PadA`/`PadB`): a random `0..=MAX_PADDING`
+/// bytes, with **NO** length prefix. The receiver locates the following protocol
+/// element via [`resync_on`], not via a declared length.
+async fn write_raw_pad<S>(stream: &mut S) -> Result<(), TunnelCryptoError>
 where
     S: AsyncWrite + Unpin,
 {
     let pad_len = rand::rng().random_range(0..=MAX_PADDING);
-    let pad_bytes = (pad_len as u16).to_be_bytes();
-    stream.write_all(&pad_bytes).await?;
     if pad_len > 0 {
-        let padding: Vec<u8> = (0..pad_len).map(|_| rand::rng().random()).collect();
-        stream.write_all(&padding).await?;
+        let mut pad = vec![0u8; pad_len];
+        rand::rng().fill(&mut pad[..]);
+        stream.write_all(&pad).await?;
     }
     Ok(())
 }
 
-/// Read a 2-byte big-endian length prefix, then read that many bytes as padding.
-async fn read_padding_prefixed<S>(stream: &mut S) -> Result<(), TunnelCryptoError>
+/// Bounded resync: read one byte at a time into a sliding `marker.len()`-wide
+/// window and return `Ok(())` the instant the window equals `marker` — at which
+/// point the stream is positioned **immediately after** the marker (no over-read,
+/// since we read exactly one byte at a time).
+///
+/// Fails closed with [`TunnelCryptoError::ResyncNotFound`] once `max_scan` bytes
+/// have been consumed without a match. NEVER reads unboundedly, so a peer that
+/// floods bytes without ever sending the marker cannot hang or OOM us. A short
+/// read before a match surfaces as an IO error.
+async fn resync_on<S>(
+    stream: &mut S,
+    marker: &[u8],
+    max_scan: usize,
+) -> Result<(), TunnelCryptoError>
 where
     S: AsyncRead + Unpin,
 {
-    let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf).await?;
-    let pad_len = u16::from_be_bytes(len_buf) as usize;
-    read_padding(stream, pad_len).await
+    let mut window: Vec<u8> = Vec::with_capacity(marker.len());
+    let mut scanned = 0usize;
+    while scanned < max_scan {
+        let mut b = [0u8; 1];
+        stream.read_exact(&mut b).await?;
+        scanned += 1;
+        if window.len() == marker.len() {
+            window.remove(0);
+        }
+        window.push(b[0]);
+        if window.len() == marker.len() && window.as_slice() == marker {
+            return Ok(());
+        }
+    }
+    Err(TunnelCryptoError::ResyncNotFound)
+}
+
+/// Read exactly `n` bytes and decrypt them in place with `cipher`, advancing the
+/// RC4 keystream by exactly `n`. Returns the decrypted plaintext.
+async fn read_exact_decrypt<S>(
+    stream: &mut S,
+    cipher: &mut Rc4Cipher,
+    n: usize,
+) -> Result<Vec<u8>, TunnelCryptoError>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut buf = vec![0u8; n];
+    if n > 0 {
+        stream.read_exact(&mut buf).await?;
+        rc4_apply(cipher, &mut buf);
+    }
+    Ok(buf)
 }
 
 // ===========================================================================
@@ -275,6 +345,9 @@ where
 struct EncryptedReader<R> {
     inner: R,
     cipher: Rc4Cipher,
+    /// Already-decrypted bytes (the MSE `IA` initial payload) to surface before
+    /// reading further from `inner`. Empty in our own handshakes (`len(IA) == 0`).
+    prefix: Vec<u8>,
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for EncryptedReader<R> {
@@ -283,6 +356,15 @@ impl<R: AsyncRead + Unpin> AsyncRead for EncryptedReader<R> {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // Drain any buffered `IA` payload first — it is already decrypted, so it
+        // must not pass through the RC4 cipher again.
+        if !self.prefix.is_empty() {
+            let n = self.prefix.len().min(buf.remaining());
+            let rest = self.prefix.split_off(n);
+            let head = std::mem::replace(&mut self.prefix, rest);
+            buf.put_slice(&head);
+            return Poll::Ready(Ok(()));
+        }
         let before = buf.filled().len();
         let inner = Pin::new(&mut self.inner);
         match inner.poll_read(cx, buf) {
@@ -399,56 +481,92 @@ async fn do_handshake<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // `SKEY` is the 20-byte carrier/torrent hash driving req2/key derivation.
+    let skey = carrier_hash.0;
     match role {
+        // ===================================================================
+        // Initiator (A). Wire order: send 1, recv 2, send 3, recv 4.
+        // ===================================================================
         PeerWireCryptoRole::Initiator => {
-            // --- Initiator: Step 1 ---
+            // --- Step 1: A -> B :  Ya ‖ PadA (raw pad, NO length prefix) ---
             let (private, public) = generate_dh_keypair();
-            let public_bytes = dh_public_to_bytes(&public);
+            stream.write_all(&dh_public_to_bytes(&public)).await?;
+            write_raw_pad(&mut stream).await?;
 
-            // Send Xa (96 bytes) + padding (with length prefix)
-            stream.write_all(&public_bytes).await?;
-            write_padding(&mut stream).await?;
-
-            // --- Initiator: Step 2 ---
-            // Read Yb (96 bytes) + padding (with length prefix)
-            let mut peer_public_bytes = [0u8; DH_KEY_BYTES];
-            stream.read_exact(&mut peer_public_bytes).await?;
-            let peer_public = bytes_to_dh_public(&peer_public_bytes);
+            // --- Step 2: B -> A :  read Yb (96). PadB is skipped by resync. ---
+            let mut yb = [0u8; DH_KEY_BYTES];
+            stream.read_exact(&mut yb).await?;
+            let peer_public = bytes_to_dh_public(&yb);
             validate_dh_public(&peer_public)?;
-            read_padding_prefixed(&mut stream).await?;
-
-            // Compute shared secret
             let secret = compute_shared_secret(&private, &peer_public);
 
-            // Derive keys
-            let (encrypt_key, decrypt_key) = derive_rc4_keys(&secret, &carrier_hash, true);
-            let mut encrypt_cipher = new_rc4(&encrypt_key);
-            let mut decrypt_cipher = new_rc4(&decrypt_key);
-
-            // Discard first 1024 bytes in both directions
+            // Keys: A encrypts A->B with keyA, decrypts B->A with keyB.
+            let (key_a, key_b) = mse_keys(&secret, &skey);
+            let mut encrypt_cipher = new_rc4(&key_a);
+            let mut decrypt_cipher = new_rc4(&key_b);
             rc4_discard(&mut encrypt_cipher, RC4_DISCARD);
             rc4_discard(&mut decrypt_cipher, RC4_DISCARD);
 
-            // --- Initiator: Steps 3-4 (VC exchange) ---
-            // Read and verify VC (encrypted)
-            let mut vc = [0u8; VC_LEN];
-            stream.read_exact(&mut vc).await?;
-            rc4_apply(&mut decrypt_cipher, &mut vc);
-            if vc != VC_VALUE {
-                return Err(TunnelCryptoError::VerificationFailed);
+            // --- Step 3: A -> B ---
+            //   req1(S) ‖ sync_marker(SKEY,S)          (cleartext, no cipher)
+            //   RC4_keyA[ VC ‖ crypto_provide ‖ len(PadC) ‖ PadC ‖ len(IA)=0 ]
+            let pad_c_len = rand::rng().random_range(0..=MAX_PADDING);
+            let pad_c = {
+                let mut v = vec![0u8; pad_c_len];
+                if pad_c_len > 0 {
+                    rand::rng().fill(&mut v[..]);
+                }
+                v
+            };
+            let mut block = Vec::with_capacity(VC_LEN + 4 + 2 + pad_c_len + 2);
+            block.extend_from_slice(&VC_VALUE);
+            block.extend_from_slice(&CRYPTO_PROVIDE.to_be_bytes());
+            block.extend_from_slice(&(pad_c_len as u16).to_be_bytes());
+            block.extend_from_slice(&pad_c);
+            block.extend_from_slice(&0u16.to_be_bytes()); // len(IA) = 0
+            rc4_apply(&mut encrypt_cipher, &mut block);
+            // encrypt_cipher is now advanced by (16 + pad_c_len) past the discard;
+            // that is exactly where the A->B payload keystream must resume.
+
+            let mut step3 = Vec::with_capacity(2 * MARKER_LEN + block.len());
+            step3.extend_from_slice(&req1(&secret));
+            step3.extend_from_slice(&sync_marker(&skey, &secret));
+            step3.extend_from_slice(&block);
+            stream.write_all(&step3).await?;
+
+            // --- Step 4: B -> A ---
+            // Skip PadB by resyncing on ENCRYPT(keyB, VC). Since VC is all-zero,
+            // that ciphertext equals the keyB keystream at position 1024..1032, so
+            // computing it here advances decrypt_cipher by exactly the 8 VC bytes.
+            // A successful match is *also* an implicit VC==0 verification.
+            let mut vc_marker = VC_VALUE;
+            rc4_apply(&mut decrypt_cipher, &mut vc_marker);
+            let max_scan = MAX_PADDING + vc_marker.len() + RESYNC_SLACK;
+            resync_on(&mut stream, &vc_marker, max_scan).await?;
+
+            // Continue the keyB stream (now at position 1032): crypto_select,
+            // len(PadD), PadD.
+            let cs = read_exact_decrypt(&mut stream, &mut decrypt_cipher, 4).await?;
+            let crypto_select = u32::from_be_bytes([cs[0], cs[1], cs[2], cs[3]]);
+            if crypto_select & CRYPTO_RC4 == 0 {
+                // We only run RC4 post-handshake; a non-RC4 selection is rejected.
+                return Err(TunnelCryptoError::CryptoNegotiationFailed);
             }
+            let pd = read_exact_decrypt(&mut stream, &mut decrypt_cipher, 2).await?;
+            let pad_d_len = u16::from_be_bytes([pd[0], pd[1]]) as usize;
+            if pad_d_len > MAX_PADDING {
+                return Err(TunnelCryptoError::PaddingTooLarge(pad_d_len));
+            }
+            read_exact_decrypt(&mut stream, &mut decrypt_cipher, pad_d_len).await?;
+            // decrypt_cipher is now at 1024 + 14 + pad_d_len — exactly where B's
+            // keyB payload keystream resumes. Reader/writer take over seamlessly.
 
-            // Send VC back (encrypted)
-            let mut vc = VC_VALUE;
-            rc4_apply(&mut encrypt_cipher, &mut vc);
-            stream.write_all(&vc).await?;
-
-            // Split and wrap
             let (read_half, write_half) = tokio::io::split(stream);
             let reader: BoxAsyncReadVectored = Box::new(
                 EncryptedReader {
                     inner: read_half,
                     cipher: decrypt_cipher,
+                    prefix: Vec::new(),
                 }
                 .into_vectored_compat(),
             );
@@ -457,56 +575,100 @@ where
                 cipher: encrypt_cipher,
                 pending: Vec::new(),
             });
-            return Ok(EncryptedPeerIo { reader, writer });
+            Ok(EncryptedPeerIo { reader, writer })
         }
-        PeerWireCryptoRole::Responder => {
-            // --- Responder: Step 1 ---
-            // Read Xa (96 bytes) + padding (with length prefix)
-            let mut initiator_public_bytes = [0u8; DH_KEY_BYTES];
-            stream.read_exact(&mut initiator_public_bytes).await?;
-            let initiator_public = bytes_to_dh_public(&initiator_public_bytes);
-            validate_dh_public(&initiator_public)?;
-            read_padding_prefixed(&mut stream).await?;
 
-            // --- Responder: Step 2 ---
+        // ===================================================================
+        // Responder (B). Wire order: recv 1, send 2, recv 3, send 4.
+        // ===================================================================
+        PeerWireCryptoRole::Responder => {
+            // --- Step 1: A -> B :  read Ya (96). PadA is skipped by resync. ---
+            let mut ya = [0u8; DH_KEY_BYTES];
+            stream.read_exact(&mut ya).await?;
+            let initiator_public = bytes_to_dh_public(&ya);
+            validate_dh_public(&initiator_public)?;
+
             let (private, public) = generate_dh_keypair();
             let secret = compute_shared_secret(&private, &initiator_public);
 
-            // Derive keys
-            let (encrypt_key, decrypt_key) = derive_rc4_keys(&secret, &carrier_hash, false);
-            let mut encrypt_cipher = new_rc4(&encrypt_key);
-            let mut decrypt_cipher = new_rc4(&decrypt_key);
-
-            // Discard first 1024 bytes in both directions
+            // Keys: B encrypts B->A with keyB, decrypts A->B with keyA.
+            let (key_a, key_b) = mse_keys(&secret, &skey);
+            let mut encrypt_cipher = new_rc4(&key_b);
+            let mut decrypt_cipher = new_rc4(&key_a);
             rc4_discard(&mut encrypt_cipher, RC4_DISCARD);
             rc4_discard(&mut decrypt_cipher, RC4_DISCARD);
 
-            // Send Yb (96 bytes) + padding (with length prefix)
-            let public_bytes = dh_public_to_bytes(&public);
-            stream.write_all(&public_bytes).await?;
-            write_padding(&mut stream).await?;
+            // --- Step 2: B -> A :  Yb ‖ PadB (raw pad) ---
+            // Sent now: the initiator withholds step 3 until it has Yb, so we must
+            // not block on reading req1 before emitting our own key.
+            stream.write_all(&dh_public_to_bytes(&public)).await?;
+            write_raw_pad(&mut stream).await?;
 
-            // --- Responder: Step 3 ---
-            // Send VC (encrypted)
-            let mut vc = VC_VALUE;
-            rc4_apply(&mut encrypt_cipher, &mut vc);
-            stream.write_all(&vc).await?;
+            // --- Step 3: A -> B ---
+            // Skip PadA and lock onto req1(S) (cleartext — ciphers untouched).
+            let expected_req1 = req1(&secret);
+            let max_scan = MAX_PADDING + expected_req1.len() + RESYNC_SLACK;
+            resync_on(&mut stream, &expected_req1, max_scan).await?;
 
-            // --- Responder: Step 4 ---
-            // Read and verify VC (encrypted)
-            let mut vc = [0u8; VC_LEN];
-            stream.read_exact(&mut vc).await?;
-            rc4_apply(&mut decrypt_cipher, &mut vc);
+            // Read + verify the sync marker (folds in SKEY). A mismatch means this
+            // is not our carrier — reject, exactly as MSE ignores unknown torrents.
+            let mut marker = [0u8; MARKER_LEN];
+            stream.read_exact(&mut marker).await?;
+            if marker != sync_marker(&skey, &secret) {
+                return Err(TunnelCryptoError::MarkerMismatch);
+            }
+
+            // Decrypt the keyA block: VC ‖ crypto_provide ‖ len(PadC) ‖ PadC ‖
+            // len(IA) ‖ IA. decrypt_cipher advances byte-for-byte from position
+            // 1024, mirroring the initiator's encrypt_cipher over the same block.
+            let vc = read_exact_decrypt(&mut stream, &mut decrypt_cipher, VC_LEN).await?;
             if vc != VC_VALUE {
                 return Err(TunnelCryptoError::VerificationFailed);
             }
+            let cp = read_exact_decrypt(&mut stream, &mut decrypt_cipher, 4).await?;
+            let crypto_provide = u32::from_be_bytes([cp[0], cp[1], cp[2], cp[3]]);
+            if crypto_provide & CRYPTO_RC4 == 0 {
+                // Initiator offered only plaintext — reject (documented choice; our
+                // own initiator always offers RC4, so this only rejects foreigners).
+                return Err(TunnelCryptoError::CryptoNegotiationFailed);
+            }
+            let pc = read_exact_decrypt(&mut stream, &mut decrypt_cipher, 2).await?;
+            let pad_c_len = u16::from_be_bytes([pc[0], pc[1]]) as usize;
+            if pad_c_len > MAX_PADDING {
+                return Err(TunnelCryptoError::PaddingTooLarge(pad_c_len));
+            }
+            read_exact_decrypt(&mut stream, &mut decrypt_cipher, pad_c_len).await?;
+            let ia_len_buf = read_exact_decrypt(&mut stream, &mut decrypt_cipher, 2).await?;
+            let ia_len = u16::from_be_bytes([ia_len_buf[0], ia_len_buf[1]]) as usize;
+            // `IA` is 0 for our own initiator; a foreign peer never reaches here
+            // (marker check). If present it is the decrypted lead of the payload.
+            let ia = read_exact_decrypt(&mut stream, &mut decrypt_cipher, ia_len).await?;
 
-            // Split and wrap
+            // --- Step 4: B -> A :  RC4_keyB[ VC ‖ crypto_select ‖ len(PadD) ‖ PadD ] ---
+            let pad_d_len = rand::rng().random_range(0..=MAX_PADDING);
+            let pad_d = {
+                let mut v = vec![0u8; pad_d_len];
+                if pad_d_len > 0 {
+                    rand::rng().fill(&mut v[..]);
+                }
+                v
+            };
+            let mut block = Vec::with_capacity(VC_LEN + 4 + 2 + pad_d_len);
+            block.extend_from_slice(&VC_VALUE);
+            block.extend_from_slice(&CRYPTO_SELECT.to_be_bytes());
+            block.extend_from_slice(&(pad_d_len as u16).to_be_bytes());
+            block.extend_from_slice(&pad_d);
+            rc4_apply(&mut encrypt_cipher, &mut block);
+            stream.write_all(&block).await?;
+            // encrypt_cipher is now at 1024 + 14 + pad_d_len — where the B->A
+            // payload keystream resumes, matching the initiator's decrypt_cipher.
+
             let (read_half, write_half) = tokio::io::split(stream);
             let reader: BoxAsyncReadVectored = Box::new(
                 EncryptedReader {
                     inner: read_half,
                     cipher: decrypt_cipher,
+                    prefix: ia,
                 }
                 .into_vectored_compat(),
             );
@@ -515,9 +677,9 @@ where
                 cipher: encrypt_cipher,
                 pending: Vec::new(),
             });
-            return Ok(EncryptedPeerIo { reader, writer });
+            Ok(EncryptedPeerIo { reader, writer })
         }
-    };
+    }
 }
 
 // ===========================================================================
@@ -528,6 +690,105 @@ where
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    // ---- MSE key-derivation / marker conformance vectors -------------------
+
+    #[test]
+    fn mse_keys_match_spec_formula() {
+        let s = [0x11u8; DH_KEY_BYTES];
+        let skey = [0x22u8; RC4_KEY_LEN];
+
+        let (key_a, key_b) = mse_keys(&s, &skey);
+
+        // keyA = SHA1("keyA" || S || SKEY), rebuilt independently in the test.
+        let mut input_a = Vec::new();
+        input_a.extend_from_slice(b"keyA");
+        input_a.extend_from_slice(&s);
+        input_a.extend_from_slice(&skey);
+        assert_eq!(
+            key_a,
+            sha1(&input_a),
+            "keyA must equal SHA1(keyA || S || SKEY)"
+        );
+
+        // keyB = SHA1("keyB" || S || SKEY).
+        let mut input_b = Vec::new();
+        input_b.extend_from_slice(b"keyB");
+        input_b.extend_from_slice(&s);
+        input_b.extend_from_slice(&skey);
+        assert_eq!(
+            key_b,
+            sha1(&input_b),
+            "keyB must equal SHA1(keyB || S || SKEY)"
+        );
+
+        assert_ne!(key_a, key_b, "keyA and keyB must differ");
+
+        // Deterministic.
+        let (key_a2, key_b2) = mse_keys(&s, &skey);
+        assert_eq!(key_a, key_a2);
+        assert_eq!(key_b, key_b2);
+    }
+
+    #[test]
+    fn req_hashes_match_spec_and_are_distinct() {
+        let s = [0x33u8; DH_KEY_BYTES];
+        let skey = [0x44u8; RC4_KEY_LEN];
+
+        let r1 = req1(&s);
+        let r2 = req2(&skey);
+        let r3 = req3(&s);
+
+        // Each equals SHA1(tag || arg), rebuilt in the test.
+        let mut i1 = Vec::new();
+        i1.extend_from_slice(b"req1");
+        i1.extend_from_slice(&s);
+        assert_eq!(r1, sha1(&i1), "req1 must equal SHA1(req1 || S)");
+
+        let mut i2 = Vec::new();
+        i2.extend_from_slice(b"req2");
+        i2.extend_from_slice(&skey);
+        assert_eq!(r2, sha1(&i2), "req2 must equal SHA1(req2 || SKEY)");
+
+        let mut i3 = Vec::new();
+        i3.extend_from_slice(b"req3");
+        i3.extend_from_slice(&s);
+        assert_eq!(r3, sha1(&i3), "req3 must equal SHA1(req3 || S)");
+
+        // Distinct.
+        assert_ne!(r1, r2);
+        assert_ne!(r1, r3);
+        assert_ne!(r2, r3);
+
+        // Deterministic.
+        assert_eq!(r1, req1(&s));
+        assert_eq!(r2, req2(&skey));
+        assert_eq!(r3, req3(&s));
+    }
+
+    #[test]
+    fn sync_marker_is_req2_xor_req3_and_recoverable() {
+        let s = [0x55u8; DH_KEY_BYTES];
+        let skey = [0x66u8; RC4_KEY_LEN];
+
+        let marker = sync_marker(&skey, &s);
+        let r2 = req2(&skey);
+        let r3 = req3(&s);
+
+        // marker == req2 xor req3, byte-for-byte.
+        let mut expected = [0u8; 20];
+        for i in 0..20 {
+            expected[i] = r2[i] ^ r3[i];
+        }
+        assert_eq!(marker, expected, "sync_marker must be req2 XOR req3");
+
+        // Responder recovery: marker xor req3(S) == req2(SKEY).
+        let mut recovered = [0u8; 20];
+        for i in 0..20 {
+            recovered[i] = marker[i] ^ r3[i];
+        }
+        assert_eq!(recovered, r2, "marker XOR req3 must recover req2");
+    }
 
     #[tokio::test]
     async fn requires_encrypted_peer_wire_and_recovers_handshake_bytes() {
@@ -611,69 +872,44 @@ mod tests {
     #[tokio::test]
     async fn rejects_invalid_dh_public_value() {
         let (client_io, mut server_io) = tokio::io::duplex(16 * 1024);
-        let carrier_hash = Id20::new([7; 20]);
-
-        // Spawn initiator
+        let skey = Id20::new([7; 20]);
         let client_task =
-            tokio::spawn(async move { PeerWireCrypto::initiator(client_io, carrier_hash).await });
+            tokio::spawn(async move { PeerWireCrypto::initiator(client_io, skey).await });
 
-        // Read initiator's DH public key (96 bytes) + padding
-        let mut buf = [0u8; DH_KEY_BYTES];
-        server_io.read_exact(&mut buf).await.unwrap();
-        // Read padding length and bytes
-        let mut pad_len_buf = [0u8; 2];
-        server_io.read_exact(&mut pad_len_buf).await.unwrap();
-        let pad_len = u16::from_be_bytes(pad_len_buf) as usize;
-        if pad_len > 0 {
-            let mut discard = vec![0u8; pad_len];
-            server_io.read_exact(&mut discard).await.unwrap();
-        }
+        // Read the initiator's Ya (96). The trailing raw PadA is left unread — the
+        // initiator's read of Yb does not depend on us consuming it.
+        let mut ya = [0u8; DH_KEY_BYTES];
+        server_io.read_exact(&mut ya).await.unwrap();
 
-        // Send invalid DH public (all zeros = 0, which is < 2)
-        let invalid_dh = [0u8; DH_KEY_BYTES];
-        server_io.write_all(&invalid_dh).await.unwrap();
-
-        let result = client_task.await.unwrap();
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn rejects_truncated_padding() {
-        let (client_io, mut server_io) = tokio::io::duplex(16 * 1024);
-        let carrier_hash = Id20::new([7; 20]);
-
-        let client_task =
-            tokio::spawn(async move { PeerWireCrypto::initiator(client_io, carrier_hash).await });
-
-        // Read initiator's DH public + padding
-        let mut buf = [0u8; DH_KEY_BYTES];
-        server_io.read_exact(&mut buf).await.unwrap();
-        let mut pad_len_buf = [0u8; 2];
-        server_io.read_exact(&mut pad_len_buf).await.unwrap();
-        let pad_len = u16::from_be_bytes(pad_len_buf) as usize;
-        if pad_len > 0 {
-            let mut discard = vec![0u8; pad_len];
-            server_io.read_exact(&mut discard).await.unwrap();
-        }
-
-        // Compute shared secret and keys for valid response
-        let initiator_public = bytes_to_dh_public(buf.as_slice().try_into().unwrap());
-        validate_dh_public(&initiator_public).unwrap();
-        let (private, public) = generate_dh_keypair();
-        let public_bytes = dh_public_to_bytes(&public);
-
-        // Send DH public
-        server_io.write_all(&public_bytes).await.unwrap();
-
-        // Send padding length prefix claiming 10 bytes, but only send 5
-        server_io.write_all(&10u16.to_be_bytes()).await.unwrap();
-        server_io.write_all(&[0u8; 5]).await.unwrap();
-
-        // Drop the entire server side to trigger EOF
+        // Respond with an invalid Yb (all zeros => value 0, outside [2, P-2]).
+        server_io.write_all(&[0u8; DH_KEY_BYTES]).await.unwrap();
         drop(server_io);
 
         let result = client_task.await.unwrap();
-        assert!(result.is_err(), "should reject truncated padding");
+        assert!(matches!(result, Err(TunnelCryptoError::InvalidDhPublic)));
+    }
+
+    #[tokio::test]
+    async fn rejects_truncated_handshake() {
+        let (client_io, mut server_io) = tokio::io::duplex(16 * 1024);
+        let skey = Id20::new([7; 20]);
+        let client_task =
+            tokio::spawn(async move { PeerWireCrypto::initiator(client_io, skey).await });
+
+        // Read Ya (96).
+        let mut ya = [0u8; DH_KEY_BYTES];
+        server_io.read_exact(&mut ya).await.unwrap();
+
+        // Send a valid Yb, then drop without ever sending the step-4 VC block.
+        let (_xb, yb) = generate_dh_keypair();
+        server_io.write_all(&dh_public_to_bytes(&yb)).await.unwrap();
+        drop(server_io); // EOF: the initiator's step-3 write / resync fails closed.
+
+        let result = client_task.await.unwrap();
+        assert!(
+            result.is_err(),
+            "truncated handshake (no VC block) must be rejected",
+        );
     }
 
     #[tokio::test]
@@ -706,5 +942,285 @@ mod tests {
 
         client_send.await.unwrap();
         assert_eq!(received, data);
+    }
+
+    // ---- Spec-accurate MSE/PE choreography ---------------------------------
+
+    /// The crux test: a full self-interop over duplex, then multi-KB payload in
+    /// BOTH directions after the handshake. A one-byte keystream misalignment in
+    /// the handshake byte-accounting silently corrupts payload — this catches it.
+    #[tokio::test]
+    async fn self_interop_roundtrip_multi_kb_bidirectional() {
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let skey = Id20::new([0x77; 20]);
+        let (client, server) = tokio::join!(
+            PeerWireCrypto::initiator(client_io, skey),
+            PeerWireCrypto::responder(server_io, skey),
+        );
+        let client = client.expect("initiator handshake");
+        let server = server.expect("responder handshake");
+        let mut client_read = client.reader;
+        let mut client_write = client.writer;
+        let mut server_read = server.reader;
+        let mut server_write = server.writer;
+
+        // Distinct, structured multi-KB patterns each direction.
+        let c2s: Vec<u8> = (0..32_768u32).map(|i| (i.wrapping_mul(31)) as u8).collect();
+        let s2c: Vec<u8> = (0..40_000u32)
+            .map(|i| (i.wrapping_mul(17).wrapping_add(7)) as u8)
+            .collect();
+        let c2s2 = c2s.clone();
+        let s2c2 = s2c.clone();
+
+        // Concurrent writers so neither direction blocks the other.
+        let cw = tokio::spawn(async move {
+            client_write.write_all(&c2s2).await.unwrap();
+            client_write.flush().await.unwrap();
+        });
+        let sw = tokio::spawn(async move {
+            server_write.write_all(&s2c2).await.unwrap();
+            server_write.flush().await.unwrap();
+        });
+
+        let mut got_s = vec![0u8; c2s.len()];
+        let mut server_mut = Pin::new(&mut *server_read);
+        AsyncReadExt::read_exact(&mut server_mut, &mut got_s)
+            .await
+            .unwrap();
+        assert_eq!(got_s, c2s, "client->server payload corrupted (keystream)");
+
+        let mut got_c = vec![0u8; s2c.len()];
+        let mut client_mut = Pin::new(&mut *client_read);
+        AsyncReadExt::read_exact(&mut client_mut, &mut got_c)
+            .await
+            .unwrap();
+        assert_eq!(got_c, s2c, "server->client payload corrupted (keystream)");
+
+        cw.await.unwrap();
+        sw.await.unwrap();
+    }
+
+    /// Structural: capture the initiator's raw first bytes and assert `Ya` (96),
+    /// then raw padding with NO 2-byte length prefix, then `req1(S)` followed by
+    /// the sync marker. Proves the spec wire format (old code emits neither).
+    #[tokio::test]
+    async fn initiator_wire_is_spec_mse_structural() {
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let skey = Id20::new([0x5A; 20]);
+        let client_task =
+            tokio::spawn(async move { PeerWireCrypto::initiator(client_io, skey).await });
+
+        // Ya (96) must be a valid DH public value.
+        let mut ya = [0u8; DH_KEY_BYTES];
+        server_io.read_exact(&mut ya).await.unwrap();
+        let ya_pub = bytes_to_dh_public(&ya);
+        validate_dh_public(&ya_pub).expect("Ya must be a valid DH public value");
+
+        // Send our Yb so the initiator proceeds to emit step 3.
+        let (xb, yb) = generate_dh_keypair();
+        server_io.write_all(&dh_public_to_bytes(&yb)).await.unwrap();
+
+        // S = Ya^Xb; compute expected markers.
+        let secret = compute_shared_secret(&xb, &ya_pub);
+        let expected_req1 = req1(&secret);
+        let expected_marker = sync_marker(&skey.0, &secret);
+
+        // Collect everything after Ya: PadA (already buffered) ‖ req1 ‖ marker ‖ …
+        let mut collected: Vec<u8> = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mut buf = [0u8; 1024];
+            let n = tokio::time::timeout_at(deadline, server_io.read(&mut buf))
+                .await
+                .expect("timed out collecting step-3 bytes")
+                .unwrap();
+            if n == 0 {
+                panic!("stream ended before req1(S) appeared");
+            }
+            collected.extend_from_slice(&buf[..n]);
+            if let Some(p) = collected
+                .windows(expected_req1.len())
+                .position(|w| w == expected_req1)
+            {
+                if collected.len() >= p + 40 {
+                    // Bytes between Ya-end and req1 == raw PadA (0..=512), no prefix.
+                    assert!(
+                        p <= MAX_PADDING,
+                        "PadA must be 0..=512 raw bytes with NO length prefix, got {p}",
+                    );
+                    assert_eq!(
+                        &collected[p + 20..p + 40],
+                        &expected_marker[..],
+                        "sync_marker(SKEY,S) must immediately follow req1(S)",
+                    );
+                    drop(server_io);
+                    let _ = client_task.await;
+                    return;
+                }
+            }
+            assert!(
+                collected.len() <= MAX_PADDING + 40 + 128,
+                "req1(S) not found after Ya + bounded pad — wrong wire format",
+            );
+        }
+    }
+
+    /// Conformance: the REAL initiator, keyed by the actual production SKEY
+    /// (`carrier_store.descriptor().handshake_info_hash` — the public info hash
+    /// a genuine BitTorrent peer would request this torrent by), emits a
+    /// structurally spec-accurate MSE/PE handshake. We play the responder just
+    /// far enough to learn `S`, then assert on the initiator's wire:
+    ///   * step 1 is a 96-byte DH public (`Ya`) that is a valid group element;
+    ///   * `PadA` is RAW — 0..=512 bytes with NO cleartext 2-byte length prefix
+    ///     (the pre-spec format prefixed pad with its length; MSE does not);
+    ///   * the cleartext `req1(S)` resync marker appears at the resync point,
+    ///     immediately followed by `sync_marker(SKEY, S)`;
+    ///   * the `VC` is sent ENCRYPTED — the 8 on-wire bytes are the RC4(keyA)
+    ///     keystream (NOT the cleartext all-zero VC) and decrypt back to
+    ///     `VC_VALUE` under the spec keys.
+    ///
+    /// This is byte-for-byte the wire a real MSE/PE peer (e.g. qBittorrent)
+    /// speaks. True interop against an actual external MSE client is a
+    /// DEPLOYMENT-TIME check: it needs a live network peer and cannot run in
+    /// this hermetic harness (no external network), so we pin the wire shape
+    /// here and defer live interop verification to deployment.
+    #[tokio::test]
+    async fn mse_handshake_is_spec_shaped() {
+        use crate::tunnel::carrier_identity::build_carrier_store;
+        use crate::tunnel::crypto::generate_keypair;
+
+        // SKEY is exactly what production keys MSE by: the carrier torrent's
+        // public `handshake_info_hash`, derived deterministically from the
+        // server key (same value the server side derives).
+        let (_sk, server_pub) = generate_keypair();
+        let dir = tempfile::tempdir().unwrap();
+        let store = build_carrier_store(dir.path(), &server_pub).await.unwrap();
+        let skey = store.descriptor().handshake_info_hash;
+
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let client_task =
+            tokio::spawn(async move { PeerWireCrypto::initiator(client_io, skey).await });
+
+        // --- Step 1: Ya (96) must be a valid DH public value, sent raw. ---
+        let mut ya = [0u8; DH_KEY_BYTES];
+        server_io.read_exact(&mut ya).await.unwrap();
+        assert_eq!(ya.len(), 96, "MSE DH public must be exactly 96 bytes");
+        let ya_pub = bytes_to_dh_public(&ya);
+        validate_dh_public(&ya_pub).expect("Ya must be a valid DH public value");
+
+        // Respond with our Yb so the initiator proceeds to emit step 3.
+        let (xb, yb) = generate_dh_keypair();
+        server_io.write_all(&dh_public_to_bytes(&yb)).await.unwrap();
+
+        // Shared secret + spec keys (initiator encrypts A->B under keyA).
+        let secret = compute_shared_secret(&xb, &ya_pub);
+        let expected_req1 = req1(&secret);
+        let expected_marker = sync_marker(&skey.0, &secret);
+        let (key_a, _key_b) = mse_keys(&secret, &skey.0);
+
+        // Collect everything after Ya: PadA(raw) ‖ req1(S) ‖ marker ‖
+        // RC4_keyA[ VC ‖ crypto_provide ‖ … ]. Stop once req1 + marker + VC are
+        // all present (bounded).
+        let mut collected: Vec<u8> = Vec::new();
+        let want = MAX_PADDING + 2 * MARKER_LEN + VC_LEN + 128;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let p = loop {
+            if let Some(p) = collected
+                .windows(expected_req1.len())
+                .position(|w| w == expected_req1)
+            {
+                if collected.len() >= p + 2 * MARKER_LEN + VC_LEN {
+                    break p;
+                }
+            }
+            assert!(
+                collected.len() <= want,
+                "req1(S) + marker + VC not found in a bounded first flight — wrong wire format",
+            );
+            let mut buf = [0u8; 1024];
+            let n = tokio::time::timeout_at(deadline, server_io.read(&mut buf))
+                .await
+                .expect("timed out collecting step-3 bytes")
+                .unwrap();
+            assert!(n > 0, "stream ended before the MSE step-3 flight appeared");
+            collected.extend_from_slice(&buf[..n]);
+        };
+
+        // Bytes between Ya-end and req1 are raw PadA: bounded, NO length prefix.
+        assert!(
+            p <= MAX_PADDING,
+            "PadA must be 0..=512 raw bytes with NO cleartext length prefix, got {p}",
+        );
+        // sync_marker(SKEY, S) immediately follows req1(S).
+        assert_eq!(
+            &collected[p + MARKER_LEN..p + 2 * MARKER_LEN],
+            &expected_marker[..],
+            "sync_marker(SKEY,S) must immediately follow req1(S)",
+        );
+
+        // The 8 bytes after the marker are the ENCRYPTED VC. VC is all-zero, so
+        // if it were sent in the clear these would be zeros; they must instead be
+        // the RC4(keyA) keystream, and must decrypt back to VC_VALUE.
+        let vc_ct = &collected[p + 2 * MARKER_LEN..p + 2 * MARKER_LEN + VC_LEN];
+        assert_ne!(
+            vc_ct,
+            &VC_VALUE[..],
+            "VC must be sent ENCRYPTED (RC4/keyA), never in the clear",
+        );
+        let mut vc_pt = [0u8; VC_LEN];
+        vc_pt.copy_from_slice(vc_ct);
+        let mut cipher = new_rc4(&key_a);
+        rc4_discard(&mut cipher, RC4_DISCARD);
+        rc4_apply(&mut cipher, &mut vc_pt);
+        assert_eq!(
+            vc_pt, VC_VALUE,
+            "RC4(keyA) decryption of the on-wire VC must recover the all-zero VC_VALUE",
+        );
+
+        drop(server_io);
+        let _ = client_task.await;
+    }
+
+    /// A mismatched SKEY: `S` matches (DH ok) so `req1(S)` resync succeeds, but the
+    /// sync marker (which folds in SKEY) fails — the responder rejects, no panic.
+    #[tokio::test]
+    async fn responder_rejects_mismatched_skey() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client_skey = Id20::new([1; 20]);
+        let server_skey = Id20::new([2; 20]);
+        let (_client_res, server_res) = tokio::join!(
+            PeerWireCrypto::initiator(client_io, client_skey),
+            PeerWireCrypto::responder(server_io, server_skey),
+        );
+        assert!(
+            server_res.is_err(),
+            "responder must reject a foreign SKEY (marker mismatch)",
+        );
+    }
+
+    /// Bounded resync: a peer that sends `Ya` then bytes that never contain the
+    /// marker must cause the responder to fail within `max_scan`, not hang/OOM.
+    #[tokio::test]
+    async fn responder_resync_is_bounded() {
+        let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let skey = Id20::new([0x11; 20]);
+        let server_task =
+            tokio::spawn(async move { PeerWireCrypto::responder(server_io, skey).await });
+
+        // Valid Ya so the responder gets past DH...
+        let (_xa, ya) = generate_dh_keypair();
+        client_io.write_all(&dh_public_to_bytes(&ya)).await.unwrap();
+        // ...then a flood that can never match req1(S) (constant byte can't equal
+        // a 20-byte SHA1 marker). Bounded amount, larger than any legal scan.
+        let _ = client_io.write_all(&[0xACu8; 4096]).await;
+
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), server_task)
+            .await
+            .expect("responder resync must terminate (bounded), not hang")
+            .unwrap();
+        assert!(
+            matches!(res, Err(TunnelCryptoError::ResyncNotFound)),
+            "expected bounded ResyncNotFound",
+        );
     }
 }

@@ -243,6 +243,19 @@ pub(crate) const MAX_CARRIERS: usize = 16;
 
 // ── Seeder (pre-auth active-probe resistance) ───────────────────────────────
 
+/// Wall-clock deadline for the MSE/PE carrier handshake itself
+/// (`PeerWireCrypto::initiator`/`responder`), enforced at both call sites
+/// (`server.rs::accept`, `client.rs::connect`). The MSE handshake does several
+/// blocking `read_exact`s (peer DH key, VC resync, crypto negotiation); without
+/// a bound a peer that sends `Ya` then stalls would pin the accepting task on a
+/// `read_exact` indefinitely. On elapse the server treats it exactly like any
+/// other failed carrier handshake — the connection is dropped with no error
+/// surfaced beyond the ordinary admission failure (a censor probing the
+/// rendezvous sees only a dropped connection = normal MSE rejection, no tell).
+/// Generous so a slow-but-real peer completes; short enough to reclaim the
+/// pre-auth accept task from a deliberate staller.
+pub(crate) const MSE_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Idle timeout for the pre-Noise seeder loop
 /// (`server.rs::seed_until_promoted`): how long the server keeps serving
 /// BitTorrent cover (`Request` → `Piece`) to an unauthenticated peer before
