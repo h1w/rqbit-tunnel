@@ -56,6 +56,9 @@ pub struct TunnelClientOptions {
 
     /// Number of parallel carrier connections to open (per-stream striping).
     pub carriers: usize,
+
+    /// Root dir for this client's copy of the carrier torrent store.
+    pub carrier_root: PathBuf,
 }
 
 impl Default for TunnelClientOptions {
@@ -67,6 +70,7 @@ impl Default for TunnelClientOptions {
             expected_server_key: TunnelPublicKey([0u8; 32]),
             pairing: None,
             carriers: super::config::DEFAULT_CARRIERS,
+            carrier_root: std::env::temp_dir().join("rqbit-tunnel-carrier-client"),
         }
     }
 }
@@ -261,6 +265,12 @@ mod tests {
         assert!(!policy.allow_loopback);
         assert!(!policy.allow_link_local);
         assert!(!policy.allow_multicast);
+    }
+
+    #[test]
+    fn client_has_carrier_root_default() {
+        let o = super::TunnelClientOptions::default();
+        assert!(!o.carrier_root.as_os_str().is_empty());
     }
 }
 

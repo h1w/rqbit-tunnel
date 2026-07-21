@@ -575,6 +575,7 @@ async fn client_tunnel_starts_when_server_unreachable() {
                 expected_server_key: server_pk,
                 pairing: None,
                 carriers: crate::tunnel::config::DEFAULT_CARRIERS,
+                ..Default::default()
             })),
             ..Default::default()
         },
@@ -1245,6 +1246,7 @@ async fn start_live_carrier_pool(
         expected_server_key: server_pk,
         pairing: None,
         carriers,
+        ..Default::default()
     };
     let pool = CarrierPool::start(client_opts, None, client_shutdown.clone());
 

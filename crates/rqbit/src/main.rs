@@ -889,6 +889,7 @@ fn build_tunnel_opts(opts: &mut Opts) -> anyhow::Result<Option<TunnelOptions>> {
                 expected_server_key,
                 pairing,
                 carriers,
+                ..Default::default()
             })))
         }
         TunnelRole::Server => {
