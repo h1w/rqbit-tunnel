@@ -683,6 +683,110 @@ where
 }
 
 // ===========================================================================
+// Test-only reusable conformance helper
+// ===========================================================================
+
+/// Drive the REAL production MSE initiator (keyed by `skey`) against a stub
+/// responder over an in-memory duplex, and assert the initiator's on-wire first
+/// flight is structurally a spec-accurate MSE/PE handshake:
+///   * step 1 is a 96-byte DH public (`Ya`) that is a valid group element;
+///   * `PadA` is RAW — 0..=512 bytes with NO cleartext 2-byte length prefix;
+///   * the cleartext `req1(S)` resync marker appears at the resync point,
+///     immediately followed by `sync_marker(SKEY, S)`;
+///   * the `VC` is sent ENCRYPTED (RC4/keyA), decrypting back to `VC_VALUE`.
+///
+/// Shared by `mse_handshake_is_spec_shaped` (below) and the full-stack tunnel
+/// gate (`tests/tunnel.rs`), so both assert the exact same wire shape against
+/// the production initiator. Requires the module-private DH/marker/RC4 helpers,
+/// hence its home here rather than in `tests/tunnel.rs`.
+#[cfg(test)]
+pub(crate) async fn assert_initiator_is_spec_mse_shaped(skey: Id20) {
+    use tokio::io::AsyncReadExt;
+
+    let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+    let client_task = tokio::spawn(async move { PeerWireCrypto::initiator(client_io, skey).await });
+
+    // --- Step 1: Ya (96) must be a valid DH public value, sent raw. ---
+    let mut ya = [0u8; DH_KEY_BYTES];
+    server_io.read_exact(&mut ya).await.unwrap();
+    assert_eq!(ya.len(), 96, "MSE DH public must be exactly 96 bytes");
+    let ya_pub = bytes_to_dh_public(&ya);
+    validate_dh_public(&ya_pub).expect("Ya must be a valid DH public value");
+
+    // Respond with our Yb so the initiator proceeds to emit step 3.
+    let (xb, yb) = generate_dh_keypair();
+    server_io.write_all(&dh_public_to_bytes(&yb)).await.unwrap();
+
+    // Shared secret + spec keys (initiator encrypts A->B under keyA).
+    let secret = compute_shared_secret(&xb, &ya_pub);
+    let expected_req1 = req1(&secret);
+    let expected_marker = sync_marker(&skey.0, &secret);
+    let (key_a, _key_b) = mse_keys(&secret, &skey.0);
+
+    // Collect everything after Ya: PadA(raw) ‖ req1(S) ‖ marker ‖
+    // RC4_keyA[ VC ‖ crypto_provide ‖ … ]. Stop once req1 + marker + VC are
+    // all present (bounded).
+    let mut collected: Vec<u8> = Vec::new();
+    let want = MAX_PADDING + 2 * MARKER_LEN + VC_LEN + 128;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let p = loop {
+        if let Some(p) = collected
+            .windows(expected_req1.len())
+            .position(|w| w == expected_req1)
+        {
+            if collected.len() >= p + 2 * MARKER_LEN + VC_LEN {
+                break p;
+            }
+        }
+        assert!(
+            collected.len() <= want,
+            "req1(S) + marker + VC not found in a bounded first flight — wrong wire format",
+        );
+        let mut buf = [0u8; 1024];
+        let n = tokio::time::timeout_at(deadline, server_io.read(&mut buf))
+            .await
+            .expect("timed out collecting step-3 bytes")
+            .unwrap();
+        assert!(n > 0, "stream ended before the MSE step-3 flight appeared");
+        collected.extend_from_slice(&buf[..n]);
+    };
+
+    // Bytes between Ya-end and req1 are raw PadA: bounded, NO length prefix.
+    assert!(
+        p <= MAX_PADDING,
+        "PadA must be 0..=512 raw bytes with NO cleartext length prefix, got {p}",
+    );
+    // sync_marker(SKEY, S) immediately follows req1(S).
+    assert_eq!(
+        &collected[p + MARKER_LEN..p + 2 * MARKER_LEN],
+        &expected_marker[..],
+        "sync_marker(SKEY,S) must immediately follow req1(S)",
+    );
+
+    // The 8 bytes after the marker are the ENCRYPTED VC. VC is all-zero, so if
+    // it were sent in the clear these would be zeros; they must instead be the
+    // RC4(keyA) keystream, and must decrypt back to VC_VALUE.
+    let vc_ct = &collected[p + 2 * MARKER_LEN..p + 2 * MARKER_LEN + VC_LEN];
+    assert_ne!(
+        vc_ct,
+        &VC_VALUE[..],
+        "VC must be sent ENCRYPTED (RC4/keyA), never in the clear",
+    );
+    let mut vc_pt = [0u8; VC_LEN];
+    vc_pt.copy_from_slice(vc_ct);
+    let mut cipher = new_rc4(&key_a);
+    rc4_discard(&mut cipher, RC4_DISCARD);
+    rc4_apply(&mut cipher, &mut vc_pt);
+    assert_eq!(
+        vc_pt, VC_VALUE,
+        "RC4(keyA) decryption of the on-wire VC must recover the all-zero VC_VALUE",
+    );
+
+    drop(server_io);
+    let _ = client_task.await;
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -1097,88 +1201,9 @@ mod tests {
         let store = build_carrier_store(dir.path(), &server_pub).await.unwrap();
         let skey = store.descriptor().handshake_info_hash;
 
-        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
-        let client_task =
-            tokio::spawn(async move { PeerWireCrypto::initiator(client_io, skey).await });
-
-        // --- Step 1: Ya (96) must be a valid DH public value, sent raw. ---
-        let mut ya = [0u8; DH_KEY_BYTES];
-        server_io.read_exact(&mut ya).await.unwrap();
-        assert_eq!(ya.len(), 96, "MSE DH public must be exactly 96 bytes");
-        let ya_pub = bytes_to_dh_public(&ya);
-        validate_dh_public(&ya_pub).expect("Ya must be a valid DH public value");
-
-        // Respond with our Yb so the initiator proceeds to emit step 3.
-        let (xb, yb) = generate_dh_keypair();
-        server_io.write_all(&dh_public_to_bytes(&yb)).await.unwrap();
-
-        // Shared secret + spec keys (initiator encrypts A->B under keyA).
-        let secret = compute_shared_secret(&xb, &ya_pub);
-        let expected_req1 = req1(&secret);
-        let expected_marker = sync_marker(&skey.0, &secret);
-        let (key_a, _key_b) = mse_keys(&secret, &skey.0);
-
-        // Collect everything after Ya: PadA(raw) ‖ req1(S) ‖ marker ‖
-        // RC4_keyA[ VC ‖ crypto_provide ‖ … ]. Stop once req1 + marker + VC are
-        // all present (bounded).
-        let mut collected: Vec<u8> = Vec::new();
-        let want = MAX_PADDING + 2 * MARKER_LEN + VC_LEN + 128;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        let p = loop {
-            if let Some(p) = collected
-                .windows(expected_req1.len())
-                .position(|w| w == expected_req1)
-            {
-                if collected.len() >= p + 2 * MARKER_LEN + VC_LEN {
-                    break p;
-                }
-            }
-            assert!(
-                collected.len() <= want,
-                "req1(S) + marker + VC not found in a bounded first flight — wrong wire format",
-            );
-            let mut buf = [0u8; 1024];
-            let n = tokio::time::timeout_at(deadline, server_io.read(&mut buf))
-                .await
-                .expect("timed out collecting step-3 bytes")
-                .unwrap();
-            assert!(n > 0, "stream ended before the MSE step-3 flight appeared");
-            collected.extend_from_slice(&buf[..n]);
-        };
-
-        // Bytes between Ya-end and req1 are raw PadA: bounded, NO length prefix.
-        assert!(
-            p <= MAX_PADDING,
-            "PadA must be 0..=512 raw bytes with NO cleartext length prefix, got {p}",
-        );
-        // sync_marker(SKEY, S) immediately follows req1(S).
-        assert_eq!(
-            &collected[p + MARKER_LEN..p + 2 * MARKER_LEN],
-            &expected_marker[..],
-            "sync_marker(SKEY,S) must immediately follow req1(S)",
-        );
-
-        // The 8 bytes after the marker are the ENCRYPTED VC. VC is all-zero, so
-        // if it were sent in the clear these would be zeros; they must instead be
-        // the RC4(keyA) keystream, and must decrypt back to VC_VALUE.
-        let vc_ct = &collected[p + 2 * MARKER_LEN..p + 2 * MARKER_LEN + VC_LEN];
-        assert_ne!(
-            vc_ct,
-            &VC_VALUE[..],
-            "VC must be sent ENCRYPTED (RC4/keyA), never in the clear",
-        );
-        let mut vc_pt = [0u8; VC_LEN];
-        vc_pt.copy_from_slice(vc_ct);
-        let mut cipher = new_rc4(&key_a);
-        rc4_discard(&mut cipher, RC4_DISCARD);
-        rc4_apply(&mut cipher, &mut vc_pt);
-        assert_eq!(
-            vc_pt, VC_VALUE,
-            "RC4(keyA) decryption of the on-wire VC must recover the all-zero VC_VALUE",
-        );
-
-        drop(server_io);
-        let _ = client_task.await;
+        // The full byte-level spec-shape assertion lives in the shared helper so
+        // the full-stack tunnel gate can reuse the exact same check.
+        super::assert_initiator_is_spec_mse_shaped(skey).await;
     }
 
     /// A mismatched SKEY: `S` matches (DH ok) so `req1(S)` resync succeeds, but the

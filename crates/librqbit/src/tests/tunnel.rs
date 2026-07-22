@@ -998,6 +998,19 @@ async fn build_real_relay_pair() -> (
     crate::tunnel::client::TunnelClient,
     crate::tunnel::server::AdmittedPeer,
 ) {
+    let (client, peer, _store) = build_real_relay_pair_with_store().await;
+    (client, peer)
+}
+
+/// As [`build_real_relay_pair`], but also returns the shared carrier store so a
+/// full-stack gate can reach the session's `handshake_info_hash` (for the MSE
+/// spec-shape check keyed by the SAME carrier) and its `info_hash` /
+/// `info_dict_bytes` (to verify the served `ut_metadata` reassembles correctly).
+async fn build_real_relay_pair_with_store() -> (
+    crate::tunnel::client::TunnelClient,
+    crate::tunnel::server::AdmittedPeer,
+    std::sync::Arc<crate::tunnel::carrier::TunnelCarrierStore>,
+) {
     use crate::tunnel::carrier_chunk::{
         CarrierDefragmenter, MAX_CARRIER_CIPHERTEXT, chunk_ciphertext, recv_one_ciphertext,
     };
@@ -1021,6 +1034,7 @@ async fn build_real_relay_pair() -> (
     let carrier_store = build_carrier_store(&dir.keep(), &server_pk).await.unwrap();
     let info_hash = carrier_store.descriptor().handshake_info_hash;
     let server_store = carrier_store.clone();
+    let ret_store = carrier_store.clone();
 
     let server_handle = tokio::spawn(async move {
         let enc = PeerWireCrypto::responder(server_io, info_hash)
@@ -1078,7 +1092,7 @@ async fn build_real_relay_pair() -> (
     let peer = server_handle.await.unwrap();
     let client =
         TunnelClient::from_carrier_parts(client_transport, read_half, write_half, carrier_peer);
-    (client, peer)
+    (client, peer, ret_store)
 }
 
 /// Transfer more than one flow-control window through the real relay against a
@@ -2129,4 +2143,574 @@ async fn carrier_cadence_matches_a_real_client_profile() {
         "the authenticated server must keep serving ongoing Piece cover without \
          self-choking, got {pieces_total} pieces"
     );
+}
+
+// ── Plan G Task 1: combined full-stack masquerade gate ──────────────────────
+
+/// THE combined regression guard that the whole A–D masquerade stack holds
+/// together on ONE live client↔server tunnel session — that no feature silently
+/// broke another. On a single real Noise-encrypted session
+/// (`build_real_relay_pair_with_store` + production `ClientMux` + `run_server_relay`),
+/// tapped at the message layer via the `CarrierTrace` sink, this asserts
+/// SIMULTANEOUSLY:
+///
+///   * (Plan C) the wire is real BitTorrent: a BEP-10 `ExtendedHandshake`
+///     advertising `ut_metadata` + a non-zero `metadata_size`, a `Bitfield`, and
+///     ONGOING `Request`/`Piece` cover ACROSS the window (not a startup burst);
+///   * (Plan C / BEP-9) the peer's one-time `ut_metadata` request is answered
+///     with served `data` whose reassembled bytes hash to the carrier info hash;
+///   * (Plan C) a periodic `KeepAlive` within `KEEPALIVE_INTERVAL`;
+///   * (Plan A) real application data traverses the tunnel intact WHILE all of
+///     the above cadence runs — a SOCKS-style TCP round trip AND a UDP datagram
+///     round trip return byte-exact, both before AND after the cadence window
+///     (the post-window TCP echo is the explicit "keepalive/cover cadence did
+///     not perturb tunnel data" interaction check).
+///
+/// The MSE spec-shape (Plan D) and the concurrent active-probe resistance
+/// (Plan B) are proven on their own live sessions in
+/// `full_stack_masquerade_is_spec_shaped_and_probe_resistant` below: MSE spec
+/// conformance requires being a DH party (it can't be verified on an opaque
+/// real server), and a concurrent second peer needs a real listener — neither
+/// fits this in-process duplex session. Together the two tests cover the whole
+/// A–D stack on live sessions.
+///
+/// MUST be current-thread (`#[tokio::test]`): the thread-local trace is only
+/// visible to tasks scheduled on this one worker. `start_paused` freezes the
+/// clock so the 3 s cover cadence and 110 s keepalive are driven with
+/// `tokio::time::advance` rather than real waits; the loopback echo (real
+/// socket I/O) still completes under paused time because it is reactor-driven,
+/// and we `pump` (yield) between advances so each round trip lands. Time is
+/// advanced in `COVER_REQUEST_INTERVAL` steps (each well under the 30 s carrier
+/// `WIRE_TIMEOUT`) so the long-lived carrier reads never spuriously time out.
+#[tokio::test(start_paused = true)]
+async fn full_stack_masquerade_holds_together() {
+    use crate::tunnel::carrier_wire::{clear_carrier_trace, install_carrier_trace};
+    use crate::tunnel::client_mux::{ClientMux, InboundTcp, InboundUdp};
+    use crate::tunnel::config::{
+        COVER_REQUEST_INTERVAL, KEEPALIVE_INTERVAL, UT_METADATA_PIECE_LEN,
+    };
+    use crate::tunnel::egress::EgressPolicy;
+    use crate::tunnel::relay::run_server_relay;
+    use crate::tunnel::test_capture::{CarrierEvent, CarrierTrace};
+    use librqbit_core::torrent_metainfo_v2::info_hash_v2;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    crate::tests::test_util::setup_test_logging();
+
+    // Install the message-layer tap BEFORE any carrier handshake runs so it
+    // observes the BEP-10 extended handshake (with its ut_metadata/metadata_size).
+    let trace = install_carrier_trace();
+    struct ClearTraceGuard;
+    impl Drop for ClearTraceGuard {
+        fn drop(&mut self) {
+            clear_carrier_trace();
+        }
+    }
+    let _clear_trace_guard = ClearTraceGuard;
+
+    // Real loopback TCP echo (the SOCKS destination the server relay dials).
+    let tcp_echo = tokio::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let tcp_echo_addr = tcp_echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = tcp_echo.accept().await {
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    // Real loopback UDP echo.
+    let udp_echo = tokio::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let udp_echo_addr = udp_echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        while let Ok((n, from)) = udp_echo.recv_from(&mut buf).await {
+            let _ = udp_echo.send_to(&buf[..n], from).await;
+        }
+    });
+
+    // ONE live Noise-encrypted client↔server session, with its shared carrier
+    // store so we can check the served ut_metadata against the real info hash.
+    let (client, peer, store) = build_real_relay_pair_with_store().await;
+    let token = CancellationToken::new();
+    let relay_token = token.clone();
+    tokio::spawn(async move {
+        run_server_relay(peer, Arc::new(EgressPolicy::default()), relay_token).await;
+    });
+    // `ClientMux::new` starts the ongoing cover-request cadence + keepalive and
+    // is where SOCKS-style streams are opened.
+    let mux = ClientMux::new(client, token.clone());
+
+    // Yield helper: keep THIS task runnable so the paused clock never
+    // auto-advances, while letting the spawned reader/writer/cadence tasks run.
+    async fn pump() {
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    // ── Req 5 (before the cadence window): SOCKS TCP round trip byte-exact ──
+    let (tcp_sid, mut tcp_inbound, tcp_credit) = mux
+        .open_tcp(TunnelDestination::Ip(tcp_echo_addr))
+        .await
+        .expect("open_tcp");
+    match tcp_inbound.recv().await {
+        Some(InboundTcp::Opened(_)) => {}
+        other => panic!("expected TcpOpened, got {:?}", other.map(|_| "non-opened")),
+    }
+    let tcp_payload = Bytes::from_static(b"full-stack-tcp-payload-before-window");
+    assert!(
+        tcp_credit.reserve(tcp_payload.len()).await,
+        "credit pool closed before send"
+    );
+    assert!(
+        mux.send_tcp_data(tcp_sid, tcp_payload.clone()).await,
+        "send_tcp_data failed"
+    );
+    pump().await;
+    match tcp_inbound.recv().await {
+        Some(InboundTcp::Data(bytes)) => assert_eq!(
+            &bytes[..],
+            &tcp_payload[..],
+            "TCP echo (pre-window) not byte-exact through the tunnel"
+        ),
+        other => panic!("expected TcpData echo, got {:?}", other.map(|_| "non-data")),
+    }
+
+    // ── Req 5 (before the cadence window): UDP datagram round trip byte-exact ──
+    let (udp_aid, mut udp_inbound) = mux.open_udp().await.expect("open_udp");
+    let udp_dest = TunnelDestination::Ip(SocketAddr::V4(match udp_echo_addr {
+        SocketAddr::V4(v4) => v4,
+        SocketAddr::V6(_) => unreachable!("bound to an IPv4 loopback address"),
+    }));
+    let udp_payload = Bytes::from_static(b"full-stack-udp-datagram");
+    assert!(
+        mux.send_udp_datagram(udp_aid, udp_dest, udp_payload.clone()),
+        "send_udp_datagram failed"
+    );
+    pump().await;
+    match udp_inbound.recv().await {
+        Some(InboundUdp::Datagram { bytes, .. }) => assert_eq!(
+            &bytes[..],
+            &udp_payload[..],
+            "UDP echo not byte-exact through the tunnel"
+        ),
+        None => panic!("UDP association closed before the echo returned"),
+    }
+
+    // Let startup traffic settle (the immediate first cover tick + the one-time
+    // ut_metadata request), then snapshot the Request count at ~t=0.
+    let count = |trace: &Arc<parking_lot::Mutex<CarrierTrace>>, kind: CarrierEvent| {
+        trace.lock().events().iter().filter(|e| **e == kind).count()
+    };
+    pump().await;
+    let requests_at_startup = count(&trace, CarrierEvent::Request);
+
+    // ── Drive the cadence window: advance one cover interval at a time,
+    // pumping between advances so each Request→Piece round trip lands. 45 * 3 s
+    // = 135 s comfortably exceeds KEEPALIVE_INTERVAL (110 s). ──
+    let steps = 45u32;
+    assert!(
+        (steps as u64) * COVER_REQUEST_INTERVAL.as_secs()
+            > KEEPALIVE_INTERVAL.as_secs() + Duration::from_secs(10).as_secs(),
+        "test window must exceed KEEPALIVE_INTERVAL so a keepalive is observed"
+    );
+    for _ in 0..steps {
+        tokio::time::advance(COVER_REQUEST_INTERVAL).await;
+        pump().await;
+    }
+    pump().await;
+
+    // ── Interaction check: real tunnel data STILL traverses intact AFTER the
+    // whole cadence/keepalive window — proof the keepalive + ongoing cover did
+    // not perturb the data path (a feature silently breaking another). ──
+    let tcp_payload_after = Bytes::from_static(b"full-stack-tcp-payload-after-window");
+    assert!(
+        tcp_credit.reserve(tcp_payload_after.len()).await,
+        "credit pool closed after the cadence window (data path broken by cadence?)"
+    );
+    assert!(
+        mux.send_tcp_data(tcp_sid, tcp_payload_after.clone()).await,
+        "send_tcp_data failed after the cadence window"
+    );
+    pump().await;
+    match tcp_inbound.recv().await {
+        Some(InboundTcp::Data(bytes)) => assert_eq!(
+            &bytes[..],
+            &tcp_payload_after[..],
+            "TCP echo (post-window) not byte-exact — cadence/keepalive perturbed tunnel data"
+        ),
+        other => panic!(
+            "expected post-window TcpData echo, got {:?} — the session broke during the window",
+            other.map(|_| "non-data")
+        ),
+    }
+
+    // Snapshot everything BEFORE cancelling (cancel tears the tasks down).
+    let events = trace.lock().events().to_vec();
+    let advertised_ut_metadata = trace.lock().advertised_ut_metadata();
+    let advertised_metadata_size = trace.lock().advertised_metadata_size();
+    let reassembled_metadata = trace.lock().reassembled_ut_metadata();
+    token.cancel();
+
+    // ── Req 2: real BitTorrent on the wire ──────────────────────────────────
+    assert!(
+        events.contains(&CarrierEvent::ExtendedHandshake),
+        "no BEP-10 extended handshake on the wire: {events:?}"
+    );
+    assert!(
+        advertised_ut_metadata,
+        "the extended handshake must advertise ut_metadata (BEP-9)"
+    );
+    assert!(
+        advertised_metadata_size > 0,
+        "the extended handshake must advertise a non-zero metadata_size, got {advertised_metadata_size}"
+    );
+    assert!(
+        events.contains(&CarrierEvent::Bitfield),
+        "no bitfield on the wire: {events:?}"
+    );
+    let requests_total = count(&trace, CarrierEvent::Request);
+    let pieces_total = count(&trace, CarrierEvent::Piece);
+    assert!(
+        requests_total > 2,
+        "cover must be ONGOING (more than the old 2-request burst), got {requests_total}"
+    );
+    assert!(
+        requests_total >= requests_at_startup + 10,
+        "cover requests must keep accruing across the window past startup \
+         (startup={requests_at_startup}, total={requests_total})"
+    );
+    assert!(
+        pieces_total >= 10,
+        "the authenticated server must keep serving ongoing Piece cover without \
+         self-choking, got {pieces_total} pieces"
+    );
+
+    // ── Req 3: served ut_metadata reassembles to the carrier info hash ──────
+    let req_pos = events
+        .iter()
+        .position(|e| *e == CarrierEvent::UtMetadataRequest);
+    let data_pos = events
+        .iter()
+        .position(|e| *e == CarrierEvent::UtMetadataData);
+    assert!(
+        matches!((req_pos, data_pos), (Some(r), Some(d)) if d > r),
+        "a served ut_metadata data must come AFTER the peer requests metadata \
+         (req at {req_pos:?}, data at {data_pos:?})"
+    );
+    assert!(
+        !reassembled_metadata.is_empty(),
+        "the server must have served ut_metadata data bytes"
+    );
+    // The client's cover cadence requests exactly piece 0; the whole small v2
+    // info dict fits in one <=16 KiB metadata piece, so what was served IS the
+    // full info dict — assert it byte-for-byte AND that it hashes to the info
+    // hash (the BEP-9/BEP-52 metadata-authenticity invariant).
+    assert!(
+        (advertised_metadata_size as u64) <= u64::from(UT_METADATA_PIECE_LEN),
+        "sanity: this carrier's info dict must fit one ut_metadata piece \
+         (metadata_size={advertised_metadata_size}); otherwise piece-0-only cover \
+         cannot reassemble the whole dict"
+    );
+    assert_eq!(
+        reassembled_metadata.as_slice(),
+        store.info_dict_bytes(),
+        "reassembled served ut_metadata must equal the carrier info dict bytes"
+    );
+    assert_eq!(
+        info_hash_v2(&reassembled_metadata),
+        store.descriptor().info_hash,
+        "reassembled served ut_metadata must hash to the advertised carrier info hash"
+    );
+
+    // ── Req 4: a KeepAlive within KEEPALIVE_INTERVAL on the idle connection ──
+    assert!(
+        events.contains(&CarrierEvent::KeepAlive),
+        "an idle carrier must emit a BT KeepAlive within KEEPALIVE_INTERVAL: {events:?}"
+    );
+}
+
+/// Companion full-stack gate covering the two A–D properties that cannot be
+/// asserted on the in-process duplex session above: the Plan D spec-accurate
+/// MSE handshake shape, and the Plan B concurrent active-probe resistance —
+/// both on REAL live sessions (real listener, real `TunnelServer::accept`,
+/// production `TunnelClient::connect`), in real time (no `start_paused`, so the
+/// production connect/accept handshake timing is exercised exactly as deployed).
+///
+/// Asserts:
+///   1. (Plan D) the production MSE initiator, keyed by the REAL server's
+///      carrier `handshake_info_hash`, emits a structurally spec-accurate MSE/PE
+///      handshake (96-byte DH, raw padding with no cleartext length prefix,
+///      `req1(S)` marker, encrypted VC) — via the shared conformance helper the
+///      standalone `mse_handshake_is_spec_shaped` test also uses.
+///   2. (Plan A) real application data traverses the authenticated tunnel
+///      intact: a SOCKS TCP round trip through the client mux returns byte-exact.
+///   3. (Plan B) a CONCURRENT unauthenticated stub BT peer is seeded a valid
+///      piece and is NOT disconnected after sending garbage `rq_tunnel` bytes —
+///      and, crucially, the authenticated session's data path is UNPERTURBED by
+///      the probe (a second SOCKS round trip after the garbage still returns
+///      byte-exact).
+///
+/// Current-thread `#[tokio::test]` for parity with the rest of the tunnel
+/// suite (no thread-local trace is used here).
+#[tokio::test]
+async fn full_stack_masquerade_is_spec_shaped_and_probe_resistant() {
+    use crate::tunnel::carrier::ValidPieceIndex;
+    use crate::tunnel::carrier_chunk::chunk_ciphertext;
+    use crate::tunnel::carrier_identity::build_carrier_store;
+    use crate::tunnel::carrier_wire::CarrierWire;
+    use crate::tunnel::client::TunnelClient;
+    use crate::tunnel::client_mux::{ClientMux, InboundTcp};
+    use crate::tunnel::config::CARRIER_PIECE_LENGTH;
+    use crate::tunnel::crypto::generate_keypair;
+    use crate::tunnel::egress::EgressPolicy as RuntimeEgressPolicy;
+    use crate::tunnel::options::{EgressPolicy, TunnelServerOptions};
+    use crate::tunnel::peer_wire_crypto::{PeerWireCrypto, assert_initiator_is_spec_mse_shaped};
+    use crate::tunnel::relay::run_server_relay;
+    use crate::tunnel::server::{AcceptOutcome, TunnelServer};
+    use peer_binary_protocol::{Message, Request};
+    use std::collections::HashSet;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    crate::tests::test_util::setup_test_logging();
+
+    let (server_sk, server_pk) = generate_keypair();
+    let (client_sk, client_pk) = generate_keypair();
+
+    // Real server carrier store; its public handshake_info_hash is what BOTH the
+    // MSE spec check and the live sessions below key by.
+    let server_carrier_dir = tempfile::tempdir().expect("server carrier temp dir");
+    let server_store = build_carrier_store(server_carrier_dir.path(), &server_pk)
+        .await
+        .expect("build server carrier store");
+    let info_hash = server_store.descriptor().handshake_info_hash;
+
+    // ── (1) Plan D: the production MSE initiator for THIS server's carrier hash
+    // emits a structurally spec-accurate MSE/PE handshake. ──
+    assert_initiator_is_spec_mse_shaped(info_hash).await;
+
+    // ── Stand up the real server behind a real listener. ──
+    let listener = tokio::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind server listener");
+    let listen_addr = listener.local_addr().unwrap();
+
+    let mut allowed = HashSet::new();
+    allowed.insert(client_pk);
+    let opts = TunnelServerOptions {
+        peer_listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        identity_key: server_sk,
+        allowed_client_keys: allowed,
+        egress_policy: EgressPolicy::default(),
+        carrier_root: server_carrier_dir.path().to_path_buf(),
+    };
+    let server = TunnelServer::new(opts, server_store.clone());
+
+    let token = CancellationToken::new();
+    let accept_server = server.clone();
+    let accept_token = token.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = accept_token.cancelled() => break,
+                res = listener.accept() => {
+                    let Ok((stream, _)) = res else { break };
+                    let s = accept_server.clone();
+                    let relay_token = accept_token.clone();
+                    tokio::spawn(async move {
+                        match s.accept(stream).await {
+                            // Authenticated (allowlisted): run the real relay.
+                            Ok(AcceptOutcome::Admitted(peer)) => {
+                                run_server_relay(
+                                    *peer,
+                                    Arc::new(RuntimeEgressPolicy::default()),
+                                    relay_token,
+                                )
+                                .await;
+                            }
+                            // Unauthenticated probe: seeded plain BT cover then
+                            // left — an ordinary outcome, just close.
+                            Ok(AcceptOutcome::Seeded) => {}
+                            Err(e) => panic!("peer admission errored: {e}"),
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    // Real loopback echo destination for the authenticated SOCKS round trips.
+    let echo = tokio::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = echo.accept().await {
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+
+    // ── Authenticated client via the PRODUCTION connect path. ──
+    let client_carrier_dir = tempfile::tempdir().expect("client carrier temp dir");
+    let client_store = build_carrier_store(client_carrier_dir.path(), &server_pk)
+        .await
+        .expect("build client carrier store");
+    let client = TunnelClient::connect(listen_addr, &client_sk, &server_pk, client_store)
+        .await
+        .expect("authenticated allowlisted client must connect");
+    let mux = ClientMux::new(client, token.clone());
+
+    // ── (2) Plan A: authenticated SOCKS TCP round trip byte-exact (BEFORE the
+    // probe). ──
+    let (sid, mut inbound, credit) = mux
+        .open_tcp(TunnelDestination::Ip(echo_addr))
+        .await
+        .expect("open_tcp");
+    match inbound.recv().await {
+        Some(InboundTcp::Opened(_)) => {}
+        other => panic!("expected TcpOpened, got {:?}", other.map(|_| "non-opened")),
+    }
+    let payload = Bytes::from_static(b"authenticated-echo-before-probe");
+    assert!(
+        credit.reserve(payload.len()).await,
+        "credit closed before send"
+    );
+    assert!(mux.send_tcp_data(sid, payload.clone()).await, "send failed");
+    match inbound.recv().await {
+        Some(InboundTcp::Data(b)) => assert_eq!(&b[..], &payload[..], "auth echo not byte-exact"),
+        other => panic!("expected TcpData echo, got {:?}", other.map(|_| "non-data")),
+    }
+
+    // ── (3) Plan B: a CONCURRENT unauthenticated stub BT peer. Same primitives
+    // `CarrierWire::establish` uses on the initiator side (MSE-initiate keyed by
+    // the public carrier hash, then real BT + BEP-10 handshake). ──
+    let probe_stream = tokio::net::TcpStream::connect(listen_addr)
+        .await
+        .expect("probe TCP connect");
+    let enc = PeerWireCrypto::initiator(probe_stream, info_hash)
+        .await
+        .expect("probe MSE initiator");
+    let probe_carrier_dir = tempfile::tempdir().expect("probe carrier temp dir");
+    let probe_store = build_carrier_store(probe_carrier_dir.path(), &server_pk)
+        .await
+        .expect("build probe carrier store");
+    let wire = CarrierWire::establish(enc.reader, enc.writer, probe_store.clone(), info_hash)
+        .await
+        .expect("probe carrier establish");
+    let (mut probe_read, mut probe_write, _probe_peer) = wire.into_halves();
+
+    probe_write
+        .send_message(&Message::Interested)
+        .await
+        .expect("probe send Interested");
+    probe_write
+        .send_message(&Message::Request(Request::new(0, 0, 16384)))
+        .await
+        .expect("probe send first Request");
+
+    // Skip any leading cover the peer's own `establish()` wrote (Bitfield/
+    // Unchoke/Interested) while waiting for the served `Piece` (the initiator
+    // side of `establish` does not drain it). Concatenate both ring-buffer
+    // halves of a `Piece`, exactly like `carrier_peer.rs::on_piece`.
+    async fn recv_probe_piece(
+        probe_read: &mut crate::tunnel::carrier_wire::CarrierReadHalf,
+    ) -> Vec<u8> {
+        loop {
+            match probe_read.recv_message().await.expect("probe recv") {
+                Some(Message::Piece(p)) => {
+                    let (b0, b1) = p.data();
+                    let mut block = Vec::with_capacity(b0.len() + b1.len());
+                    block.extend_from_slice(b0);
+                    block.extend_from_slice(b1);
+                    break block;
+                }
+                Some(_) => continue,
+                None => panic!("probe disconnected instead of being served a Piece"),
+            }
+        }
+    }
+
+    let first_block =
+        tokio::time::timeout(Duration::from_secs(5), recv_probe_piece(&mut probe_read))
+            .await
+            .expect("server must serve the probe a Piece within a bounded wait");
+    let mut expected_piece = vec![0u8; CARRIER_PIECE_LENGTH as usize];
+    probe_store
+        .read_piece(ValidPieceIndex(0), &mut expected_piece)
+        .await
+        .expect("read piece 0 from probe carrier store");
+    assert_eq!(
+        first_block,
+        expected_piece[0..16384],
+        "served Piece block does not match the deterministic carrier corpus"
+    );
+
+    // Garbage rq_tunnel bytes (not a valid Noise IK initiator message) must NOT
+    // drop the probe connection — the removed active-probe disconnect tell.
+    let garbage: Vec<u8> = (0..96u8)
+        .map(|i| i.wrapping_mul(37).wrapping_add(11))
+        .collect();
+    for chunk in chunk_ciphertext(&garbage) {
+        probe_write
+            .send_tunnel(&chunk)
+            .await
+            .expect("probe send garbage rq_tunnel payload");
+    }
+    probe_write
+        .send_message(&Message::Request(Request::new(0, 0, 16384)))
+        .await
+        .expect("probe send second Request");
+    let second_block =
+        tokio::time::timeout(Duration::from_secs(5), recv_probe_piece(&mut probe_read))
+            .await
+            .expect(
+                "server must still seed the probe after garbage rq_tunnel bytes (no drop tell)",
+            );
+    assert_eq!(
+        second_block,
+        expected_piece[0..16384],
+        "second served Piece block does not match the deterministic carrier corpus"
+    );
+
+    // ── Interaction check: the authenticated session's data path is UNPERTURBED
+    // by the concurrent probe — a second SOCKS round trip AFTER the probe's
+    // garbage still returns byte-exact. ──
+    let payload_after = Bytes::from_static(b"authenticated-echo-after-probe");
+    assert!(
+        credit.reserve(payload_after.len()).await,
+        "credit closed after the probe interaction (probe perturbed the auth session?)"
+    );
+    assert!(
+        mux.send_tcp_data(sid, payload_after.clone()).await,
+        "send failed after the probe interaction"
+    );
+    match inbound.recv().await {
+        Some(InboundTcp::Data(b)) => assert_eq!(
+            &b[..],
+            &payload_after[..],
+            "post-probe auth echo not byte-exact — the concurrent probe perturbed the authenticated session"
+        ),
+        other => panic!(
+            "expected post-probe TcpData echo, got {:?} — the auth session broke during the probe",
+            other.map(|_| "non-data")
+        ),
+    }
+
+    drop(probe_read);
+    drop(probe_write);
+    token.cancel();
 }

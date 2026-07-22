@@ -153,6 +153,17 @@ fn record_carrier_event(msg: &Message<'_>) {
                     h.metadata_size.unwrap_or(0),
                 );
             }
+            // Retain the raw bytes of every SERVED ut_metadata data piece so a
+            // full-stack gate can reassemble the metadata and check it hashes to
+            // the info hash (BEP-9). Only the served-piece payload is kept.
+            if let Message::Extended(ExtendedMessage::UtMetadata(
+                peer_binary_protocol::extended::ut_metadata::UtMetadata::Data(d),
+            )) = msg
+            {
+                let mut bytes = vec![0u8; d.len()];
+                d.copy_to_slice(&mut bytes);
+                trace.record_ut_metadata_data(d.piece(), bytes);
+            }
         }
     });
 }

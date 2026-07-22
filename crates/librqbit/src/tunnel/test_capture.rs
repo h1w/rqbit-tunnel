@@ -146,6 +146,11 @@ pub(crate) struct CarrierTrace {
     /// handshake (0 if none advertised one). A real client that advertises
     /// `ut_metadata` always pairs it with a non-zero `metadata_size`.
     handshake_metadata_size: u32,
+    /// Served BEP-9 `ut_metadata` `data` pieces observed on the wire, as
+    /// `(piece_index, raw_piece_bytes)`. Retained (test-only) so a full-stack
+    /// gate can REASSEMBLE the actually-served metadata and check it hashes to
+    /// the advertised info hash — the trace normally keeps only event kinds.
+    ut_metadata_data: Vec<(u32, Vec<u8>)>,
 }
 
 impl CarrierTrace {
@@ -154,11 +159,36 @@ impl CarrierTrace {
             events: Vec::new(),
             handshake_advertised_ut_metadata: false,
             handshake_metadata_size: 0,
+            ut_metadata_data: Vec::new(),
         }
     }
 
     pub(crate) fn push(&mut self, event: CarrierEvent) {
         self.events.push(event);
+    }
+
+    /// Record one served `ut_metadata` `data` piece (its index and raw bytes).
+    /// Called by the message tap for every observed `UtMetadata::Data`.
+    pub(crate) fn record_ut_metadata_data(&mut self, piece: u32, data: Vec<u8>) {
+        self.ut_metadata_data.push((piece, data));
+    }
+
+    /// Reassemble the served `ut_metadata` pieces into the metadata blob,
+    /// ordering by piece index and concatenating (deduplicating retransmits by
+    /// keeping the first copy of each index). Empty if none were served.
+    #[allow(dead_code)]
+    pub(crate) fn reassembled_ut_metadata(&self) -> Vec<u8> {
+        let mut pieces: Vec<&(u32, Vec<u8>)> = self.ut_metadata_data.iter().collect();
+        pieces.sort_by_key(|(idx, _)| *idx);
+        let mut out = Vec::new();
+        let mut next: u32 = 0;
+        for (idx, data) in pieces {
+            if *idx == next {
+                out.extend_from_slice(data);
+                next += 1;
+            }
+        }
+        out
     }
 
     /// Record the `ut_metadata` advertisement seen on an extended handshake
