@@ -352,3 +352,77 @@ shows only ciphertext anyway):
 plaintext-BT-handshake identity, with real piece cover. Rungs 3 (active-probe
 resistance), 4 (spec-accurate MSE/PE identity), 5 (swarm/DHT realism) and 6
 (statistical shaping) remain for Plans B–F.
+
+## Results (Plans B–D + Plan G close-out)
+
+Status: **rungs 1–4 complete, validated, and merged; rungs 5–6 (E–F) deferred to
+deployment — see rationale below.** Plans B, C, D each landed as their own
+reviewed PR (adversarial per-task + whole-branch reviews, all fixes re-verified):
+
+- **Plan B — active-probe resistance (PR #8), rung 3.** The server behaves as an
+  ordinary BitTorrent seeder to any unauthenticated peer (serves valid pieces,
+  no "handshake-then-drop" tell) and promotes to tunnel-relay ONLY on a valid
+  allowlisted Noise handshake. Hardened pre-auth DoS surface: bounded Noise
+  attempts + plausible IK-size band, ignored inbound pieces, per-connection
+  pieces cap + upload slots + non-resetting seed-window deadline + per-IP/global
+  connection caps (released on promotion). An active BT probe cannot distinguish
+  the node from a seeding peer without the client key.
+- **Plan C — steady-state cadence (PR #9), rung 2 full.** Advertises + serves
+  `ut_metadata` (BEP-9) — the exact info-dict bytes (info-hash matches by
+  construction), 16 KiB chunks, per-connection cap; periodic `KeepAlive`; ongoing
+  `Request`/`Piece` cover so the wire shows continuous piece exchange (authenticated
+  carriers exempt from the pre-auth pieces cap).
+- **Plan D — spec-accurate MSE/PE (PR #10), rung 4.** The outer handshake is now
+  exact MSE: `req1`/`req2^req3` markers, `crypto_provide`/`crypto_select`
+  negotiation, raw (unprefixed) padding with bounded fail-closed resync,
+  `SHA1('keyA'‖S‖SKEY)` derivation, 1024-byte discard, RC4 keystream continuity.
+  SKEY is the public `handshake_info_hash` (as a real MSE peer uses), which also
+  **removed a prior fingerprint** (the old node announced info-hash X on DHT but
+  rejected MSE keyed by X). A 30 s wall-clock handshake timeout was added.
+
+**Plan G — comprehensive gate + close-out (this PR).**
+- Combined E2E gate proves the whole A–D stack holds together on a single live
+  session with **no interaction bug**: spec-MSE structure + real BT/BEP-10 +
+  served ut_metadata (reassembles to the info hash) + keepalive + byte-exact SOCKS
+  TCP/UDP tunnel data (before and after the cadence window) + a concurrent active
+  probe seeded a valid piece and not dropped, with the authenticated session
+  unperturbed. Full suite: **215 `tunnel` tests, 0 failed.**
+- Real-binary milestone (release build, loopback + userspace 100 ms delay proxy):
+  a 100 MiB SOCKS download is **byte-exact (sha256)** both direct (**655 Mbit/s**)
+  and at emulated 100 ms RTT (**32.8 Mbit/s**); server logs show the full
+  `MSE → establish → Noise → admit` pipeline and DHT rendezvous on
+  `handshake_info_hash`, no errors. The direct figure is healthy (slightly faster
+  than Plan A's 629 Mbit/s); the 100 ms figure is a **harness lower bound** — the
+  richer A–D message mix (piece/ut_metadata/keepalive cover interleaved with
+  tunnel data) raises the Python delay-proxy's per-message overhead, and the
+  ongoing cover cadence competes on the carrier. A proper throughput/bufferbloat
+  benchmark (native `tc netem`, no userspace-proxy bottleneck, and possibly a
+  lighter cover cadence under load) is deployment-phase work.
+
+### Why E (swarm/DHT realism) and F (statistical shaping) are deferred to deployment
+
+Both rungs are **behavioural**, and doing them in-sandbox (no external network, no
+reference client) would REINTRODUCE the exact fingerprints Plan D just removed:
+- **Multi-info_hash presence** requires a *consistent backing torrent per
+  announced hash* (its own deterministic corpus + a multi-SKEY MSE responder +
+  consistent seeding). Announcing decoy hashes without backing them means a peer
+  that discovers a decoy and reaches the BT handshake gets a mismatched info hash
+  — the "announces X, rejects/mishandles X" anomaly Plan D eliminated for the
+  primary hash.
+- **`ut_pex` (BEP-11)** advertises *real swarm peers*; with no real swarm, a
+  fabricated list is a dead-peer tell and an empty one is a (weaker) tell —
+  lose-lose without genuine swarm participation.
+- **F's acceptance criterion** is *reference-capture parity* against a real
+  qBittorrent-in-a-swarm pcap plus an off-the-shelf classifier — neither is
+  capturable in-sandbox (no external network, no reference client).
+
+Deployment-phase checklist for E/F/real-interop (run with a real network + a real
+qBittorrent peer): interop the spec-MSE handshake against a live qBittorrent
+encrypted peer; back N decoy info_hashes with consistent deterministic torrents +
+a multi-SKEY MSE responder; serve `ut_pex` from genuinely-known peers; capture a
+reference pcap and gate the shaped traffic on feature-parity + a classifier;
+benchmark steady-state throughput on a real high-BDP path.
+
+**Ladder status:** rungs 1–4 met and validated end-to-end (protocol-aware DPI,
+active-probe resistance, spec-accurate encrypted-peer identity); rungs 5–6
+(swarm/DHT realism, statistical shaping) are scoped and deferred to deployment.
