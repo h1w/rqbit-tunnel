@@ -68,7 +68,7 @@ Expected: FAIL because package `rqbit-tunnel` does not exist.
 
 - [ ] **Step 3: Add the workspace member and minimal crate manifest**
 
-Add `"crates/rqbit-tunnel"` to `[workspace].members`. Add shared `rusqlite = { version = "0.37", features = ["bundled"] }`, `ratatui = "0.29"`, and `crossterm = "0.28"` workspace dependencies. Create the crate manifest with `librqbit`, `tokio`, `tokio-util`, `serde`, `serde_json`, `uuid` (`v4`, `serde`), `rusqlite`, `clap`, `thiserror`, `tracing`, `hex`, `sha2`, `directories`, `ratatui`, and `crossterm` inherited from the workspace where available.
+Add `"crates/rqbit-tunnel"` to `[workspace].members`. Add shared `rusqlite = { version = "0.37", features = ["bundled"] }`, `ratatui = "0.29"`, and `crossterm = "0.28"` workspace dependencies. Create the crate manifest with `tokio`, `tokio-util`, `serde`, `serde_json`, `uuid` (`v4`, `serde`), `rusqlite`, `clap`, `thiserror`, `tracing`, `hex`, `sha2`, `directories`, `ratatui`, and `crossterm` inherited from the workspace where available. Defer the `librqbit` dependency to Task 4, where the registry first implements its tunnel traits; a model-only crate must not select a TLS backend.
 
 ```toml
 [package]
@@ -77,7 +77,6 @@ edition = "2024"
 version.workspace = true
 
 [dependencies]
-librqbit = { workspace = true, features = ["tracing-subscriber-utils"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "sync", "time"] }
 tokio-util.workspace = true
 serde.workspace = true
@@ -142,6 +141,7 @@ git commit -m "feat(tunnel): scaffold managed harness model"
 - Modify: `crates/librqbit/src/tunnel/service.rs`
 - Modify: `crates/librqbit/src/lib.rs`
 - Modify: `crates/rqbit/src/main.rs`
+- Modify: `crates/librqbit/tests/tunnel.rs`
 - Test: inline tests in `options.rs`, `crypto.rs`, and `server.rs`
 
 - [ ] **Step 0: Map every exported option callsite before changing it**
@@ -202,7 +202,7 @@ pub struct TunnelServerOptions {
 }
 ```
 
-Validation must reject an empty static set only when `authorizer.is_none()`. Re-export the traits and direction from `librqbit::lib`. Update every existing `TunnelServerOptions` struct literal—including `rqbit::build_tunnel_opts`—to set `authorizer: None`, so the direct `--tunnel-allowed-clients` CLI keeps its current behavior.
+Validation must reject an empty static set only when `authorizer.is_none()`. Re-export the traits and direction from `librqbit::lib`. Update every existing `TunnelServerOptions` struct literal—including `rqbit::build_tunnel_opts`, `librqbit` inline tests, and `crates/librqbit/tests/tunnel.rs`—to set `authorizer: None`, so the direct `--tunnel-allowed-clients` CLI keeps its current behavior.
 
 - [ ] **Step 4: Refactor Noise admission to retain a session exactly once**
 
@@ -264,7 +264,7 @@ Expected: all selected tests pass; static rejection behavior remains unchanged.
 Commit:
 
 ```bash
-git add crates/librqbit/src/tunnel/{options.rs,crypto.rs,server.rs,service.rs} crates/librqbit/src/lib.rs crates/rqbit/src/main.rs
+git add crates/librqbit/src/tunnel/{options.rs,crypto.rs,server.rs,service.rs} crates/librqbit/src/lib.rs crates/librqbit/tests/tunnel.rs crates/rqbit/src/main.rs
 git commit -m "feat(tunnel): support dynamic server authorization"
 ```
 
@@ -352,6 +352,7 @@ git commit -m "feat(tunnel): meter successful relay payload"
 **Files:**
 - Create: `crates/rqbit-tunnel/src/paths.rs`
 - Create: `crates/rqbit-tunnel/src/store.rs`
+- Modify: `crates/rqbit-tunnel/Cargo.toml`
 - Create: `crates/rqbit-tunnel/src/registry.rs`
 - Modify: `crates/rqbit-tunnel/src/lib.rs`
 - Test: inline tests in `store.rs` and `registry.rs`
@@ -389,7 +390,7 @@ Expected: FAIL because `ServerStore` and `UserRegistry` do not exist.
 
 - [ ] **Step 3: Implement path policy and transactional migrations**
 
-`ServerPaths::system()` returns `/etc/rqbit-tunnel`, `/var/lib/rqbit-tunnel`, `/run/rqbit-tunnel`; `ServerPaths::under(root)` exists only for tests/install staging. `ServerStore::open` must set `journal_mode = WAL`, `foreign_keys = ON`, and execute an idempotent migration creating `users`, `traffic_totals`, and `settings` exactly as specified.
+`ServerPaths::system()` returns `/etc/rqbit-tunnel`, `/var/lib/rqbit-tunnel`, `/run/rqbit-tunnel`; `ServerPaths::under(root)` exists only for tests/install staging. Add `arc-swap` as a normal workspace dependency and `tempfile` as a dev-dependency to `rqbit-tunnel` in this task. Add `librqbit = { workspace = true, default-features = false, features = ["tracing-subscriber-utils"] }` plus crate features `default = ["default-tls"]`, `default-tls = ["librqbit/default-tls"]`, and `rust-tls = ["librqbit/rust-tls"]`. Thus normal workspace builds select the existing default TLS backend, while a Rustls workspace build must explicitly select `rqbit-tunnel/rust-tls` alongside `rqbit/rust-tls`; never select both. `ServerStore::open` must set `journal_mode = WAL`, `foreign_keys = ON`, and execute an idempotent migration creating `users`, `traffic_totals`, and `settings` exactly as specified.
 
 ```sql
 CREATE TABLE IF NOT EXISTS users (
@@ -438,8 +439,7 @@ Expected: user lifecycle, bidirectional flush, and revocation tests pass.
 
 Commit:
 
-```bash
-git add crates/rqbit-tunnel/src/{lib.rs,paths.rs,store.rs,registry.rs}
+git add crates/rqbit-tunnel/Cargo.toml crates/rqbit-tunnel/src/{lib.rs,paths.rs,store.rs,registry.rs}
 git commit -m "feat(tunnel): persist managed server users and traffic"
 ```
 
