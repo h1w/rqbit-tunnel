@@ -123,7 +123,6 @@ impl std::fmt::Debug for TunnelServerOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TunnelServerOptions")
             .field("peer_listen", &self.peer_listen)
-            .field("identity_key", &self.identity_key)
             .field("allowed_client_keys", &self.allowed_client_keys)
             .field("authorizer", &self.authorizer.is_some())
             .field("egress_policy", &self.egress_policy)
@@ -250,6 +249,29 @@ mod tests {
         });
 
         assert!(options.validate().is_ok());
+    }
+
+    #[test]
+    fn server_options_debug_redacts_identity_key() {
+        let identity_key = TunnelPrivateKey([0xA5; 32]);
+        let private_key_debug = format!("{identity_key:?}");
+        let debug = format!(
+            "{:?}",
+            TunnelServerOptions {
+                peer_listen: SocketAddr::from(([127, 0, 0, 1], 9091)),
+                identity_key,
+                allowed_client_keys: HashSet::new(),
+                authorizer: Some(Arc::new(DynamicAuthorizer)),
+                egress_policy: EgressPolicy::default(),
+                carrier_root: PathBuf::from("/tmp"),
+            }
+        );
+
+        assert!(debug.contains("peer_listen"));
+        assert!(debug.contains("authorizer: true"));
+        assert!(!debug.contains("identity_key"));
+        assert!(!debug.contains(&private_key_debug));
+        assert!(!debug.contains("[165, 165"));
     }
 
     #[test]

@@ -1451,6 +1451,104 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn dynamic_session_disconnects_when_run_relay_ends() {
+        use super::super::carrier_chunk::{
+            CarrierDefragmenter, MAX_CARRIER_CIPHERTEXT, chunk_ciphertext, recv_one_ciphertext,
+        };
+        use super::super::carrier_wire::CarrierWire;
+        use std::net::{Ipv4Addr, SocketAddrV4};
+
+        let identity_key = server_key();
+        let server_pub = crypto::public_key(&identity_key);
+        let (client_key, client_public_key) = crypto::generate_keypair();
+        let (_dir, store) = test_carrier_store(&identity_key).await;
+        let info_hash = store.descriptor().handshake_info_hash;
+        let session = Arc::new(RecordingSession::new());
+        let opts = TunnelServerOptions {
+            identity_key: identity_key.clone(),
+            allowed_client_keys: HashSet::new(),
+            authorizer: Some(Arc::new(KeyAuthorizer {
+                key: client_public_key,
+                session: session.clone(),
+            })),
+            ..test_server_options(HashSet::new())
+        };
+        let server = TunnelServer::new(opts, store.clone());
+        let server_for_check = server.clone();
+        let listener = tokio::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let listen_addr = listener.local_addr().expect("listener address");
+        let server_shutdown = CancellationToken::new();
+        let run_shutdown = server_shutdown.clone();
+        let server_task = tokio::spawn(async move {
+            server.run(listener, run_shutdown).await;
+        });
+
+        let client_stream = tokio::net::TcpStream::connect(listen_addr)
+            .await
+            .expect("client connect");
+        let enc = PeerWireCrypto::initiator(client_stream, info_hash)
+            .await
+            .expect("client MSE initiator");
+        let wire = CarrierWire::establish(enc.reader, enc.writer, store, info_hash)
+            .await
+            .expect("client carrier establish");
+        let (mut read_half, mut write_half, _client_peer) = wire.into_halves();
+        let (handshake, noise_message) =
+            crypto::initiator_start(&client_key, &server_pub).expect("initiator start");
+        for chunk in chunk_ciphertext(&noise_message) {
+            write_half
+                .send_tunnel(&chunk)
+                .await
+                .expect("send Noise initiation");
+        }
+        let mut defrag = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
+        let reply = recv_one_ciphertext(&mut read_half, &mut defrag)
+            .await
+            .expect("Noise reply");
+        let _client_transport =
+            crypto::initiator_complete(handshake, &reply).expect("initiator complete");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if session.connected.load(Ordering::Relaxed) == 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dynamic session must be connected after admission");
+
+        session.shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if server_for_check.peer_count().await == 0 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session cancellation must end the relay");
+
+        assert_eq!(session.connected.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            session.disconnected.load(Ordering::Relaxed),
+            1,
+            "relay termination must invoke disconnected exactly once"
+        );
+        assert!(
+            !server_shutdown.is_cancelled(),
+            "session cancellation must not cancel the global server token"
+        );
+
+        server_shutdown.cancel();
+        server_task.await.expect("server run task join");
+    }
+
     // ── Overall seed-window deadline (Plan B, Task 2) ────────────────────────
 
     /// THE bug this task closes: `idle` alone resets on every message, so a
