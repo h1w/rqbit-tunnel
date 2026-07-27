@@ -459,6 +459,10 @@ git commit -m "feat(tunnel): persist managed server users and traffic"
 - Create: `crates/rqbit-tunnel/src/runtime/mod.rs`
 - Create: `crates/rqbit-tunnel/src/runtime/server.rs`
 - Modify: `crates/rqbit-tunnel/src/lib.rs`
+- Modify: `crates/rqbit-tunnel/src/model.rs`
+- Modify: `crates/rqbit-tunnel/src/paths.rs`
+- Modify: `crates/librqbit/src/tunnel/crypto.rs`
+- Modify: `crates/librqbit/src/lib.rs`
 - Test: inline tests in `ipc/protocol.rs`, `ipc/unix.rs`, and `runtime/server.rs`
 
 - [ ] **Step 1: Add a failing IPC round-trip test**
@@ -489,20 +493,25 @@ Use a four-byte big-endian length plus JSON body, reject zero-length or frames a
 pub enum ServerRequest {
     Snapshot,
     ListUsers,
-    AddUser { name: String, export_path: Option<PathBuf> },
+    AddUser { name: String, export_path: PathBuf },
     SetEnabled { id: Uuid, enabled: bool },
     DeleteUser { id: Uuid },
     ResetTraffic { id: Uuid },
-    ReloadConfig,
+    GetConfig,
+    SetConfig { config: ServerConfig },
     Shutdown,
 }
 ```
 
 `ServerResponse` must use structured `Ok` payloads and a typed `{ code, message, recovery }` error; it must never serialize private key bytes except in the explicit `AddUser` export operation, which writes to a file instead of returning the bundle through IPC.
 
+Migrate the unused Task 1 `ServerConfig` before it reaches disk: use `schema_version`, `peer_listen`, `egress: ServerEgressConfig` (four explicit allow booleans matching `EgressPolicy`), `default_client_socks_listen`, and `default_client_carriers`. Validate schema, nonzero listener port, and client carrier bounds before persisting. `ServerPaths` must provide `config_path()` (`server.json`), `server_key_path()` (`server.key`), `carrier_root()` (`carrier/`), `control_socket_path()` (`server.sock`), and `database_path()` (`server-state.db`); update its tests. Expose a narrow `librqbit::tunnel_public_key(&TunnelPrivateKey) -> TunnelPublicKey` helper rather than making the harness depend directly on Curve25519 internals.
+
+`AddUser` requires an explicit bundle destination. The runtime uses the one-time `CreatedUser.client_private_key` to construct an `EnrollmentBundle`, atomically writes it mode `0600`, and returns only a secret-free user snapshot. If bundle creation/write fails, delete the just-created user before returning a typed error; private material is never returned over IPC or retained in memory. `SetConfig` validates and atomically replaces root-owned `server.json`; return typed config snapshots only.
+
 - [ ] **Step 4: Start `librqbit` server mode from managed configuration**
 
-`ManagedServer::start` loads root-owned JSON config/key material, opens store/registry, creates `TunnelServerOptions { authorizer: Some(registry.clone()), allowed_client_keys: HashSet::new(), … }`, and starts `Session::new_with_opts` with normal tunnel DHT behavior but no ordinary torrent listener or HTTP API.
+`ManagedServer::start` loads validated root-owned JSON/key material through `ServerPaths`, opens store/registry, derives the server public key through `librqbit`, creates `TunnelServerOptions { authorizer: Some(registry.clone()), allowed_client_keys: HashSet::new(), peer_listen: config.peer_listen, egress_policy: config.egress.into(), carrier_root: paths.carrier_root(), … }`, and starts `Session::new_with_opts` with normal tunnel DHT behavior but no ordinary torrent listener or HTTP API.
 
 ```rust
 let session = Session::new_with_opts(
@@ -518,7 +527,7 @@ let session = Session::new_with_opts(
 ).await?;
 ```
 
-Bind the control socket after removing only an existing socket owned by the configured runtime path. Create its parent with `0750` and socket with group-readable admin permissions. On `Shutdown`, stop the session, flush registry counters, remove the socket, and return only after the task exits.
+Bind the control socket after removing only an existing Unix socket at the configured runtime path; reject a regular file, symlink, or directory there. Create its parent with `0750` and socket with group-readable admin permissions. On `Shutdown`, stop the session, call `registry.shutdown()` (join periodic flush worker, then final flush), remove the socket, and return only after the task exits.
 
 - [ ] **Step 5: Run IPC/runtime tests and commit**
 
@@ -535,7 +544,7 @@ Expected: malformed frames are rejected, snapshots round-trip, and graceful shut
 Commit:
 
 ```bash
-git add crates/rqbit-tunnel/src/{lib.rs,ipc,runtime}
+git add crates/rqbit-tunnel/src/{lib.rs,model.rs,paths.rs,ipc,runtime} crates/librqbit/src/{lib.rs,tunnel/crypto.rs}
 git commit -m "feat(tunnel): run managed server control plane"
 ```
 
