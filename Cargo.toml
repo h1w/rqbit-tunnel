@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/rqbit",
+    "crates/rqbit-tunnel",
     "crates/librqbit",
     "crates/buffers",
     "crates/clone_to_owned",
@@ -93,6 +94,7 @@ clap = "4"
 clap_complete = "4"
 console-subscriber = "0.5"
 criterion = "0.7"
+crossterm = "0.28"
 crypto-hash = "0.3"
 dashmap = "6"
 data-encoding = "2"
@@ -127,9 +129,11 @@ parse_duration = "2"
 pollster = "0.4"
 quick-xml = "0.38"
 rand = "0.9"
+ratatui = "0.29"
 regex = "1"
 reqwest = { version = "0.12", default-features = false }
 rlimit = "0.10"
+rusqlite = { version = "0.37", features = ["bundled"] }
 serde = "1"
 serde_derive = "1"
 serde_json = "1"
