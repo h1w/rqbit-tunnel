@@ -80,10 +80,25 @@ mod tests {
         let root = Path::new("/tmp/rqbit-tunnel-stage");
         let paths = ServerPaths::under(root);
 
-        assert_eq!(paths.config_path(), root.join("etc/rqbit-tunnel/server.json"));
-        assert_eq!(paths.server_key_path(), root.join("etc/rqbit-tunnel/server.key"));
-        assert_eq!(paths.carrier_root(), root.join("var/lib/rqbit-tunnel/carrier"));
-        assert_eq!(paths.control_socket_path(), root.join("run/rqbit-tunnel/server.sock"));
-        assert_eq!(paths.database_path(), root.join("var/lib/rqbit-tunnel/server-state.db"));
+        assert_eq!(
+            paths.config_path(),
+            root.join("etc/rqbit-tunnel/server.json")
+        );
+        assert_eq!(
+            paths.server_key_path(),
+            root.join("etc/rqbit-tunnel/server.key")
+        );
+        assert_eq!(
+            paths.carrier_root(),
+            root.join("var/lib/rqbit-tunnel/carrier")
+        );
+        assert_eq!(
+            paths.control_socket_path(),
+            root.join("run/rqbit-tunnel/server.sock")
+        );
+        assert_eq!(
+            paths.database_path(),
+            root.join("var/lib/rqbit-tunnel/server-state.db")
+        );
     }
 }

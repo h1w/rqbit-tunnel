@@ -12,8 +12,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::protocol::{
-    MAX_FRAME_BYTES, ProtocolError, ServerRequest, ServerResponse, decode_request,
-    decode_response, encode_request, encode_response,
+    MAX_FRAME_BYTES, ProtocolError, ServerRequest, ServerResponse, decode_request, decode_response,
+    encode_request, encode_response,
 };
 
 #[derive(Debug, Error)]
@@ -39,12 +39,13 @@ pub struct UnixControlClient {
 impl UnixControlClient {
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self, UnixControlError> {
         let path = path.as_ref().to_path_buf();
-        let stream = UnixStream::connect(&path)
-            .await
-            .map_err(|source| UnixControlError::Connect {
-                path: path.clone(),
-                source,
-            })?;
+        let stream =
+            UnixStream::connect(&path)
+                .await
+                .map_err(|source| UnixControlError::Connect {
+                    path: path.clone(),
+                    source,
+                })?;
         Ok(Self { stream })
     }
 
@@ -175,9 +176,9 @@ where
     W: AsyncWrite + Unpin,
 {
     if body.is_empty() || body.len() > MAX_FRAME_BYTES {
-        return Err(UnixControlError::Protocol(ProtocolError::EncodedFrameTooLarge {
-            length: body.len(),
-        }));
+        return Err(UnixControlError::Protocol(
+            ProtocolError::EncodedFrameTooLarge { length: body.len() },
+        ));
     }
     let length = u32::try_from(body.len()).map_err(|_| {
         UnixControlError::Protocol(ProtocolError::EncodedFrameTooLarge { length: body.len() })
@@ -217,11 +218,10 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
 
-    use super::{ControlResponseWrite, UnixControlError, read_request, write_response_until_shutdown};
-    use crate::{
-
-        ipc::protocol::{ProtocolError, ServerResponse, MAX_FRAME_BYTES},
+    use super::{
+        ControlResponseWrite, UnixControlError, read_request, write_response_until_shutdown,
     };
+    use crate::ipc::protocol::{MAX_FRAME_BYTES, ProtocolError, ServerResponse};
 
     #[tokio::test]
     async fn request_reader_rejects_a_zero_length_frame_before_reading_a_body() {
@@ -309,17 +309,11 @@ mod tests {
             Poll::Pending
         }
 
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _context: &mut Context<'_>,
-        ) -> Poll<io::Result<()>> {
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Pending
         }
 
-        fn poll_shutdown(
-            self: Pin<&mut Self>,
-            _context: &mut Context<'_>,
-        ) -> Poll<io::Result<()>> {
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Pending
         }
     }

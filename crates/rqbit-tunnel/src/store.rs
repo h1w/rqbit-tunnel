@@ -7,7 +7,7 @@ use std::{
 #[cfg(test)]
 use std::sync::Condvar;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 use tokio::task::spawn_blocking;
 use uuid::Uuid;
@@ -48,10 +48,7 @@ pub enum StoreError {
     #[error("the system clock is before the Unix epoch: {0}")]
     Clock(#[from] std::time::SystemTimeError),
     #[error("SQLite counter {direction}={value} is outside SQLite's signed range")]
-    CounterOutOfRange {
-        direction: &'static str,
-        value: u64,
-    },
+    CounterOutOfRange { direction: &'static str, value: u64 },
     #[error("stored enabled value for user {user_id} is invalid: {value}")]
     InvalidEnabled { user_id: Uuid, value: i64 },
     #[error("stored public key has invalid length {0}")]
@@ -113,13 +110,21 @@ impl SetEnabledPause {
     }
 
     pub(crate) fn release(&self) {
-        let mut released = self.release.0.lock().expect("set-enabled pause mutex poisoned");
+        let mut released = self
+            .release
+            .0
+            .lock()
+            .expect("set-enabled pause mutex poisoned");
         *released = true;
         self.release.1.notify_all();
     }
 
     fn wait_for_release(&self) {
-        let released = self.release.0.lock().expect("set-enabled pause mutex poisoned");
+        let released = self
+            .release
+            .0
+            .lock()
+            .expect("set-enabled pause mutex poisoned");
         let _released = self
             .release
             .1
@@ -138,9 +143,11 @@ impl ServerStore {
 
         let connection = spawn_blocking(move || -> Result<Connection, StoreError> {
             if let Some(directory) = directory {
-                std::fs::create_dir_all(&directory).map_err(|source| StoreError::CreateDirectory {
-                    path: directory,
-                    source,
+                std::fs::create_dir_all(&directory).map_err(|source| {
+                    StoreError::CreateDirectory {
+                        path: directory,
+                        source,
+                    }
                 })?;
             }
 
@@ -201,7 +208,10 @@ impl ServerStore {
         self.run(move |connection| {
             let transaction = connection.transaction()?;
             require_user(
-                transaction.execute("DELETE FROM users WHERE id = ?1", params![user_id.to_string()])?,
+                transaction.execute(
+                    "DELETE FROM users WHERE id = ?1",
+                    params![user_id.to_string()],
+                )?,
                 user_id,
             )?;
             transaction.commit()?;
@@ -261,9 +271,8 @@ impl ServerStore {
                     source,
                 })?;
                 let public_key: Vec<u8> = row.get(2)?;
-                let public_key: [u8; 32] = public_key
-                    .try_into()
-                    .map_err(|public_key: Vec<u8>| {
+                let public_key: [u8; 32] =
+                    public_key.try_into().map_err(|public_key: Vec<u8>| {
                         StoreError::InvalidPublicKeyLength(public_key.len())
                     })?;
                 let enabled: i64 = row.get(3)?;
@@ -274,10 +283,11 @@ impl ServerStore {
                 };
                 let upload: i64 = row.get(6)?;
                 let download: i64 = row.get(7)?;
-                let upload = u64::try_from(upload).map_err(|_| StoreError::InvalidStoredCounter {
-                    user_id: id,
-                    direction: "upload",
-                })?;
+                let upload =
+                    u64::try_from(upload).map_err(|_| StoreError::InvalidStoredCounter {
+                        user_id: id,
+                        direction: "upload",
+                    })?;
                 let download =
                     u64::try_from(download).map_err(|_| StoreError::InvalidStoredCounter {
                         user_id: id,
@@ -470,11 +480,9 @@ mod tests {
                 [],
                 |row| row.get(0),
             )?;
-            let counter_rows: i64 = connection.query_row(
-                "SELECT COUNT(*) FROM traffic_totals",
-                [],
-                |row| row.get(0),
-            )?;
+            let counter_rows: i64 =
+                connection
+                    .query_row("SELECT COUNT(*) FROM traffic_totals", [], |row| row.get(0))?;
             Ok::<_, rusqlite::Error>((journal_mode, schema_version, counter_rows))
         })
         .await
