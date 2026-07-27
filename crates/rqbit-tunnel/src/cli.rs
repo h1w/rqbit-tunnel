@@ -676,6 +676,16 @@ async fn read_server_settings_file(path: PathBuf) -> Result<Vec<u8>, CliError> {
 }
 
 fn read_server_settings_file_blocking(path: PathBuf) -> Result<Vec<u8>, SettingsFileError> {
+    read_server_settings_file_blocking_after_inspection(path, || {})
+}
+
+fn read_server_settings_file_blocking_after_inspection<F>(
+    path: PathBuf,
+    after_inspection: F,
+) -> Result<Vec<u8>, SettingsFileError>
+where
+    F: FnOnce(),
+{
     let inspected = fs::symlink_metadata(&path).map_err(|source| SettingsFileError::Inspect {
         path: path.clone(),
         source,
@@ -683,11 +693,12 @@ fn read_server_settings_file_blocking(path: PathBuf) -> Result<Vec<u8>, Settings
     if !inspected.file_type().is_file() {
         return Err(SettingsFileError::NotRegular { path });
     }
+    after_inspection();
 
     #[cfg(unix)]
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&path)
         .map_err(|source| SettingsFileError::Read {
             path: path.clone(),
@@ -923,6 +934,9 @@ mod tests {
     use std::{fs, io, path::PathBuf};
 
     #[cfg(unix)]
+    use std::{ffi::CString, os::unix::ffi::OsStrExt, time::Duration};
+
+    #[cfg(unix)]
     use super::RegisteredShutdownSignals;
 
     #[cfg(unix)]
@@ -937,7 +951,8 @@ mod tests {
     use super::{
         BundleExportStatus, Cli, CliError, Command, ControlError, ServerCommand,
         ServerSettingsCommand, ServerUsersCommand, SettingsFileError, bundle_export_diagnostics,
-        bundle_export_status, read_server_settings_file, render_json, unexpected_control_exit,
+        bundle_export_status, read_server_settings_file,
+        read_server_settings_file_blocking_after_inspection, render_json, unexpected_control_exit,
     };
 
     fn sample_user() -> UserSnapshot {
@@ -1045,6 +1060,47 @@ mod tests {
             error,
             CliError::SettingsFile(SettingsFileError::NotRegular { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn settings_reader_rejects_fifo_replaced_after_inspection_without_blocking() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        fs::write(&path, b"{}").unwrap();
+        let read_path = path.clone();
+        let replacement_path = path.clone();
+        let (ready, ready_signal) = tokio::sync::oneshot::channel();
+        let mut reader = tokio::task::spawn_blocking(move || {
+            read_server_settings_file_blocking_after_inspection(read_path, move || {
+                fs::remove_file(&replacement_path).unwrap();
+                let fifo_path = CString::new(replacement_path.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+                ready.send(()).unwrap();
+            })
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), ready_signal)
+            .await
+            .expect("reader must reach the post-inspection replacement hook")
+            .expect("replacement hook sender must stay connected");
+        let result = match tokio::time::timeout(Duration::from_millis(100), &mut reader).await {
+            Ok(joined) => joined.unwrap(),
+            Err(_) => {
+                let writer_path = path.clone();
+                let writer = tokio::task::spawn_blocking(move || {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(writer_path)
+                        .unwrap();
+                });
+                writer.await.unwrap();
+                reader.await.unwrap();
+                panic!("settings reader blocked while opening a substituted FIFO");
+            }
+        };
+
+        assert!(matches!(result, Err(SettingsFileError::NotRegular { .. })));
     }
 
     #[test]

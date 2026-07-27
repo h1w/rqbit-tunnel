@@ -349,6 +349,8 @@ pub enum TuiError {
     Terminal(#[from] io::Error),
     #[error("terminal event reader stopped unexpectedly")]
     EventReaderStopped,
+    #[error("terminal event reader task failed: {0}")]
+    EventReaderTask(#[source] tokio::task::JoinError),
     #[error("server returned an unexpected response: {0:?}")]
     UnexpectedResponse(ServerResponse),
 }
@@ -432,41 +434,90 @@ impl TuiShutdownSignals {
     }
 }
 
-fn terminal_event_reader() -> tokio::sync::mpsc::UnboundedReceiver<Result<KeyEvent, io::Error>> {
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    tokio::task::spawn_blocking(move || {
-        loop {
-            if sender.is_closed() {
-                break;
-            }
-            match event::poll(EVENT_TICK) {
-                Ok(true) => match event::read() {
-                    Ok(Event::Key(key)) => {
-                        if sender.send(Ok(key)).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        let _ = sender.send(Err(error));
-                        break;
-                    }
-                },
-                Ok(false) => {}
-                Err(error) => {
-                    let _ = sender.send(Err(error));
+type TerminalEvent = Result<KeyEvent, io::Error>;
+
+const TERMINAL_EVENT_QUEUE_CAPACITY: usize = 1;
+
+struct TerminalEventReader {
+    receiver: tokio::sync::mpsc::Receiver<TerminalEvent>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+fn terminal_event_channel() -> (
+    tokio::sync::mpsc::Sender<TerminalEvent>,
+    tokio::sync::mpsc::Receiver<TerminalEvent>,
+) {
+    tokio::sync::mpsc::channel(TERMINAL_EVENT_QUEUE_CAPACITY)
+}
+
+fn enqueue_terminal_event(
+    sender: &tokio::sync::mpsc::Sender<TerminalEvent>,
+    event: TerminalEvent,
+) -> bool {
+    match sender.try_send(event) {
+        Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => true,
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+    }
+}
+
+impl TerminalEventReader {
+    fn spawn() -> Self {
+        let (sender, receiver) = terminal_event_channel();
+        let task = tokio::task::spawn_blocking(move || {
+            loop {
+                if sender.is_closed() {
                     break;
                 }
+                match event::poll(EVENT_TICK) {
+                    Ok(true) => match event::read() {
+                        Ok(Event::Key(key)) => {
+                            if !enqueue_terminal_event(&sender, Ok(key)) {
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            let _ = enqueue_terminal_event(&sender, Err(error));
+                            break;
+                        }
+                    },
+                    Ok(false) => {}
+                    Err(error) => {
+                        let _ = enqueue_terminal_event(&sender, Err(error));
+                        break;
+                    }
+                }
             }
-        }
-    });
-    receiver
+        });
+        Self { receiver, task }
+    }
+
+    async fn recv(&mut self) -> Option<TerminalEvent> {
+        self.receiver.recv().await
+    }
+
+    async fn shutdown(mut self) -> Result<(), TuiError> {
+        self.receiver.close();
+        self.task.await.map_err(TuiError::EventReaderTask)
+    }
 }
 
 pub async fn run_server_tui(socket: PathBuf) -> Result<(), TuiError> {
     let mut signals = TuiShutdownSignals::register()?;
     let mut terminal = TerminalSession::enter()?;
-    let mut events = terminal_event_reader();
+    let mut events = TerminalEventReader::spawn();
+    let result = run_server_tui_loop(&socket, &mut terminal, &mut signals, &mut events).await;
+    let reader_shutdown = events.shutdown().await;
+    result?;
+    reader_shutdown
+}
+
+async fn run_server_tui_loop(
+    socket: &Path,
+    terminal: &mut TerminalSession,
+    signals: &mut TuiShutdownSignals,
+    events: &mut TerminalEventReader,
+) -> Result<(), TuiError> {
     let mut state = ServerTuiState::default();
     let mut previous_snapshot = None;
     let mut pending_reset_users = HashSet::new();
@@ -476,7 +527,7 @@ pub async fn run_server_tui(socket: PathBuf) -> Result<(), TuiError> {
     loop {
         if refresh_due || Instant::now() >= next_snapshot {
             match tokio::select! {
-                snapshot = fetch_server_snapshot(&socket) => Some(snapshot),
+                snapshot = fetch_server_snapshot(socket) => Some(snapshot),
                 _ = signals.wait() => None,
             } {
                 Some(Ok(snapshot)) => {
@@ -515,7 +566,7 @@ pub async fn run_server_tui(socket: PathBuf) -> Result<(), TuiError> {
                             _ => None,
                         };
                         match tokio::select! {
-                            action_result = execute_tui_action(&socket, action) => Some(action_result),
+                            action_result = execute_tui_action(socket, action) => Some(action_result),
                             _ = signals.wait() => None,
                         } {
                             Some(Ok(TuiLoop::Quit)) => break,
@@ -776,7 +827,8 @@ mod tests {
 
     use super::{
         Modal, ServerTuiState, TrafficRate, TuiAction, TuiError, apply_pending_reset_rates,
-        derive_rates, footer_height, key_code_for_event, rates_for_snapshot, require_terminal_io,
+        derive_rates, enqueue_terminal_event, footer_height, key_code_for_event,
+        rates_for_snapshot, require_terminal_io, terminal_event_channel,
     };
 
     #[cfg(unix)]
@@ -857,6 +909,21 @@ mod tests {
     #[tokio::test]
     async fn tui_shutdown_signals_register() {
         let _signals = TuiShutdownSignals::register().unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_event_queue_bounds_and_drops_congested_input() {
+        let (sender, mut receiver) = terminal_event_channel();
+        let first = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let second = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
+
+        assert!(enqueue_terminal_event(&sender, Ok(first)));
+        assert!(enqueue_terminal_event(&sender, Ok(second)));
+        assert_eq!(receiver.recv().await.unwrap().unwrap(), first);
+        assert!(receiver.try_recv().is_err());
+
+        receiver.close();
+        assert!(!enqueue_terminal_event(&sender, Ok(second)));
     }
 
     #[test]
