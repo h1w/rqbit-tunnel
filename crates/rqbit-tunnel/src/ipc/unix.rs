@@ -7,7 +7,9 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::UnixStream,
+    time::{Duration, timeout},
 };
+use tokio_util::sync::CancellationToken;
 
 use super::protocol::{
     MAX_FRAME_BYTES, ProtocolError, ServerRequest, ServerResponse, decode_request,
@@ -93,6 +95,59 @@ where
     write_frame(writer, &body).await
 }
 
+/// Writes a response, replacing an oversized normal payload with a small typed error.
+pub(crate) async fn write_bounded_response<W>(
+    writer: &mut W,
+    response: &ServerResponse,
+) -> Result<(), UnixControlError>
+where
+    W: AsyncWrite + Unpin,
+{
+    match write_response(writer, response).await {
+        Err(UnixControlError::Protocol(ProtocolError::EncodedFrameTooLarge { .. })) => {
+            write_response(writer, &response_too_large()).await
+        }
+        result => result,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ControlResponseWrite {
+    Written,
+    Cancelled,
+    TimedOut,
+}
+
+/// Writes a bounded response unless managed-server shutdown wins the race.
+pub(crate) async fn write_response_until_shutdown<W>(
+    writer: &mut W,
+    response: &ServerResponse,
+    shutdown: &CancellationToken,
+) -> Result<ControlResponseWrite, UnixControlError>
+where
+    W: AsyncWrite + Unpin,
+{
+    tokio::select! {
+        _ = shutdown.cancelled() => Ok(ControlResponseWrite::Cancelled),
+        result = write_bounded_response(writer, response) => result.map(|()| ControlResponseWrite::Written),
+    }
+}
+
+/// Writes a bounded response with a finite deadline for the shutdown acknowledgement path.
+pub(crate) async fn write_response_with_deadline<W>(
+    writer: &mut W,
+    response: &ServerResponse,
+    deadline: Duration,
+) -> Result<ControlResponseWrite, UnixControlError>
+where
+    W: AsyncWrite + Unpin,
+{
+    match timeout(deadline, write_bounded_response(writer, response)).await {
+        Ok(result) => result.map(|()| ControlResponseWrite::Written),
+        Err(_) => Ok(ControlResponseWrite::TimedOut),
+    }
+}
+
 async fn read_frame<R>(reader: &mut R) -> Result<Vec<u8>, UnixControlError>
 where
     R: AsyncRead + Unpin,
@@ -119,6 +174,11 @@ async fn write_frame<W>(writer: &mut W, body: &[u8]) -> Result<(), UnixControlEr
 where
     W: AsyncWrite + Unpin,
 {
+    if body.is_empty() || body.len() > MAX_FRAME_BYTES {
+        return Err(UnixControlError::Protocol(ProtocolError::EncodedFrameTooLarge {
+            length: body.len(),
+        }));
+    }
     let length = u32::try_from(body.len()).map_err(|_| {
         UnixControlError::Protocol(ProtocolError::EncodedFrameTooLarge { length: body.len() })
     })?;
@@ -132,13 +192,36 @@ where
         .map_err(UnixControlError::Write)
 }
 
+fn response_too_large() -> ServerResponse {
+    ServerResponse::Error(super::protocol::ServerError::new(
+        "response_too_large",
+        "The requested response exceeds the 64 KiB control-plane frame limit.",
+        "Narrow or page the query before retrying. If this command may have changed server state, inspect state before retrying.",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::UnixStream;
+    use std::{
+        io,
+        pin::Pin,
+        sync::Arc,
+        task::{Context, Poll},
+        time::Duration,
+    };
 
-    use super::{UnixControlError, read_request};
-    use crate::ipc::protocol::{ProtocolError, MAX_FRAME_BYTES};
+    use tokio::{
+        io::{AsyncWrite, AsyncWriteExt},
+        net::UnixStream,
+        sync::Notify,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    use super::{ControlResponseWrite, UnixControlError, read_request, write_response_until_shutdown};
+    use crate::{
+
+        ipc::protocol::{ProtocolError, ServerResponse, MAX_FRAME_BYTES},
+    };
 
     #[tokio::test]
     async fn request_reader_rejects_a_zero_length_frame_before_reading_a_body() {
@@ -187,5 +270,57 @@ mod tests {
             error,
             UnixControlError::Protocol(ProtocolError::UnsupportedProtocolVersion { received: 2 })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_stalled_response_write_is_cancelled_when_the_server_shuts_down() {
+        let started = Arc::new(Notify::new());
+        let cancellation = CancellationToken::new();
+        let mut writer = StalledWriter {
+            started: Arc::clone(&started),
+        };
+        let response = ServerResponse::Shutdown;
+        let writer_cancellation = cancellation.clone();
+        let response_write = tokio::spawn(async move {
+            write_response_until_shutdown(&mut writer, &response, &writer_cancellation).await
+        });
+
+        started.notified().await;
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), response_write)
+            .await
+            .expect("a cancelled response write must not block shutdown")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, ControlResponseWrite::Cancelled);
+    }
+
+    struct StalledWriter {
+        started: Arc<Notify>,
+    }
+
+    impl AsyncWrite for StalledWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.started.notify_one();
+            Poll::Pending
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
     }
 }

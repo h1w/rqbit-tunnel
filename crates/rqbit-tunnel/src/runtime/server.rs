@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -17,9 +17,12 @@ use librqbit::{
 use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::{Mutex, RwLock},
+    sync::{Mutex, RwLock, watch},
     task::{JoinHandle, JoinSet},
+    time::Duration,
 };
+#[cfg(test)]
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -28,7 +31,10 @@ use crate::{
         protocol::{
             ServerConfigResponse, ServerError, ServerRequest, ServerResponse,
         },
-        unix::{UnixControlError, read_request, write_response},
+        unix::{
+            UnixControlError, read_request, write_response_until_shutdown,
+            write_response_with_deadline,
+        },
     },
     model::{
         BUNDLE_SCHEMA_VERSION, EnrollmentBundle, ServerConfig, ServerConfigError,
@@ -183,6 +189,50 @@ pub enum ServerRuntimeError {
     },
     #[error("control server task failed: {0}")]
     ControlTask(#[from] tokio::task::JoinError),
+    #[error("managed server shutdown failed during {code:?}: {message}")]
+    SharedShutdownFailure {
+        code: ShutdownFailureCode,
+        message: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShutdownFailureCode {
+    Cleanup,
+    ControlTask,
+}
+
+#[derive(Clone, Debug)]
+enum SharedShutdownResult {
+    Completed,
+    Failed {
+        code: ShutdownFailureCode,
+        message: String,
+    },
+}
+
+impl SharedShutdownResult {
+    fn from_result(result: &Result<(), ServerRuntimeError>) -> Self {
+        match result {
+            Ok(()) => Self::Completed,
+            Err(error) => Self::Failed {
+                code: match error {
+                    ServerRuntimeError::ControlTask(_) => ShutdownFailureCode::ControlTask,
+                    _ => ShutdownFailureCode::Cleanup,
+                },
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn into_result(self) -> Result<(), ServerRuntimeError> {
+        match self {
+            Self::Completed => Ok(()),
+            Self::Failed { code, message } => {
+                Err(ServerRuntimeError::SharedShutdownFailure { code, message })
+            }
+        }
+    }
 }
 
 impl ServerRuntimeError {
@@ -223,7 +273,7 @@ impl ServerRuntimeError {
                 "server_runtime_error",
                 "Repair the local server runtime environment and restart the service.",
             ),
-            Self::ControlTask(_) => (
+            Self::ControlTask(_) | Self::SharedShutdownFailure { .. } => (
                 "server_runtime_error",
                 "Restart the managed server after the control task has stopped.",
             ),
@@ -233,20 +283,64 @@ impl ServerRuntimeError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SocketIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl SocketIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShutdownPhase {
+    Active,
+    ShuttingDown,
+}
+
+#[cfg(test)]
+struct ConfigAssignmentPause {
+    paused: Notify,
+    resumed: Notify,
+}
+
+#[cfg(test)]
+impl ConfigAssignmentPause {
+    async fn wait_until_paused(&self) {
+        self.paused.notified().await;
+    }
+
+    fn resume(&self) {
+        self.resumed.notify_one();
+    }
+}
+
 pub struct ManagedServer {
     inner: Arc<ManagedServerInner>,
     control_task: Mutex<Option<JoinHandle<Result<(), ServerRuntimeError>>>>,
+    shutdown_phase: Mutex<ShutdownPhase>,
+    shutdown_result: watch::Sender<Option<SharedShutdownResult>>,
 }
 
 struct ManagedServerInner {
     paths: ServerPaths,
     config: RwLock<ServerConfig>,
+    config_mutation: Mutex<()>,
     server_public_key: TunnelPublicKey,
     registry: Arc<UserRegistry>,
     session: Arc<Session>,
     shutdown: CancellationToken,
+    control_socket_identity: SocketIdentity,
     cleanup_gate: Mutex<()>,
     cleanup_complete: AtomicBool,
+    #[cfg(test)]
+    config_assignment_pause: Mutex<Option<Arc<ConfigAssignmentPause>>>,
 }
 
 impl ManagedServer {
@@ -287,7 +381,7 @@ impl ManagedServer {
             }
         };
 
-        let listener = match bind_control_socket(&paths.control_socket_path()) {
+        let (listener, control_socket_identity) = match bind_control_socket(&paths.control_socket_path()) {
             Ok(listener) => listener,
             Err(error) => {
                 session.stop().await;
@@ -298,31 +392,84 @@ impl ManagedServer {
         let inner = Arc::new(ManagedServerInner {
             paths,
             config: RwLock::new(config),
+            config_mutation: Mutex::new(()),
             server_public_key,
             registry,
             session,
             shutdown,
+            control_socket_identity,
             cleanup_gate: Mutex::new(()),
             cleanup_complete: AtomicBool::new(false),
+            #[cfg(test)]
+            config_assignment_pause: Mutex::new(None),
         });
         let control_task = tokio::spawn(serve_control_socket(listener, Arc::clone(&inner)));
+        let (shutdown_result, _) = watch::channel(None);
 
         Ok(Self {
             inner,
             control_task: Mutex::new(Some(control_task)),
+            shutdown_phase: Mutex::new(ShutdownPhase::Active),
+            shutdown_result,
         })
     }
 
     pub async fn shutdown(&self) -> Result<(), ServerRuntimeError> {
+        let mut result = self.shutdown_result.subscribe();
+        let leader = {
+            let mut phase = self.shutdown_phase.lock().await;
+            match *phase {
+                ShutdownPhase::Active => {
+                    *phase = ShutdownPhase::ShuttingDown;
+                    true
+                }
+                ShutdownPhase::ShuttingDown => false,
+            }
+        };
+
+        if leader {
+            let outcome = self.shutdown_once().await;
+            let shared = SharedShutdownResult::from_result(&outcome);
+            self.shutdown_result.send_replace(Some(shared));
+            return outcome;
+        }
+
+        loop {
+            if let Some(shared) = result.borrow().clone() {
+                return shared.into_result();
+            }
+            if result.changed().await.is_err() {
+                return Err(ServerRuntimeError::SharedShutdownFailure {
+                    code: ShutdownFailureCode::Cleanup,
+                    message: "the shutdown coordinator stopped before publishing a result".to_owned(),
+                });
+            }
+        }
+    }
+
+    async fn shutdown_once(&self) -> Result<(), ServerRuntimeError> {
         let cleanup_result = self.inner.cleanup().await;
         let control_task = self.control_task.lock().await.take();
         let task_result = match control_task {
-            Some(task) => task.await?,
+            Some(task) => match task.await {
+                Ok(result) => result,
+                Err(error) => Err(ServerRuntimeError::ControlTask(error)),
+            },
             None => Ok(()),
         };
 
         cleanup_result?;
         task_result
+    }
+
+    #[cfg(test)]
+    async fn wait_until_shutdown_started(&self) {
+        loop {
+            if matches!(*self.shutdown_phase.lock().await, ShutdownPhase::ShuttingDown) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
     }
 }
 
@@ -336,7 +483,10 @@ impl ManagedServerInner {
         self.shutdown.cancel();
         self.session.stop().await;
         let registry_result = self.registry.shutdown().await.map_err(ServerRuntimeError::Registry);
-        let socket_result = remove_control_socket(&self.paths.control_socket_path());
+        let socket_result = remove_owned_control_socket(
+            &self.paths.control_socket_path(),
+            self.control_socket_identity,
+        );
         self.cleanup_complete.store(true, Ordering::Release);
 
         registry_result?;
@@ -371,8 +521,12 @@ impl ManagedServerInner {
                 }))
             }
             ServerRequest::SetConfig { config } => {
+                let _mutation = self.config_mutation.lock().await;
                 config.validate().map_err(ConfigError::from)?;
-                let persistence = persist_server_config(self.paths.config_path(), config.clone()).await?;
+                let persistence =
+                    persist_server_config(self.paths.config_path(), config.clone()).await?;
+                #[cfg(test)]
+                self.pause_before_config_assignment().await;
                 *self.config.write().await = config.clone();
                 if let AtomicWriteOutcome::CommittedButUnsynced(source) = persistence {
                     return Err(ServerRuntimeError::Config(
@@ -385,6 +539,25 @@ impl ManagedServerInner {
                 }))
             }
             ServerRequest::Shutdown => unreachable!("shutdown is handled before command dispatch"),
+        }
+    }
+
+    #[cfg(test)]
+    async fn pause_next_config_assignment(&self) -> Arc<ConfigAssignmentPause> {
+        let pause = Arc::new(ConfigAssignmentPause {
+            paused: Notify::new(),
+            resumed: Notify::new(),
+        });
+        *self.config_assignment_pause.lock().await = Some(Arc::clone(&pause));
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_before_config_assignment(&self) {
+        let pause = { self.config_assignment_pause.lock().await.take() };
+        if let Some(pause) = pause {
+            pause.paused.notify_one();
+            pause.resumed.notified().await;
         }
     }
 
@@ -493,7 +666,12 @@ async fn serve_control_connection(
         result = read_request(stream) => match result {
             Ok(request) => request,
             Err(UnixControlError::Protocol(error)) => {
-                let _ = write_response(stream, &ServerResponse::Error(error.response())).await;
+                let _ = write_response_until_shutdown(
+                    stream,
+                    &ServerResponse::Error(error.response()),
+                    &inner.shutdown,
+                )
+                .await;
                 return Ok(false);
             }
             Err(_) => return Ok(false),
@@ -505,7 +683,7 @@ async fn serve_control_connection(
             Ok(()) => ServerResponse::Shutdown,
             Err(error) => ServerResponse::Error(error.response()),
         };
-        let _ = write_response(stream, &response).await;
+        let _ = write_response_with_deadline(stream, &response, Duration::from_secs(1)).await;
         return Ok(true);
     }
 
@@ -513,7 +691,7 @@ async fn serve_control_connection(
         Ok(response) => response,
         Err(error) => ServerResponse::Error(error.response()),
     };
-    let _ = write_response(stream, &response).await;
+    let _ = write_response_until_shutdown(stream, &response, &inner.shutdown).await;
     Ok(false)
 }
 
@@ -695,7 +873,7 @@ fn atomic_write_file(
     result
 }
 
-fn bind_control_socket(path: &Path) -> Result<UnixListener, ServerRuntimeError> {
+fn bind_control_socket(path: &Path) -> Result<(UnixListener, SocketIdentity), ServerRuntimeError> {
     let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).ok_or_else(|| {
         ServerRuntimeError::UnsafeControlSocketPath {
             path: path.to_path_buf(),
@@ -750,14 +928,25 @@ fn bind_control_socket(path: &Path) -> Result<UnixListener, ServerRuntimeError> 
         path: path.to_path_buf(),
         source,
     })?;
+    let metadata = fs::symlink_metadata(path).map_err(|source| ServerRuntimeError::ControlSocket {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_socket() {
+        return Err(ServerRuntimeError::UnsafeControlSocketPath {
+            path: path.to_path_buf(),
+            kind: socket_path_kind(&metadata),
+        });
+    }
+    let identity = SocketIdentity::from_metadata(&metadata);
     if let Err(source) = fs::set_permissions(path, fs::Permissions::from_mode(0o660)) {
-        let _ = remove_control_socket(path);
+        let _ = remove_owned_control_socket(path, identity);
         return Err(ServerRuntimeError::ControlSocket {
             path: path.to_path_buf(),
             source,
         });
     }
-    Ok(listener)
+    Ok((listener, identity))
 }
 
 fn remove_control_socket(path: &Path) -> Result<(), ServerRuntimeError> {
@@ -772,6 +961,29 @@ fn remove_control_socket(path: &Path) -> Result<(), ServerRuntimeError> {
             path: path.to_path_buf(),
             kind: socket_path_kind(&metadata),
         }),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(ServerRuntimeError::ControlSocket {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn remove_owned_control_socket(
+    path: &Path,
+    expected_identity: SocketIdentity,
+) -> Result<(), ServerRuntimeError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.file_type().is_socket()
+                && SocketIdentity::from_metadata(&metadata) == expected_identity =>
+        {
+            fs::remove_file(path).map_err(|source| ServerRuntimeError::ControlSocket {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+        Ok(_) => Ok(()),
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(ServerRuntimeError::ControlSocket {
             path: path.to_path_buf(),
@@ -840,11 +1052,16 @@ pub(crate) async fn spawn_test_server(socket: &Path) -> ManagedServer {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, path::Path, time::Duration};
+    use std::{
+        net::SocketAddr,
+        os::unix::fs::FileTypeExt,
+        path::Path,
+        sync::Arc,
+        time::Duration,
+    };
 
     use librqbit::tunnel_generate_keypair;
-    use tokio::net::UnixStream;
-
+    use tokio::net::{UnixListener, UnixStream};
     use crate::{
         ipc::{
             protocol::{ServerRequest, ServerResponse},
@@ -1138,6 +1355,170 @@ mod tests {
             .is_symlink());
     }
 
+    #[tokio::test]
+    async fn oversized_list_users_response_becomes_a_typed_bounded_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = test_paths(directory.path());
+        write_test_server_material(&paths).await;
+        let server = ManagedServer::start(paths.clone()).await.unwrap();
+
+        for index in 0..160 {
+            server
+                .inner
+                .registry
+                .create_user(format!("{index:04}-{}", "x".repeat(512)))
+                .await
+                .unwrap();
+        }
+
+        let response = request(&paths, ServerRequest::ListUsers).await;
+        match response {
+            ServerResponse::Error(error) => {
+                assert_eq!(error.code, "response_too_large");
+                assert!(error.recovery.contains("Narrow"));
+            }
+            other => panic!("expected a bounded typed response error, got {other:?}"),
+        }
+
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_config_updates_never_split_disk_and_memory_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = test_paths(directory.path());
+        write_test_server_material(&paths).await;
+        let server = ManagedServer::start(paths.clone()).await.unwrap();
+        let config_a = ServerConfig {
+            schema_version: SERVER_CONFIG_SCHEMA_VERSION,
+            peer_listen: SocketAddr::from(([127, 0, 0, 1], 4242)),
+            egress: ServerEgressConfig {
+                allow_private: true,
+                allow_loopback: false,
+                allow_link_local: false,
+                allow_multicast: false,
+            },
+            default_client_socks_listen: SocketAddr::from(([127, 0, 0, 1], 1081)),
+            default_client_carriers: 5,
+        };
+        let config_b = ServerConfig {
+            schema_version: SERVER_CONFIG_SCHEMA_VERSION,
+            peer_listen: SocketAddr::from(([127, 0, 0, 1], 4343)),
+            egress: ServerEgressConfig {
+                allow_private: false,
+                allow_loopback: true,
+                allow_link_local: false,
+                allow_multicast: false,
+            },
+            default_client_socks_listen: SocketAddr::from(([127, 0, 0, 1], 1082)),
+            default_client_carriers: 6,
+        };
+        let pause = server.inner.pause_next_config_assignment().await;
+        let first_socket = paths.control_socket_path();
+        let first = tokio::spawn(async move {
+            UnixControlClient::connect(first_socket)
+                .await
+                .unwrap()
+                .request(ServerRequest::SetConfig { config: config_a })
+                .await
+                .unwrap()
+        });
+
+        pause.wait_until_paused().await;
+        let second_socket = paths.control_socket_path();
+        let mut second = tokio::spawn(async move {
+            UnixControlClient::connect(second_socket)
+                .await
+                .unwrap()
+                .request(ServerRequest::SetConfig {
+                    config: config_b.clone(),
+                })
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second)
+                .await
+                .is_err(),
+            "the second update completed while the first persisted update was pending assignment"
+        );
+
+        pause.resume();
+        assert!(matches!(first.await.unwrap(), ServerResponse::Config(_)));
+        assert!(matches!(second.await.unwrap(), ServerResponse::Config(_)));
+        assert_eq!(
+            serde_json::from_slice::<ServerConfig>(&std::fs::read(paths.config_path()).unwrap())
+                .unwrap(),
+            ServerConfig {
+                schema_version: SERVER_CONFIG_SCHEMA_VERSION,
+                peer_listen: SocketAddr::from(([127, 0, 0, 1], 4343)),
+                egress: ServerEgressConfig {
+                    allow_private: false,
+                    allow_loopback: true,
+                    allow_link_local: false,
+                    allow_multicast: false,
+                },
+                default_client_socks_listen: SocketAddr::from(([127, 0, 0, 1], 1082)),
+                default_client_carriers: 6,
+            }
+        );
+        let response = request(&paths, ServerRequest::GetConfig).await;
+        assert!(matches!(
+            response,
+            ServerResponse::Config(response)
+                if response.config.peer_listen == SocketAddr::from(([127, 0, 0, 1], 4343))
+        ));
+
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_shutdown_waits_for_shared_completion() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = test_paths(directory.path());
+        write_test_server_material(&paths).await;
+        let server = Arc::new(ManagedServer::start(paths.clone()).await.unwrap());
+        let cleanup_gate = server.inner.cleanup_gate.lock().await;
+        let first_server = Arc::clone(&server);
+        let first = tokio::spawn(async move { first_server.shutdown().await });
+
+        server.wait_until_shutdown_started().await;
+        let second_server = Arc::clone(&server);
+        let mut second = Box::pin(async move { second_server.shutdown().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second)
+                .await
+                .is_err(),
+            "a concurrent shutdown returned before the shared shutdown completed"
+        );
+
+        drop(cleanup_gate);
+        first.await.unwrap().unwrap();
+        second.await.unwrap();
+        assert!(!paths.control_socket_path().exists());
+    }
+
+    #[tokio::test]
+    async fn shutdown_leaves_a_replacement_control_socket_untouched() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = test_paths(directory.path());
+        write_test_server_material(&paths).await;
+        let server = ManagedServer::start(paths.clone()).await.unwrap();
+        let socket = paths.control_socket_path();
+
+        std::fs::remove_file(&socket).unwrap();
+        let replacement = UnixListener::bind(&socket).unwrap();
+
+        server.shutdown().await.unwrap();
+        assert!(std::fs::symlink_metadata(&socket)
+            .unwrap()
+            .file_type()
+            .is_socket());
+
+        drop(replacement);
+        std::fs::remove_file(socket).unwrap();
+    }
     async fn request(paths: &ServerPaths, request: ServerRequest) -> ServerResponse {
         UnixControlClient::connect(&paths.control_socket_path())
             .await
