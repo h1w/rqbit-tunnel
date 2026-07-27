@@ -113,7 +113,7 @@ pub struct EnrollmentBundle {
 pub const BUNDLE_SCHEMA_VERSION: u32 = 1;
 ```
 
-`lib.rs` must publicly expose only `model`, `paths`, `registry`, `runtime`, `store`, and `ipc`; do not expose internal TUI state.
+In this task `lib.rs` publicly exposes only `model`, because the other public modules do not exist yet. Task 4 adds `paths`, `registry`, and `store`; Task 5 adds `runtime` and `ipc`. No task exposes internal TUI state.
 
 - [ ] **Step 5: Run the model test, format, and commit**
 
