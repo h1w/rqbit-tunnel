@@ -1,12 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
-    io,
+    io::{self, IsTerminal},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -306,6 +306,35 @@ fn bytes_per_second(bytes: u64, elapsed: Duration) -> u64 {
     u64::try_from(bytes_per_second).unwrap_or(u64::MAX)
 }
 
+fn rates_for_snapshot(
+    previous: Option<&(ServerSnapshot, Instant)>,
+    current: &ServerSnapshot,
+    completed_at: Instant,
+    pending_resets: &mut HashSet<Uuid>,
+) -> HashMap<Uuid, TrafficRate> {
+    let mut rates = previous
+        .map(|(snapshot, sampled_at)| {
+            derive_rates(
+                snapshot,
+                current,
+                completed_at.saturating_duration_since(*sampled_at),
+            )
+        })
+        .unwrap_or_default();
+    apply_pending_reset_rates(&mut rates, pending_resets, current);
+    rates
+}
+
+fn key_code_for_event(key: KeyEvent) -> Option<KeyCode> {
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Some(KeyCode::Char('q'));
+    }
+    Some(key.code)
+}
+
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 const EVENT_TICK: Duration = Duration::from_millis(250);
 const FOOTER: &str = "[a]dd [e]nable [d]isable [x] delete [r]eset [b]undle F5 q";
@@ -314,10 +343,22 @@ const FOOTER: &str = "[a]dd [e]nable [d]isable [x] delete [r]eset [b]undle F5 q"
 pub enum TuiError {
     #[error(transparent)]
     Control(#[from] ControlError),
+    #[error("server TUI requires both stdin and stdout to be terminals")]
+    NotTerminal,
     #[error("terminal I/O failed: {0}")]
     Terminal(#[from] io::Error),
+    #[error("terminal event reader stopped unexpectedly")]
+    EventReaderStopped,
     #[error("server returned an unexpected response: {0:?}")]
     UnexpectedResponse(ServerResponse),
+}
+
+fn require_terminal_io(stdin_is_terminal: bool, stdout_is_terminal: bool) -> Result<(), TuiError> {
+    if stdin_is_terminal && stdout_is_terminal {
+        Ok(())
+    } else {
+        Err(TuiError::NotTerminal)
+    }
 }
 
 struct TerminalSession {
@@ -325,12 +366,13 @@ struct TerminalSession {
 }
 
 impl TerminalSession {
-    fn enter() -> io::Result<Self> {
+    fn enter() -> Result<Self, TuiError> {
+        require_terminal_io(io::stdin().is_terminal(), io::stdout().is_terminal())?;
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         if let Err(error) = execute!(stdout, EnterAlternateScreen) {
             let _ = disable_raw_mode();
-            return Err(error);
+            return Err(TuiError::Terminal(error));
         }
 
         match Terminal::new(CrosstermBackend::new(stdout)) {
@@ -339,7 +381,7 @@ impl TerminalSession {
                 let mut stdout = io::stdout();
                 let _ = execute!(stdout, LeaveAlternateScreen);
                 let _ = disable_raw_mode();
-                Err(error)
+                Err(TuiError::Terminal(error))
             }
         }
     }
@@ -353,8 +395,78 @@ impl Drop for TerminalSession {
     }
 }
 
+#[cfg(unix)]
+struct TuiShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl TuiShutdownSignals {
+    fn register() -> Result<Self, TuiError> {
+        Ok(Self {
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+        })
+    }
+
+    async fn wait(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct TuiShutdownSignals;
+
+#[cfg(not(unix))]
+impl TuiShutdownSignals {
+    fn register() -> Result<Self, TuiError> {
+        Ok(Self)
+    }
+
+    async fn wait(&mut self) {
+        std::future::pending::<()>().await;
+    }
+}
+
+fn terminal_event_reader() -> tokio::sync::mpsc::UnboundedReceiver<Result<KeyEvent, io::Error>> {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    tokio::task::spawn_blocking(move || {
+        loop {
+            if sender.is_closed() {
+                break;
+            }
+            match event::poll(EVENT_TICK) {
+                Ok(true) => match event::read() {
+                    Ok(Event::Key(key)) => {
+                        if sender.send(Ok(key)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        break;
+                    }
+                },
+                Ok(false) => {}
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    break;
+                }
+            }
+        }
+    });
+    receiver
+}
+
 pub async fn run_server_tui(socket: PathBuf) -> Result<(), TuiError> {
+    let mut signals = TuiShutdownSignals::register()?;
     let mut terminal = TerminalSession::enter()?;
+    let mut events = terminal_event_reader();
     let mut state = ServerTuiState::default();
     let mut previous_snapshot = None;
     let mut pending_reset_users = HashSet::new();
@@ -363,25 +475,24 @@ pub async fn run_server_tui(socket: PathBuf) -> Result<(), TuiError> {
 
     loop {
         if refresh_due || Instant::now() >= next_snapshot {
-            let sampled_at = Instant::now();
-            match fetch_server_snapshot(&socket).await {
-                Ok(snapshot) => {
-                    let mut rates = previous_snapshot
-                        .as_ref()
-                        .map(|(previous, previous_at)| {
-                            derive_rates(
-                                previous,
-                                &snapshot,
-                                sampled_at.duration_since(*previous_at),
-                            )
-                        })
-                        .unwrap_or_default();
-                    apply_pending_reset_rates(&mut rates, &mut pending_reset_users, &snapshot);
+            match tokio::select! {
+                snapshot = fetch_server_snapshot(&socket) => Some(snapshot),
+                _ = signals.wait() => None,
+            } {
+                Some(Ok(snapshot)) => {
+                    let sampled_at = Instant::now();
+                    let rates = rates_for_snapshot(
+                        previous_snapshot.as_ref(),
+                        &snapshot,
+                        sampled_at,
+                        &mut pending_reset_users,
+                    );
                     state.apply_snapshot(snapshot.clone(), rates);
                     state.last_error = None;
                     previous_snapshot = Some((snapshot, sampled_at));
                 }
-                Err(error) => state.set_error(error.to_string()),
+                Some(Err(error)) => state.set_error(error.to_string()),
+                None => break,
             }
             refresh_due = false;
             next_snapshot = Instant::now() + SNAPSHOT_INTERVAL;
@@ -394,26 +505,35 @@ pub async fn run_server_tui(socket: PathBuf) -> Result<(), TuiError> {
         let wait = next_snapshot
             .saturating_duration_since(Instant::now())
             .min(EVENT_TICK);
-        if event::poll(wait)? {
-            if let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-                && let Some(action) = state.handle_key(key.code)
-            {
-                let reset_user = match &action {
-                    TuiAction::ResetTraffic(id) => Some(*id),
-                    _ => None,
-                };
-                match execute_tui_action(&socket, action).await {
-                    Ok(TuiLoop::Quit) => break,
-                    Ok(TuiLoop::Continue) => {
-                        if let Some(id) = reset_user {
-                            pending_reset_users.insert(id);
+        tokio::select! {
+            _ = signals.wait() => break,
+            event = events.recv() => match event {
+                Some(Ok(key)) => {
+                    if let Some(action) = key_code_for_event(key).and_then(|key| state.handle_key(key)) {
+                        let reset_user = match &action {
+                            TuiAction::ResetTraffic(id) => Some(*id),
+                            _ => None,
+                        };
+                        match tokio::select! {
+                            action_result = execute_tui_action(&socket, action) => Some(action_result),
+                            _ = signals.wait() => None,
+                        } {
+                            Some(Ok(TuiLoop::Quit)) => break,
+                            Some(Ok(TuiLoop::Continue)) => {
+                                if let Some(id) = reset_user {
+                                    pending_reset_users.insert(id);
+                                }
+                                refresh_due = true;
+                            }
+                            Some(Err(error)) => state.set_error(error.to_string()),
+                            None => break,
                         }
-                        refresh_due = true;
                     }
-                    Err(error) => state.set_error(error.to_string()),
                 }
-            }
+                Some(Err(error)) => return Err(TuiError::Terminal(error)),
+                None => return Err(TuiError::EventReaderStopped),
+            },
+            _ = tokio::time::sleep(wait) => {}
         }
 
         if state.should_quit {
@@ -493,10 +613,14 @@ async fn execute_tui_action(socket: &Path, action: TuiAction) -> Result<TuiLoop,
     }
 }
 
+fn footer_height(state: &ServerTuiState) -> u16 {
+    if state.last_error.is_some() { 4 } else { 3 }
+}
+
 fn render_server(frame: &mut ratatui::Frame, state: &ServerTuiState) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(4), Constraint::Length(3)])
+        .constraints([Constraint::Min(4), Constraint::Length(footer_height(state))])
         .split(frame.area());
     let header = Row::new([
         "Name",
@@ -640,17 +764,23 @@ fn format_bytes(bytes: u64) -> String {
     }
     format!("{value} {}", UNITS[unit])
 }
-
 #[cfg(test)]
 mod tests {
-    use crossterm::event::KeyCode;
-    use std::{collections::HashSet, time::Duration};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::{
+        collections::HashSet,
+        time::{Duration, Instant},
+    };
 
     use crate::model::{ServerSnapshot, TrafficTotals, UserSnapshot};
 
     use super::{
-        Modal, ServerTuiState, TrafficRate, TuiAction, apply_pending_reset_rates, derive_rates,
+        Modal, ServerTuiState, TrafficRate, TuiAction, TuiError, apply_pending_reset_rates,
+        derive_rates, footer_height, key_code_for_event, rates_for_snapshot, require_terminal_io,
     };
+
+    #[cfg(unix)]
+    use super::TuiShutdownSignals;
 
     fn sample_user() -> UserSnapshot {
         UserSnapshot {
@@ -698,6 +828,71 @@ mod tests {
             Some(TuiAction::Delete(user.id))
         );
         assert_eq!(state.users.len(), 1);
+    }
+
+    #[test]
+    fn footer_reserves_an_interior_error_row() {
+        let mut state = ServerTuiState::default();
+        assert_eq!(footer_height(&state), 3);
+
+        state.set_error("control socket unavailable");
+
+        assert_eq!(footer_height(&state), 4);
+    }
+
+    #[test]
+    fn terminal_setup_requires_stdin_and_stdout_terminals() {
+        assert!(matches!(
+            require_terminal_io(false, true),
+            Err(TuiError::NotTerminal)
+        ));
+        assert!(matches!(
+            require_terminal_io(true, false),
+            Err(TuiError::NotTerminal)
+        ));
+        assert!(require_terminal_io(true, true).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tui_shutdown_signals_register() {
+        let _signals = TuiShutdownSignals::register().unwrap();
+    }
+
+    #[test]
+    fn ctrl_c_key_requests_tui_quit() {
+        assert_eq!(
+            key_code_for_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(KeyCode::Char('q'))
+        );
+    }
+
+    #[test]
+    fn rates_use_completed_snapshot_time_not_request_start_time() {
+        let id = uuid::Uuid::from_u128(11);
+        let requested_at = Instant::now();
+        let completed_at = requested_at + Duration::from_secs(2);
+        let previous = (
+            ServerSnapshot {
+                users: vec![user(id, 0, 0)],
+            },
+            requested_at,
+        );
+        let current = ServerSnapshot {
+            users: vec![user(id, 100, 100)],
+        };
+        let mut pending_resets = HashSet::new();
+
+        let rates =
+            rates_for_snapshot(Some(&previous), &current, completed_at, &mut pending_resets);
+
+        assert_eq!(
+            rates.get(&id),
+            Some(&TrafficRate {
+                upload_per_second: 50,
+                download_per_second: 50,
+            })
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::{
     ffi::{OsStr, OsString},
-    io::{self, IsTerminal, Write},
+    fs::{self, OpenOptions},
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -8,6 +9,9 @@ use clap::{Arg, ArgAction, ArgMatches, Command as ClapCommand, error::ErrorKind}
 use serde::Serialize;
 use thiserror::Error;
 use uuid::Uuid;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 #[cfg(unix)]
 use crate::ipc::unix::{UnixControlClient, UnixControlError};
@@ -409,6 +413,28 @@ pub(crate) async fn request_server(
     }
 }
 
+const MAX_SERVER_SETTINGS_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug, Error)]
+pub enum SettingsFileError {
+    #[error("failed to inspect server settings file {path}: {source}")]
+    Inspect {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("server settings input must be a regular, non-symlink file: {path}")]
+    NotRegular { path: PathBuf },
+    #[error("server settings file {path} exceeds the {limit}-byte limit")]
+    TooLarge { path: PathBuf, limit: u64 },
+    #[error("failed to read server settings file {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+}
+
 #[derive(Debug, Error)]
 pub enum CliError {
     #[error(transparent)]
@@ -419,12 +445,10 @@ pub enum CliError {
     Tui(#[from] TuiError),
     #[error("server configuration path must be named server.json: {path}")]
     UnsupportedConfigPath { path: PathBuf },
-    #[error("failed to read server settings from {path}: {source}")]
-    ReadSettings {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
+    #[error(transparent)]
+    SettingsFile(#[from] SettingsFileError),
+    #[error("settings file reader task failed: {0}")]
+    SettingsReadTask(#[source] tokio::task::JoinError),
     #[error("server settings in {path} are not valid JSON: {source}")]
     DecodeSettings {
         path: PathBuf,
@@ -443,6 +467,8 @@ pub enum CliError {
     ConfirmationDeclined,
     #[error("failed to wait for a shutdown signal: {0}")]
     Signal(#[source] io::Error),
+    #[error("managed server control socket exited unexpectedly")]
+    ControlExited,
     #[error("server returned an unexpected response while expecting {expected}: {received:?}")]
     UnexpectedResponse {
         expected: &'static str,
@@ -477,9 +503,15 @@ async fn run_server(options: ServerRunOptions) -> Result<(), CliError> {
     {
         let mut signals = RegisteredShutdownSignals::register()?;
         let server = ManagedServer::start(server_paths_from_config(&options.config)?).await?;
-        signals.wait().await;
+        let control_exit = tokio::select! {
+            _ = signals.wait() => None,
+            result = server.wait_for_control_exit() => Some(result),
+        };
         server.shutdown().await?;
-        Ok(())
+        match control_exit {
+            Some(result) => unexpected_control_exit(result),
+            None => Ok(()),
+        }
     }
 
     #[cfg(not(unix))]
@@ -512,6 +544,11 @@ impl RegisteredShutdownSignals {
             _ = self.terminate.recv() => {}
         }
     }
+}
+
+fn unexpected_control_exit(control_exit: Result<(), ServerRuntimeError>) -> Result<(), CliError> {
+    control_exit?;
+    Err(CliError::ControlExited)
 }
 
 fn server_paths_from_config(config: &Path) -> Result<ServerPaths, CliError> {
@@ -568,14 +605,14 @@ async fn execute_users(socket: PathBuf, command: ServerUsersCommand) -> Result<(
             {
                 Ok(response) => response,
                 Err(error) => {
-                    if is_bundle_durability_uncertain(&error) {
-                        emit_bundle_export_diagnostics(&export, true);
+                    if let Some(status) = bundle_export_status(&error) {
+                        emit_bundle_export_diagnostics(&export, status);
                     }
                     return Err(error.into());
                 }
             };
             let user = expect_user(response)?;
-            emit_bundle_export_diagnostics(&export, false);
+            emit_bundle_export_diagnostics(&export, BundleExportStatus::Written);
             emit_user(&user, json)
         }
         ServerUsersCommand::Enable { id, json } => {
@@ -616,10 +653,7 @@ async fn execute_settings(socket: PathBuf, command: ServerSettingsCommand) -> Re
             emit_settings(&settings, json)
         }
         ServerSettingsCommand::Set { config, json } => {
-            let contents = std::fs::read(&config).map_err(|source| CliError::ReadSettings {
-                path: config.clone(),
-                source,
-            })?;
+            let contents = read_server_settings_file(config.clone()).await?;
             let settings = serde_json::from_slice::<ServerConfig>(&contents).map_err(|source| {
                 CliError::DecodeSettings {
                     path: config.clone(),
@@ -632,6 +666,71 @@ async fn execute_settings(socket: PathBuf, command: ServerSettingsCommand) -> Re
             emit_settings(&updated, json)
         }
     }
+}
+
+async fn read_server_settings_file(path: PathBuf) -> Result<Vec<u8>, CliError> {
+    tokio::task::spawn_blocking(move || read_server_settings_file_blocking(path))
+        .await
+        .map_err(CliError::SettingsReadTask)?
+        .map_err(CliError::SettingsFile)
+}
+
+fn read_server_settings_file_blocking(path: PathBuf) -> Result<Vec<u8>, SettingsFileError> {
+    let inspected = fs::symlink_metadata(&path).map_err(|source| SettingsFileError::Inspect {
+        path: path.clone(),
+        source,
+    })?;
+    if !inspected.file_type().is_file() {
+        return Err(SettingsFileError::NotRegular { path });
+    }
+
+    #[cfg(unix)]
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|source| SettingsFileError::Read {
+            path: path.clone(),
+            source,
+        })?;
+    #[cfg(not(unix))]
+    let file = OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .map_err(|source| SettingsFileError::Read {
+            path: path.clone(),
+            source,
+        })?;
+
+    let metadata = file.metadata().map_err(|source| SettingsFileError::Read {
+        path: path.clone(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(SettingsFileError::NotRegular { path });
+    }
+    if metadata.len() > MAX_SERVER_SETTINGS_BYTES {
+        return Err(SettingsFileError::TooLarge {
+            path,
+            limit: MAX_SERVER_SETTINGS_BYTES,
+        });
+    }
+
+    let mut contents = Vec::with_capacity(metadata.len() as usize);
+    let mut reader = file.take(MAX_SERVER_SETTINGS_BYTES + 1);
+    reader
+        .read_to_end(&mut contents)
+        .map_err(|source| SettingsFileError::Read {
+            path: path.clone(),
+            source,
+        })?;
+    if contents.len() as u64 > MAX_SERVER_SETTINGS_BYTES {
+        return Err(SettingsFileError::TooLarge {
+            path,
+            limit: MAX_SERVER_SETTINGS_BYTES,
+        });
+    }
+    Ok(contents)
 }
 
 async fn list_users(socket: &Path) -> Result<Vec<UserSnapshot>, CliError> {
@@ -710,33 +809,50 @@ fn confirm_mutation(yes: bool, prompt: &str) -> Result<(), CliError> {
     }
 }
 
-fn is_bundle_durability_uncertain(error: &ControlError) -> bool {
-    matches!(
-        error,
-        ControlError::Server { code, .. } if code == "bundle_durability_uncertain"
-    )
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BundleExportStatus {
+    Written,
+    TransportUncertain,
+    DurabilityUncertain,
 }
 
-fn bundle_export_diagnostics(export: &Path, durability_uncertain: bool) -> [String; 2] {
-    let destination = if durability_uncertain {
-        format!(
-            "Enrollment bundle destination may contain the bundle: {}",
-            export.display()
-        )
-    } else {
-        format!("Enrollment bundle written to {}", export.display())
-    };
-    let warning = if durability_uncertain {
-        "WARNING: this bundle contains an unencrypted client secret; its durability is uncertain, so inspect the destination before retrying.".to_owned()
-    } else {
-        "WARNING: this bundle contains an unencrypted client secret; protect it until import."
-            .to_owned()
-    };
-    [destination, warning]
+fn bundle_export_status(error: &ControlError) -> Option<BundleExportStatus> {
+    match error {
+        #[cfg(unix)]
+        ControlError::Unix(_) => Some(BundleExportStatus::TransportUncertain),
+        ControlError::Server { code, .. } if code == "bundle_durability_uncertain" => {
+            Some(BundleExportStatus::DurabilityUncertain)
+        }
+        _ => None,
+    }
 }
 
-fn emit_bundle_export_diagnostics(export: &Path, durability_uncertain: bool) {
-    for diagnostic in bundle_export_diagnostics(export, durability_uncertain) {
+fn bundle_export_diagnostics(export: &Path, status: BundleExportStatus) -> [String; 2] {
+    match status {
+        BundleExportStatus::Written => [
+            format!("Enrollment bundle written to {}", export.display()),
+            "WARNING: this bundle contains an unencrypted client secret; protect it until import."
+                .to_owned(),
+        ],
+        BundleExportStatus::TransportUncertain => [
+            format!(
+                "Enrollment bundle may have been created at {}",
+                export.display()
+            ),
+            "WARNING: control transport failed after dispatch; an unencrypted client secret may have been created. Inspect the destination before retrying.".to_owned(),
+        ],
+        BundleExportStatus::DurabilityUncertain => [
+            format!(
+                "Enrollment bundle destination may contain the bundle: {}",
+                export.display()
+            ),
+            "WARNING: this bundle contains an unencrypted client secret; its durability is uncertain, so inspect the destination before retrying.".to_owned(),
+        ],
+    }
+}
+
+fn emit_bundle_export_diagnostics(export: &Path, status: BundleExportStatus) {
+    for diagnostic in bundle_export_diagnostics(export, status) {
         eprintln!("{diagnostic}");
     }
 }
@@ -803,8 +919,14 @@ fn format_user(user: &UserSnapshot) -> String {
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    use std::{fs, io, path::PathBuf};
+
+    #[cfg(unix)]
     use super::RegisteredShutdownSignals;
 
+    #[cfg(unix)]
+    use crate::ipc::unix::UnixControlError;
     use std::path::Path;
 
     use crate::{
@@ -813,8 +935,9 @@ mod tests {
     };
 
     use super::{
-        Cli, Command, ControlError, ServerCommand, ServerSettingsCommand, ServerUsersCommand,
-        bundle_export_diagnostics, is_bundle_durability_uncertain, render_json,
+        BundleExportStatus, Cli, CliError, Command, ControlError, ServerCommand,
+        ServerSettingsCommand, ServerUsersCommand, SettingsFileError, bundle_export_diagnostics,
+        bundle_export_status, read_server_settings_file, render_json, unexpected_control_exit,
     };
 
     fn sample_user() -> UserSnapshot {
@@ -850,16 +973,78 @@ mod tests {
             recovery: "inspect the destination".to_owned(),
         };
 
-        assert!(is_bundle_durability_uncertain(&error));
-        let diagnostics = bundle_export_diagnostics(Path::new("/secure/alice.bundle"), true);
+        assert_eq!(
+            bundle_export_status(&error),
+            Some(BundleExportStatus::DurabilityUncertain)
+        );
+        let diagnostics = bundle_export_diagnostics(
+            Path::new("/secure/alice.bundle"),
+            BundleExportStatus::DurabilityUncertain,
+        );
         assert!(diagnostics[0].contains("/secure/alice.bundle"));
         assert!(diagnostics[1].contains("unencrypted client secret"));
+        assert!(diagnostics[1].contains("durability is uncertain"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transport_uncertain_bundle_diagnostics_warn_before_error_propagates() {
+        let error = ControlError::Unix(UnixControlError::Read(io::Error::other("peer closed")));
+
+        assert_eq!(
+            bundle_export_status(&error),
+            Some(BundleExportStatus::TransportUncertain)
+        );
+        let diagnostics = bundle_export_diagnostics(
+            Path::new("/secure/alice.bundle"),
+            BundleExportStatus::TransportUncertain,
+        );
+        assert!(diagnostics[0].contains("/secure/alice.bundle"));
+        assert!(diagnostics[1].contains("unencrypted client secret may have been created"));
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn registers_server_shutdown_signals() {
         let _signals = RegisteredShutdownSignals::register().unwrap();
+    }
+
+    #[test]
+    fn clean_control_exit_is_an_error_for_the_foreground_server() {
+        assert!(matches!(
+            unexpected_control_exit(Ok(())),
+            Err(CliError::ControlExited)
+        ));
+    }
+
+    #[tokio::test]
+    async fn settings_reader_rejects_a_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = read_server_settings_file(directory.path().to_path_buf())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::SettingsFile(SettingsFileError::NotRegular { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn settings_reader_rejects_a_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("settings.json");
+        fs::write(&target, b"{}").unwrap();
+        let link = directory.path().join("settings-link.json");
+        symlink(&target, &link).unwrap();
+
+        let error = read_server_settings_file(PathBuf::from(&link))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::SettingsFile(SettingsFileError::NotRegular { .. })
+        ));
     }
 
     #[test]

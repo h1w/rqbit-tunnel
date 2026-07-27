@@ -472,6 +472,7 @@ struct ShutdownCoordinator {
     control_task: Mutex<Option<JoinHandle<Result<(), ServerRuntimeError>>>>,
     phase: Mutex<ShutdownPhase>,
     result: watch::Sender<Option<SharedShutdownResult>>,
+    control_exit: watch::Sender<Option<SharedShutdownResult>>,
     #[cfg(test)]
     started: AtomicBool,
     #[cfg(test)]
@@ -590,15 +591,22 @@ impl ManagedServer {
             #[cfg(test)]
             config_assignment_pause: Mutex::new(None),
         });
-        let control_task = tokio::spawn(serve_control_socket(listener, Arc::clone(&inner)));
         let (result, _) = watch::channel(None);
-
+        let (control_exit, _) = watch::channel(None);
+        let control_exit_sender = control_exit.clone();
+        let control_inner = Arc::clone(&inner);
+        let control_task = tokio::spawn(async move {
+            let outcome = serve_control_socket(listener, control_inner).await;
+            control_exit_sender.send_replace(Some(SharedShutdownResult::from_result(&outcome)));
+            outcome
+        });
         Ok(Self {
             coordinator: Arc::new(ShutdownCoordinator {
                 inner,
                 control_task: Mutex::new(Some(control_task)),
                 phase: Mutex::new(ShutdownPhase::Active),
                 result,
+                control_exit,
                 #[cfg(test)]
                 started: AtomicBool::new(false),
                 #[cfg(test)]
@@ -609,6 +617,12 @@ impl ManagedServer {
 
     pub async fn shutdown(&self) -> Result<(), ServerRuntimeError> {
         self.coordinator.request_shutdown().await
+    }
+
+    /// Waits until the managed control socket exits, whether it stopped cleanly
+    /// (for example after an IPC shutdown request) or failed.
+    pub async fn wait_for_control_exit(&self) -> Result<(), ServerRuntimeError> {
+        self.coordinator.wait_for_control_exit().await
     }
 
     #[cfg(test)]
@@ -646,6 +660,22 @@ impl ShutdownCoordinator {
                 return Err(ServerRuntimeError::SharedShutdownFailure {
                     code: ShutdownFailureCode::Cleanup,
                     message: "the shutdown coordinator stopped before publishing a result"
+                        .to_owned(),
+                });
+            }
+        }
+    }
+
+    async fn wait_for_control_exit(&self) -> Result<(), ServerRuntimeError> {
+        let mut control_exit = self.control_exit.subscribe();
+        loop {
+            if let Some(shared) = control_exit.borrow().clone() {
+                return shared.into_result();
+            }
+            if control_exit.changed().await.is_err() {
+                return Err(ServerRuntimeError::SharedShutdownFailure {
+                    code: ShutdownFailureCode::ControlTask,
+                    message: "the managed control socket stopped without publishing an exit result"
                         .to_owned(),
                 });
             }
@@ -1711,6 +1741,10 @@ mod tests {
 
         assert!(matches!(response, ServerResponse::Shutdown));
         assert!(!paths.control_socket_path().exists());
+        tokio::time::timeout(Duration::from_millis(100), server.wait_for_control_exit())
+            .await
+            .expect("IPC shutdown must wake the control-exit observer")
+            .unwrap();
         server.shutdown().await.unwrap();
     }
 
