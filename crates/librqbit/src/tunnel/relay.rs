@@ -791,6 +791,7 @@ async fn retire_finished_tcp_entry(
     if let Some(entry) = entry {
         entry.send_credit.close();
         entry.shutdown.cancel();
+        entry.idle.shutdown().await;
     }
     removed
 }
@@ -1009,9 +1010,11 @@ pub(crate) async fn run_server_relay(
                 .await;
             }
             TunnelFrame::TcpReset { stream_id, .. } => {
-                if let Some(entry) = tcp.lock().await.remove(&stream_id) {
+                let entry = { tcp.lock().await.remove(&stream_id) };
+                if let Some(entry) = entry {
                     entry.send_credit.close();
                     entry.shutdown.cancel();
+                    entry.idle.shutdown().await;
                 }
             }
             TunnelFrame::OpenUdp { association_id } => {
@@ -1092,8 +1095,10 @@ pub(crate) async fn run_server_relay(
                 }
             }
             TunnelFrame::CloseUdp { association_id } => {
-                if let Some(entry) = udp.lock().await.remove(&association_id) {
+                let entry = { udp.lock().await.remove(&association_id) };
+                if let Some(entry) = entry {
                     entry.shutdown.cancel();
+                    entry.idle.shutdown().await;
                 }
             }
             TunnelFrame::Ping { nonce } => {
@@ -1118,12 +1123,16 @@ pub(crate) async fn run_server_relay(
     // Peer gone or cancellation fired: cancel every descendant before joining
     // it, so no relay task can account payload after this function returns.
     relay_shutdown.cancel();
-    for (_, entry) in tcp.lock().await.drain() {
+    let tcp_entries: Vec<_> = tcp.lock().await.drain().map(|(_, entry)| entry).collect();
+    for entry in tcp_entries {
         entry.send_credit.close();
         entry.shutdown.cancel();
+        entry.idle.shutdown().await;
     }
-    for (_, entry) in udp.lock().await.drain() {
+    let udp_entries: Vec<_> = udp.lock().await.drain().map(|(_, entry)| entry).collect();
+    for entry in udp_entries {
         entry.shutdown.cancel();
+        entry.idle.shutdown().await;
     }
     while let Some(result) = descendants.join_next().await {
         if let Err(error) = result {
@@ -1562,7 +1571,9 @@ mod tests {
 
 
     use super::super::carrier::{TunnelCarrierConfig, TunnelCarrierStore};
-    use super::super::carrier_chunk::{CarrierDefragmenter, MAX_CARRIER_CIPHERTEXT};
+    use super::super::carrier_chunk::{
+        CarrierDefragmenter, MAX_CARRIER_CIPHERTEXT, chunk_ciphertext, recv_one_ciphertext,
+    };
     use super::super::carrier_peer::TunnelCarrierPeer;
     use super::super::carrier_wire::{CarrierReadHalf, CarrierWire, CarrierWriteHalf};
     use super::super::config::PACING_DEFAULT_RATE;
@@ -2407,5 +2418,105 @@ mod tests {
             .await
             .expect("destination reset task must not panic");
         assert!(token.is_cancelled(), "stream tears down only after its reset is sent");
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn relay_shutdown_joins_idle_watchdog() {
+        let (exit_gate, _clear_exit_gate) =
+            super::super::flow::install_idle_guard_exit_gate();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind destination listener");
+        let destination_addr = listener
+            .local_addr()
+            .expect("destination listener address");
+        let (close_destination, wait_for_close) = tokio::sync::oneshot::channel();
+        let destination = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept destination connection");
+            wait_for_close
+                .await
+                .expect("close destination connection");
+            drop(stream);
+        });
+
+        let (mut client_transport, server_transport) = handshake_pair();
+        let (
+            (mut client_read, mut client_write, _client_peer),
+            (server_read, server_write, server_peer),
+        ) = carrier_test_pair().await;
+        let shutdown = CancellationToken::new();
+        let session: Arc<dyn TunnelServerSession> = Arc::new(RecordingSession::new());
+        let mut relay = tokio::spawn(run_server_relay(
+            AdmittedPeer {
+                client_key: TunnelPublicKey([0; 32]),
+                session,
+                transport: server_transport,
+                read_half: server_read,
+                write_half: server_write,
+                carrier_peer: server_peer,
+            },
+            Arc::new(EgressPolicy {
+                idle_timeout: Duration::from_secs(60),
+                ..EgressPolicy::default()
+            }),
+            shutdown.clone(),
+        ));
+
+        let open = client_transport
+            .encrypt(&TunnelFrame::OpenTcp {
+                stream_id: 7,
+                host: "127.0.0.1".to_owned(),
+                port: destination_addr.port(),
+            })
+            .expect("encrypt OpenTcp");
+        for chunk in chunk_ciphertext(&open) {
+            client_write
+                .send_tunnel(&chunk)
+                .await
+                .expect("send OpenTcp");
+        }
+
+        let mut defrag = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
+        let opened = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let ciphertext = recv_one_ciphertext(&mut client_read, &mut defrag)
+                    .await
+                    .expect("server must respond over the carrier");
+                let frame = client_transport
+                    .decrypt(&ciphertext)
+                    .expect("decrypt server response");
+                if matches!(frame, TunnelFrame::TcpOpened { stream_id: 7, .. }) {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("TcpOpened must prove the relay created its stream watchdog");
+        assert!(matches!(
+            opened,
+            TunnelFrame::TcpOpened { stream_id: 7, .. }
+        ));
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), exit_gate.wait_until_entered())
+            .await
+            .expect("idle watchdog must observe relay cancellation");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut relay)
+                .await
+                .is_err(),
+            "relay shutdown must wait for its idle watchdog to exit"
+        );
+
+        exit_gate.release();
+        tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .expect("relay shutdown must finish after watchdog exit")
+            .expect("relay task must not panic");
+        close_destination
+            .send(())
+            .expect("release destination connection");
+        destination
+            .await
+            .expect("destination task must not panic");
     }
 }

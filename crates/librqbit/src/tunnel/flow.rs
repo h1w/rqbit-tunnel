@@ -22,7 +22,10 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::cell::RefCell;
 
+use futures::future::{BoxFuture, FutureExt, Shared};
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -93,13 +96,71 @@ impl Default for SendCredit {
     }
 }
 
+// Test-only deterministic barrier for proving a relay joins its watchdog. The
+// regression uses a current-thread runtime, so spawned watchdogs capture it.
+#[cfg(test)]
+thread_local! {
+    static IDLE_GUARD_EXIT_GATE: RefCell<Option<IdleGuardExitGate>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct IdleGuardExitGate {
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+#[cfg(test)]
+impl IdleGuardExitGate {
+    pub(crate) async fn wait_until_entered(&self) {
+        self.entered
+            .acquire()
+            .await
+            .expect("idle guard exit gate is never closed")
+            .forget();
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct IdleGuardExitGateReset;
+
+#[cfg(test)]
+impl Drop for IdleGuardExitGateReset {
+    fn drop(&mut self) {
+        IDLE_GUARD_EXIT_GATE.with(|gate| *gate.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_idle_guard_exit_gate() -> (IdleGuardExitGate, IdleGuardExitGateReset) {
+    let gate = IdleGuardExitGate {
+        entered: Arc::new(Semaphore::new(0)),
+        release: Arc::new(Semaphore::new(0)),
+    };
+    IDLE_GUARD_EXIT_GATE.with(|slot| *slot.borrow_mut() = Some(gate.clone()));
+    (gate, IdleGuardExitGateReset)
+}
+
 // ── Bidirectional idle watchdog ─────────────────────────────────────────────
 
 /// Cancels `token` if no activity is reported for `idle`. Any direction of a
-/// stream reports activity via [`poke`](Self::poke).
+/// stream reports activity via [`poke`](Self::poke). Owners must
+/// [`shutdown`](Self::shutdown) it when removing the stream so its watchdog is
+/// cancelled and joined.
 #[derive(Clone)]
 pub(crate) struct IdleGuard {
     notify: Arc<Notify>,
+    shutdown: CancellationToken,
+    task: Arc<IdleGuardTask>,
+}
+
+struct IdleGuardTask {
+    join: Shared<BoxFuture<'static, ()>>,
 }
 
 impl IdleGuard {
@@ -108,7 +169,10 @@ impl IdleGuard {
     pub(crate) fn spawn(idle: Duration, token: CancellationToken) -> Self {
         let notify = Arc::new(Notify::new());
         let watch = notify.clone();
-        tokio::spawn(async move {
+        let shutdown = token.clone();
+        #[cfg(test)]
+        let exit_gate = IDLE_GUARD_EXIT_GATE.with(|gate| gate.borrow().clone());
+        let handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = token.cancelled() => break,
@@ -120,8 +184,34 @@ impl IdleGuard {
                     _ = watch.notified() => {}
                 }
             }
+            #[cfg(test)]
+            if let Some(exit_gate) = exit_gate {
+                exit_gate.entered.add_permits(1);
+                exit_gate
+                    .release
+                    .acquire()
+                    .await
+                    .expect("idle guard exit gate is never closed")
+                    .forget();
+            }
         });
-        Self { notify }
+        let join = async move {
+            let _ = handle.await;
+        }
+        .boxed()
+        .shared();
+        Self {
+            notify,
+            shutdown,
+            task: Arc::new(IdleGuardTask { join }),
+        }
+    }
+
+    /// Cancel the watchdog and wait for its task to exit. Concurrent callers
+    /// share the same join and all return only after it has completed.
+    pub(crate) async fn shutdown(&self) {
+        self.shutdown.cancel();
+        self.task.join.clone().await;
     }
 
     /// Report activity, resetting the idle countdown.
