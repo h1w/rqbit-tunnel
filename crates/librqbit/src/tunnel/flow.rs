@@ -17,13 +17,13 @@
 //     destination-read direction, so a busy upload with a quiet download
 //     direction was wrongly reset.)
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-#[cfg(test)]
-use std::cell::RefCell;
 
 use futures::future::{BoxFuture, FutureExt, Shared};
 use tokio::sync::{Notify, Semaphore};

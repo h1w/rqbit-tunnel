@@ -1901,12 +1901,10 @@ mod tests {
         let client_io = tokio::net::TcpStream::connect(peer_listen)
             .await
             .expect("connect to tunnel server");
-        let encrypted = PeerWireCrypto::initiator(
-            client_io,
-            client_store.descriptor().handshake_info_hash,
-        )
-        .await
-        .expect("complete MSE handshake");
+        let encrypted =
+            PeerWireCrypto::initiator(client_io, client_store.descriptor().handshake_info_hash)
+                .await
+                .expect("complete MSE handshake");
 
         tokio::join!(session.stop(), session.stop());
 

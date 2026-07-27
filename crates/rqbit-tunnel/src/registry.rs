@@ -24,8 +24,7 @@ use uuid::Uuid;
 
 use crate::{
     model::{
-        MAX_USER_NAME_BYTES, MAX_USER_PAGE_SIZE, TrafficTotals, UserPage, UserRecord,
-        UserSnapshot,
+        MAX_USER_NAME_BYTES, MAX_USER_PAGE_SIZE, TrafficTotals, UserPage, UserRecord, UserSnapshot,
     },
     store::{ServerStore, StoreError, current_unix_seconds},
 };
@@ -76,7 +75,6 @@ struct ManagedUser {
     meter: Arc<UserMeter>,
     retired_meters: Vec<Weak<UserMeter>>,
 }
-
 
 struct UserMeter {
     counters: Arc<UserCounters>,
@@ -178,9 +176,9 @@ impl UserRegistry {
     ) -> Result<CreatedUser, RegistryError> {
         let name = name.into();
         validate_user_name(&name)?;
-        self.run_owned_operation(move |registry| async move {
-            registry.create_user_inner(name).await
-        })
+        self.run_owned_operation(
+            move |registry| async move { registry.create_user_inner(name).await },
+        )
         .await
     }
 
@@ -296,10 +294,7 @@ impl UserRegistry {
         self.flush_inner().await
     }
 
-    pub async fn reset_traffic(
-        self: &Arc<Self>,
-        user_id: Uuid,
-    ) -> Result<(), RegistryError> {
+    pub async fn reset_traffic(self: &Arc<Self>, user_id: Uuid) -> Result<(), RegistryError> {
         self.run_owned_operation(move |registry| async move {
             registry.reset_traffic_inner(user_id).await
         })
@@ -346,11 +341,7 @@ impl UserRegistry {
         .await
     }
 
-    async fn set_enabled_inner(
-        &self,
-        user_id: Uuid,
-        enabled: bool,
-    ) -> Result<(), RegistryError> {
+    async fn set_enabled_inner(&self, user_id: Uuid, enabled: bool) -> Result<(), RegistryError> {
         let _mutation = self
             .mutations
             .acquire()
@@ -438,7 +429,6 @@ impl UserRegistry {
         })
     }
 
-
     fn publish_enabled_key_map(&self, users: &BTreeMap<Uuid, ManagedUser>) {
         self.by_key.store(Arc::new(enabled_key_map(users)));
     }
@@ -485,7 +475,6 @@ fn validate_user_name(name: &str) -> Result<(), RegistryError> {
     Ok(())
 }
 
-
 impl FlushWorker {
     fn new() -> Self {
         Self {
@@ -498,11 +487,7 @@ impl FlushWorker {
         }
     }
 
-    async fn start(
-        &self,
-        registry: std::sync::Weak<UserRegistry>,
-        interval: Duration,
-    ) {
+    async fn start(&self, registry: std::sync::Weak<UserRegistry>, interval: Duration) {
         let cancellation = self.cancellation.clone();
         #[cfg(test)]
         let flush_completed = Some(Arc::clone(&self.flush_completed));
@@ -596,11 +581,7 @@ impl ManagedUser {
 
         let mut meters = Vec::with_capacity(self.retired_meters.len() + 1);
         meters.push(Arc::clone(&self.meter));
-        meters.extend(
-            self.retired_meters
-                .iter()
-                .filter_map(Weak::upgrade),
-        );
+        meters.extend(self.retired_meters.iter().filter_map(Weak::upgrade));
         meters
     }
 
@@ -642,8 +623,7 @@ impl ManagedUser {
     }
 
     fn prune_retired_meters(&mut self) {
-        self.retired_meters
-            .retain(|meter| meter.strong_count() > 0);
+        self.retired_meters.retain(|meter| meter.strong_count() > 0);
     }
 }
 
@@ -669,7 +649,6 @@ impl UserMeter {
         let timestamp = self.last_seen.load(Ordering::Relaxed);
         (timestamp > 0).then_some(timestamp)
     }
-
 }
 
 impl UserCounters {
@@ -777,9 +756,9 @@ impl TunnelServerSession for UserMeter {
     }
 }
 
-
-
-fn enabled_key_map(users: &BTreeMap<Uuid, ManagedUser>) -> HashMap<TunnelPublicKey, Arc<UserMeter>> {
+fn enabled_key_map(
+    users: &BTreeMap<Uuid, ManagedUser>,
+) -> HashMap<TunnelPublicKey, Arc<UserMeter>> {
     users
         .values()
         .filter(|user| user.record.enabled)
@@ -799,15 +778,15 @@ mod tests {
     use librqbit::{
         TunnelPublicKey, TunnelServerAuthorizer, TunnelServerSession, TunnelTrafficDirection,
     };
-    use rusqlite::{params, Connection};
+    use rusqlite::{Connection, params};
 
+    use super::{UserCounters, UserMeter, UserRegistry};
     use crate::{
         ipc::protocol::{MAX_FRAME_BYTES, ServerResponse, encode_response},
         model::{MAX_USER_NAME_BYTES, TrafficTotals, UserRecord},
         paths::ServerPaths,
         store::ServerStore,
     };
-    use super::{UserCounters, UserMeter, UserRegistry};
 
     struct TestRegistry {
         _directory: tempfile::TempDir,
@@ -835,7 +814,6 @@ mod tests {
             registry,
         }
     }
-
 
     async fn test_registry_with_flush_interval(
         interval: Duration,
@@ -883,7 +861,9 @@ mod tests {
 
         let created = registry.create_user("alice").await.unwrap();
         let user = created.user;
-        let session = registry.authorize(&TunnelPublicKey(user.public_key)).unwrap();
+        let session = registry
+            .authorize(&TunnelPublicKey(user.public_key))
+            .unwrap();
         session.record_payload(TunnelTrafficDirection::Upload, 9);
         session.record_payload(TunnelTrafficDirection::Download, 14);
 
@@ -907,7 +887,9 @@ mod tests {
             test_registry_with_flush_interval(Duration::from_secs(60)).await;
         let created = registry.create_user("alice").await.unwrap();
         let user = created.user;
-        let session = registry.authorize(&TunnelPublicKey(user.public_key)).unwrap();
+        let session = registry
+            .authorize(&TunnelPublicKey(user.public_key))
+            .unwrap();
         session.record_payload(TunnelTrafficDirection::Upload, 9);
         session.record_payload(TunnelTrafficDirection::Download, 14);
 
@@ -926,9 +908,15 @@ mod tests {
         let registry = test_registry().await;
         let created = registry.create_user("alice").await.unwrap();
         let user = created.user;
-        let session = registry.authorize(&TunnelPublicKey(user.public_key)).unwrap();
+        let session = registry
+            .authorize(&TunnelPublicKey(user.public_key))
+            .unwrap();
         registry.set_enabled(user.id, false).await.unwrap();
-        assert!(registry.authorize(&TunnelPublicKey(user.public_key)).is_none());
+        assert!(
+            registry
+                .authorize(&TunnelPublicKey(user.public_key))
+                .is_none()
+        );
         assert!(session.cancellation_token().is_cancelled());
         let reloaded = UserRegistry::open(
             ServerStore::open(registry.database_path.clone())
@@ -966,26 +954,27 @@ mod tests {
         let reloaded = UserRegistry::open(ServerStore::open(database_path).await.unwrap())
             .await
             .unwrap();
-        assert!(
-            reloaded
-                .authorize(&TunnelPublicKey(public_key))
-                .is_none()
-        );
+        assert!(reloaded.authorize(&TunnelPublicKey(public_key)).is_none());
         reloaded.shutdown().await.unwrap();
         registry.shutdown().await.unwrap();
     }
-
 
     #[tokio::test]
     async fn deleting_a_user_rejects_new_admission_and_cancels_existing_sessions() {
         let registry = test_registry().await;
         let created = registry.create_user("alice").await.unwrap();
         let user = created.user;
-        let session = registry.authorize(&TunnelPublicKey(user.public_key)).unwrap();
+        let session = registry
+            .authorize(&TunnelPublicKey(user.public_key))
+            .unwrap();
 
         registry.delete_user(user.id).await.unwrap();
 
-        assert!(registry.authorize(&TunnelPublicKey(user.public_key)).is_none());
+        assert!(
+            registry
+                .authorize(&TunnelPublicKey(user.public_key))
+                .is_none()
+        );
         assert!(session.cancellation_token().is_cancelled());
         assert!(matches!(
             registry.snapshot(user.id).await,
@@ -997,7 +986,9 @@ mod tests {
         let registry = test_registry().await;
         let created = registry.create_user("alice").await.unwrap();
         let user = created.user;
-        let session = registry.authorize(&TunnelPublicKey(user.public_key)).unwrap();
+        let session = registry
+            .authorize(&TunnelPublicKey(user.public_key))
+            .unwrap();
         session.record_payload(TunnelTrafficDirection::Upload, 9);
         session.record_payload(TunnelTrafficDirection::Download, 14);
         registry.flush().await.unwrap();
@@ -1030,7 +1021,9 @@ mod tests {
             test_registry_with_flush_interval(Duration::from_secs(60)).await;
         let created = registry.create_user("alice").await.unwrap();
         let user = created.user;
-        let session = registry.authorize(&TunnelPublicKey(user.public_key)).unwrap();
+        let session = registry
+            .authorize(&TunnelPublicKey(user.public_key))
+            .unwrap();
         session.record_payload(TunnelTrafficDirection::Upload, 9);
         session.record_payload(TunnelTrafficDirection::Download, 14);
 
@@ -1094,7 +1087,9 @@ mod tests {
         let registry = test_registry().await;
         let created = registry.create_user("alice").await.unwrap();
         let user = created.user;
-        let old_session = registry.authorize(&TunnelPublicKey(user.public_key)).unwrap();
+        let old_session = registry
+            .authorize(&TunnelPublicKey(user.public_key))
+            .unwrap();
 
         registry.set_enabled(user.id, false).await.unwrap();
         registry.set_enabled(user.id, true).await.unwrap();
@@ -1115,7 +1110,9 @@ mod tests {
             test_registry_with_flush_interval(Duration::from_secs(60)).await;
         let created = registry.create_user("alice").await.unwrap();
         let user = created.user;
-        let retired = registry.authorize(&TunnelPublicKey(user.public_key)).unwrap();
+        let retired = registry
+            .authorize(&TunnelPublicKey(user.public_key))
+            .unwrap();
 
         registry.set_enabled(user.id, false).await.unwrap();
         registry.set_enabled(user.id, true).await.unwrap();
@@ -1137,13 +1134,7 @@ mod tests {
         }
 
         let users = registry.users.read().await;
-        assert!(
-            users
-                .get(&user.id)
-                .unwrap()
-                .retired_meters
-                .is_empty()
-        );
+        assert!(users.get(&user.id).unwrap().retired_meters.is_empty());
     }
 
     #[tokio::test]
@@ -1152,12 +1143,16 @@ mod tests {
             test_registry_with_flush_interval(Duration::from_secs(60)).await;
         let created = registry.create_user("alice").await.unwrap();
         let user = created.user;
-        let retired = registry.authorize(&TunnelPublicKey(user.public_key)).unwrap();
+        let retired = registry
+            .authorize(&TunnelPublicKey(user.public_key))
+            .unwrap();
         retired.connected();
 
         registry.set_enabled(user.id, false).await.unwrap();
         registry.set_enabled(user.id, true).await.unwrap();
-        let active = registry.authorize(&TunnelPublicKey(user.public_key)).unwrap();
+        let active = registry
+            .authorize(&TunnelPublicKey(user.public_key))
+            .unwrap();
         active.connected();
 
         assert_eq!(registry.snapshot(user.id).await.unwrap().connected, 2);
@@ -1171,7 +1166,9 @@ mod tests {
         let registry = test_registry().await;
         let created = registry.create_user("alice").await.unwrap();
         let user = created.user;
-        let session = registry.authorize(&TunnelPublicKey(user.public_key)).unwrap();
+        let session = registry
+            .authorize(&TunnelPublicKey(user.public_key))
+            .unwrap();
         session.record_payload(TunnelTrafficDirection::Upload, 4);
         session.record_payload(TunnelTrafficDirection::Download, 6);
         registry.flush().await.unwrap();
@@ -1198,17 +1195,20 @@ mod tests {
         );
     }
 
-
     #[tokio::test]
     async fn reset_persists_post_reset_payloads_from_active_and_retired_sessions() {
         let registry = test_registry().await;
         let created = registry.create_user("alice").await.unwrap();
         let user = created.user;
-        let retired = registry.authorize(&TunnelPublicKey(user.public_key)).unwrap();
+        let retired = registry
+            .authorize(&TunnelPublicKey(user.public_key))
+            .unwrap();
 
         registry.set_enabled(user.id, false).await.unwrap();
         registry.set_enabled(user.id, true).await.unwrap();
-        let active = registry.authorize(&TunnelPublicKey(user.public_key)).unwrap();
+        let active = registry
+            .authorize(&TunnelPublicKey(user.public_key))
+            .unwrap();
 
         registry.reset_traffic(user.id).await.unwrap();
         retired.record_payload(TunnelTrafficDirection::Upload, 3);
@@ -1296,7 +1296,6 @@ mod tests {
         let encoded = encode_response(&ServerResponse::UserPage(page)).unwrap();
         assert!(encoded.len() <= MAX_FRAME_BYTES);
 
-
         registry.shutdown().await.unwrap();
     }
 
@@ -1305,7 +1304,14 @@ mod tests {
         let registry = test_registry().await;
 
         assert!(registry.create_user("x".repeat(65)).await.is_err());
-        assert!(registry.snapshot_page(None, 1).await.unwrap().users.is_empty());
+        assert!(
+            registry
+                .snapshot_page(None, 1)
+                .await
+                .unwrap()
+                .users
+                .is_empty()
+        );
 
         registry.shutdown().await.unwrap();
     }

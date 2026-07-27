@@ -144,7 +144,11 @@ async fn seed_until_promoted(
     idle: Duration,
     deadline: Duration,
 ) -> Result<
-    Option<(NoiseTransport, TunnelPublicKey, Arc<dyn TunnelServerSession>)>,
+    Option<(
+        NoiseTransport,
+        TunnelPublicKey,
+        Arc<dyn TunnelServerSession>,
+    )>,
     TunnelAdmissionError,
 > {
     let seed = async {
@@ -528,11 +532,7 @@ impl TunnelServer {
 
     /// Run the accept loop on the given listener, owning every accepted peer
     /// task until it has stopped.
-    pub async fn run(
-        self: &Arc<Self>,
-        listener: TcpListener,
-        shutdown: CancellationToken,
-    ) {
+    pub async fn run(self: &Arc<Self>, listener: TcpListener, shutdown: CancellationToken) {
         // Build the runtime egress policy once and share it across all peers.
         let egress = Arc::new(super::egress::EgressPolicy::from_config(
             &self.options.egress_policy,
@@ -751,8 +751,7 @@ mod tests {
 
     impl TunnelServerAuthorizer for KeyAuthorizer {
         fn authorize(&self, key: &TunnelPublicKey) -> Option<Arc<dyn TunnelServerSession>> {
-            (key == &self.key)
-                .then(|| self.session.clone() as Arc<dyn TunnelServerSession>)
+            (key == &self.key).then(|| self.session.clone() as Arc<dyn TunnelServerSession>)
         }
     }
 
@@ -1470,7 +1469,9 @@ mod tests {
                     "disconnect must wait for the relay task to end"
                 );
             }
-            AcceptOutcome::Seeded => panic!("a valid dynamically authorized client must be Admitted"),
+            AcceptOutcome::Seeded => {
+                panic!("a valid dynamically authorized client must be Admitted")
+            }
         }
     }
 

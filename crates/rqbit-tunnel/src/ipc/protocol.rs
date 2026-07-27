@@ -1,7 +1,4 @@
-use std::{
-    io,
-    path::PathBuf,
-};
+use std::{io, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -24,12 +21,24 @@ pub enum ServerRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<usize>,
     },
-    AddUser { name: String, export_path: PathBuf },
-    SetEnabled { id: Uuid, enabled: bool },
-    DeleteUser { id: Uuid },
-    ResetTraffic { id: Uuid },
+    AddUser {
+        name: String,
+        export_path: PathBuf,
+    },
+    SetEnabled {
+        id: Uuid,
+        enabled: bool,
+    },
+    DeleteUser {
+        id: Uuid,
+    },
+    ResetTraffic {
+        id: Uuid,
+    },
     GetConfig,
-    SetConfig { config: ServerConfig },
+    SetConfig {
+        config: ServerConfig,
+    },
     Shutdown,
 }
 
@@ -146,7 +155,8 @@ pub(crate) fn encode_request(request: &ServerRequest) -> Result<Vec<u8>, Protoco
 
 pub(crate) fn decode_request(body: &[u8]) -> Result<ServerRequest, ProtocolError> {
     let text = std::str::from_utf8(body).map_err(|_| ProtocolError::InvalidUtf8)?;
-    let envelope = serde_json::from_str::<RequestEnvelope>(text).map_err(ProtocolError::InvalidJson)?;
+    let envelope =
+        serde_json::from_str::<RequestEnvelope>(text).map_err(ProtocolError::InvalidJson)?;
     check_protocol_version(envelope.protocol_version)?;
     Ok(envelope.request)
 }

@@ -1,7 +1,9 @@
+#[cfg(test)]
+use std::sync::LazyLock;
 use std::{
     collections::HashSet,
-    fs::{self, File, OpenOptions},
     ffi::CString,
+    fs::{self, File, OpenOptions},
     io::{self, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
@@ -16,30 +18,26 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-#[cfg(test)]
-use std::sync::LazyLock;
 
 use librqbit::{
     EgressPolicy, Session, SessionOptions, TunnelOptions, TunnelPrivateKey, TunnelPublicKey,
     TunnelServerAuthorizer, TunnelServerOptions, tunnel_public_key,
 };
 use thiserror::Error;
+#[cfg(test)]
+use tokio::sync::Notify;
 use tokio::{
     net::{UnixListener, UnixStream},
     sync::{Mutex, RwLock, watch},
     task::{JoinHandle, JoinSet},
     time::Duration,
 };
-#[cfg(test)]
-use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
     ipc::{
-        protocol::{
-            ServerConfigResponse, ServerError, ServerRequest, ServerResponse,
-        },
+        protocol::{ServerConfigResponse, ServerError, ServerRequest, ServerResponse},
         unix::{
             UnixControlError, read_request, write_response_until_shutdown,
             write_response_with_deadline,
@@ -181,7 +179,10 @@ fn install_atomic_write_parent_open_hook(
         .lock()
         .expect("atomic write parent-open hook lock must not be poisoned")
         .replace((path.to_path_buf(), Box::new(hook)));
-    assert!(previous.is_none(), "an atomic write parent-open hook is already installed");
+    assert!(
+        previous.is_none(),
+        "an atomic write parent-open hook is already installed"
+    );
     AtomicWriteParentOpenHookGuard
 }
 
@@ -203,7 +204,6 @@ fn run_atomic_write_parent_open_hook(path: &Path) {
         hook();
     }
 }
-
 
 #[derive(Debug, Error)]
 pub enum ServerRuntimeError {
@@ -402,8 +402,9 @@ struct StaleSocketRemovalPause {
 }
 
 #[cfg(test)]
-static STALE_SOCKET_REMOVAL_PAUSE: LazyLock<std::sync::Mutex<Option<Arc<StaleSocketRemovalPause>>>> =
-    LazyLock::new(|| std::sync::Mutex::new(None));
+static STALE_SOCKET_REMOVAL_PAUSE: LazyLock<
+    std::sync::Mutex<Option<Arc<StaleSocketRemovalPause>>>,
+> = LazyLock::new(|| std::sync::Mutex::new(None));
 
 #[cfg(test)]
 impl StaleSocketRemovalPause {
@@ -436,14 +437,17 @@ impl Drop for StaleSocketRemovalPauseGuard {
 }
 
 #[cfg(test)]
-fn install_stale_socket_removal_pause() -> (Arc<StaleSocketRemovalPause>, StaleSocketRemovalPauseGuard)
-{
+fn install_stale_socket_removal_pause()
+-> (Arc<StaleSocketRemovalPause>, StaleSocketRemovalPauseGuard) {
     let pause = Arc::new(StaleSocketRemovalPause::new());
     let previous = STALE_SOCKET_REMOVAL_PAUSE
         .lock()
         .expect("stale socket removal pause lock must not be poisoned")
         .replace(Arc::clone(&pause));
-    assert!(previous.is_none(), "a stale socket removal pause is already installed");
+    assert!(
+        previous.is_none(),
+        "a stale socket removal pause is already installed"
+    );
     (pause, StaleSocketRemovalPauseGuard)
 }
 
@@ -458,7 +462,6 @@ fn pause_before_stale_socket_removal() {
         pause.resumed.wait();
     }
 }
-
 
 pub struct ManagedServer {
     coordinator: Arc<ShutdownCoordinator>,
@@ -516,11 +519,10 @@ impl ShutdownResultPublication {
 impl Drop for ShutdownResultPublication {
     fn drop(&mut self) {
         if !self.published {
-            self.sender
-                .send_replace(Some(SharedShutdownResult::Failed {
-                    code: ShutdownFailureCode::Cleanup,
-                    message: "the shutdown coordinator exited before completing cleanup".to_owned(),
-                }));
+            self.sender.send_replace(Some(SharedShutdownResult::Failed {
+                code: ShutdownFailureCode::Cleanup,
+                message: "the shutdown coordinator exited before completing cleanup".to_owned(),
+            }));
         }
     }
 }
@@ -643,7 +645,8 @@ impl ShutdownCoordinator {
             if result.changed().await.is_err() {
                 return Err(ServerRuntimeError::SharedShutdownFailure {
                     code: ShutdownFailureCode::Cleanup,
-                    message: "the shutdown coordinator stopped before publishing a result".to_owned(),
+                    message: "the shutdown coordinator stopped before publishing a result"
+                        .to_owned(),
                 });
             }
         }
@@ -694,7 +697,11 @@ impl ManagedServerInner {
 
         self.shutdown.cancel();
         self.session.stop().await;
-        let registry_result = self.registry.shutdown().await.map_err(ServerRuntimeError::Registry);
+        let registry_result = self
+            .registry
+            .shutdown()
+            .await
+            .map_err(ServerRuntimeError::Registry);
         let socket_result = remove_owned_control_socket(
             &self.paths.control_socket_path(),
             self.control_socket_identity,
@@ -713,9 +720,13 @@ impl ManagedServerInner {
                     .snapshot_page(None, DEFAULT_USER_PAGE_SIZE)
                     .await?;
                 if page.next_page.is_some() {
-                    return Err(ServerRuntimeError::Registry(RegistryError::PaginationRequired));
+                    return Err(ServerRuntimeError::Registry(
+                        RegistryError::PaginationRequired,
+                    ));
                 }
-                Ok(ServerResponse::Snapshot(ServerSnapshot { users: page.users }))
+                Ok(ServerResponse::Snapshot(ServerSnapshot {
+                    users: page.users,
+                }))
             }
             ServerRequest::SnapshotPage => {
                 let page = self
@@ -730,7 +741,9 @@ impl ManagedServerInner {
                     .snapshot_page(None, DEFAULT_USER_PAGE_SIZE)
                     .await?;
                 if page.next_page.is_some() {
-                    return Err(ServerRuntimeError::Registry(RegistryError::PaginationRequired));
+                    return Err(ServerRuntimeError::Registry(
+                        RegistryError::PaginationRequired,
+                    ));
                 }
                 Ok(ServerResponse::Users(page.users))
             }
@@ -1001,13 +1014,11 @@ async fn load_server_key(path: PathBuf) -> Result<TunnelPrivateKey, ConfigError>
                 actual: bytes.len(),
             });
         }
-        let encoded = std::str::from_utf8(&bytes).map_err(|_| ConfigError::InvalidKeyHex {
-            path: path.clone(),
-        })?;
+        let encoded = std::str::from_utf8(&bytes)
+            .map_err(|_| ConfigError::InvalidKeyHex { path: path.clone() })?;
         let mut key = [0_u8; 32];
-        hex::decode_to_slice(encoded, &mut key).map_err(|_| ConfigError::InvalidKeyHex {
-            path: path.clone(),
-        })?;
+        hex::decode_to_slice(encoded, &mut key)
+            .map_err(|_| ConfigError::InvalidKeyHex { path: path.clone() })?;
         Ok(TunnelPrivateKey(key))
     })
     .await
@@ -1046,7 +1057,6 @@ async fn write_enrollment_bundle(
         })?
 }
 
-
 fn inspect_regular_file(path: &Path, kind: &'static str) -> Result<fs::Metadata, ConfigError> {
     let metadata = fs::symlink_metadata(path).map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
@@ -1071,10 +1081,7 @@ fn inspect_regular_file(path: &Path, kind: &'static str) -> Result<fs::Metadata,
     Ok(metadata)
 }
 
-fn atomic_write_file(
-    path: &Path,
-    bytes: &[u8],
-) -> Result<AtomicWriteOutcome, AtomicWriteError> {
+fn atomic_write_file(path: &Path, bytes: &[u8]) -> Result<AtomicWriteOutcome, AtomicWriteError> {
     let final_component = path
         .as_os_str()
         .as_bytes()
@@ -1087,11 +1094,10 @@ fn atomic_write_file(
         .ok_or_else(|| AtomicWriteError::MissingFinalComponent {
             path: path.to_path_buf(),
         })?;
-    let final_component = CString::new(final_component).map_err(|_| {
-        AtomicWriteError::MissingFinalComponent {
+    let final_component =
+        CString::new(final_component).map_err(|_| AtomicWriteError::MissingFinalComponent {
             path: path.to_path_buf(),
-        }
-    })?;
+        })?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1130,11 +1136,7 @@ fn atomic_write_file(
             libc::openat(
                 directory.as_raw_fd(),
                 temporary_component.as_ptr(),
-                libc::O_WRONLY
-                    | libc::O_CREAT
-                    | libc::O_EXCL
-                    | libc::O_CLOEXEC
-                    | libc::O_NOFOLLOW,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                 0o600,
             )
         };
@@ -1185,13 +1187,7 @@ fn atomic_write_file(
     if result.is_err() {
         // SAFETY: the temporary component and parent descriptor are the same ones used for
         // creation, so cleanup cannot traverse a replaced parent path.
-        let _ = unsafe {
-            libc::unlinkat(
-                directory.as_raw_fd(),
-                temporary_component.as_ptr(),
-                0,
-            )
-        };
+        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temporary_component.as_ptr(), 0) };
     }
     result
 }
@@ -1215,20 +1211,22 @@ fn lock_control_socket(path: &Path) -> Result<File, ServerRuntimeError> {
             path: lock_path.clone(),
             source,
         })?;
-    lock.lock().map_err(|source| ServerRuntimeError::ControlSocket {
-        path: lock_path,
-        source,
-    })?;
+    lock.lock()
+        .map_err(|source| ServerRuntimeError::ControlSocket {
+            path: lock_path,
+            source,
+        })?;
     Ok(lock)
 }
 
 fn bind_control_socket(path: &Path) -> Result<(UnixListener, SocketIdentity), ServerRuntimeError> {
-    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).ok_or_else(|| {
-        ServerRuntimeError::UnsafeControlSocketPath {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| ServerRuntimeError::UnsafeControlSocketPath {
             path: path.to_path_buf(),
             kind: "path without a parent directory",
-        }
-    })?;
+        })?;
     fs::create_dir_all(parent).map_err(|source| ServerRuntimeError::ControlSocket {
         path: parent.to_path_buf(),
         source,
@@ -1277,14 +1275,16 @@ fn bind_control_socket(path: &Path) -> Result<(UnixListener, SocketIdentity), Se
             });
         }
     }
-    let listener = UnixListener::bind(path).map_err(|source| ServerRuntimeError::ControlSocket {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let metadata = fs::symlink_metadata(path).map_err(|source| ServerRuntimeError::ControlSocket {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let listener =
+        UnixListener::bind(path).map_err(|source| ServerRuntimeError::ControlSocket {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let metadata =
+        fs::symlink_metadata(path).map_err(|source| ServerRuntimeError::ControlSocket {
+            path: path.to_path_buf(),
+            source,
+        })?;
     if !metadata.file_type().is_socket() {
         return Err(ServerRuntimeError::UnsafeControlSocketPath {
             path: path.to_path_buf(),
@@ -1376,7 +1376,10 @@ static TEST_SERVER_START_GATE: LazyLock<tokio::sync::Mutex<()>> =
 #[cfg(test)]
 pub(crate) async fn spawn_test_server(socket: &Path) -> ManagedServer {
     let run_dir = socket.parent().expect("test socket has a parent directory");
-    assert_eq!(socket.file_name().and_then(|name| name.to_str()), Some("server.sock"));
+    assert_eq!(
+        socket.file_name().and_then(|name| name.to_str()),
+        Some("server.sock")
+    );
     let paths = ServerPaths {
         config_dir: run_dir.join("config"),
         data_dir: run_dir.join("data"),
@@ -1458,17 +1461,11 @@ async fn try_start_test_server(
 
 #[cfg(test)]
 async fn write_test_server_material(paths: &ServerPaths) {
-    write_test_server_config(
-        paths,
-        std::net::SocketAddr::from(([127, 0, 0, 1], 49152)),
-    );
+    write_test_server_config(paths, std::net::SocketAddr::from(([127, 0, 0, 1], 49152)));
     let (key, _) = librqbit::tunnel_generate_keypair();
     fs::write(paths.server_key_path(), hex::encode(key.0)).expect("write test server key");
-    fs::set_permissions(
-        paths.server_key_path(),
-        fs::Permissions::from_mode(0o600),
-    )
-    .expect("restrict test server key");
+    fs::set_permissions(paths.server_key_path(), fs::Permissions::from_mode(0o600))
+        .expect("restrict test server key");
 }
 
 #[cfg(test)]
@@ -1482,9 +1479,7 @@ fn write_test_server_config(paths: &ServerPaths, peer_listen: std::net::SocketAd
             allow_link_local: false,
             allow_multicast: false,
         },
-        default_client_socks_listen: "127.0.0.1:1080"
-            .parse()
-            .expect("valid test SOCKS listener"),
+        default_client_socks_listen: "127.0.0.1:1080".parse().expect("valid test SOCKS listener"),
         default_client_carriers: 4,
     };
     fs::create_dir_all(&paths.config_dir).expect("create test config directory");
@@ -1505,18 +1500,16 @@ mod tests {
         time::Duration,
     };
 
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::{TcpListener, UnixListener, UnixStream};
     use crate::{
         ipc::{
             protocol::{ServerRequest, ServerResponse},
             unix::UnixControlClient,
         },
-        model::{
-            EnrollmentBundle, ServerConfig, ServerEgressConfig, SERVER_CONFIG_SCHEMA_VERSION,
-        },
+        model::{EnrollmentBundle, SERVER_CONFIG_SCHEMA_VERSION, ServerConfig, ServerEgressConfig},
         paths::ServerPaths,
     };
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, UnixListener, UnixStream};
 
     use super::{
         AtomicWriteError, AtomicWriteOutcome, ConfigError, ManagedServer, ServerRuntimeError,
@@ -1557,8 +1550,9 @@ mod tests {
         assert!(!response_json.contains(&hex::encode(bundle.client_private_key)));
         #[cfg(unix)]
         assert_eq!(
-            std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&export_path).unwrap().permissions())
-                & 0o777,
+            std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(&export_path).unwrap().permissions()
+            ) & 0o777,
             0o600
         );
 
@@ -1578,7 +1572,10 @@ mod tests {
                 .unwrap()
                 .contains("client_private_key")
         );
-        assert_eq!(std::fs::read_dir(&malformed_export_path).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read_dir(&malformed_export_path).unwrap().count(),
+            0
+        );
 
         let users = request(
             &paths,
@@ -1680,7 +1677,10 @@ mod tests {
         let missing_key = ManagedServer::start(paths.clone()).await;
         assert!(matches!(
             &missing_key,
-            Err(ServerRuntimeError::Config(ConfigError::MissingFile { kind: "key", .. }))
+            Err(ServerRuntimeError::Config(ConfigError::MissingFile {
+                kind: "key",
+                ..
+            }))
         ));
 
         std::fs::write(paths.server_key_path(), "g".repeat(64)).unwrap();
@@ -1694,7 +1694,9 @@ mod tests {
         let invalid_key = ManagedServer::start(paths).await;
         assert!(matches!(
             &invalid_key,
-            Err(ServerRuntimeError::Config(ConfigError::InvalidKeyHex { .. }))
+            Err(ServerRuntimeError::Config(
+                ConfigError::InvalidKeyHex { .. }
+            ))
         ));
     }
 
@@ -1751,7 +1753,9 @@ mod tests {
         let paths = test_paths(directory.path());
         write_test_server_material(&paths).await;
         let server = start_test_server(paths.clone()).await.unwrap();
-        let idle_connection = UnixStream::connect(paths.control_socket_path()).await.unwrap();
+        let idle_connection = UnixStream::connect(paths.control_socket_path())
+            .await
+            .unwrap();
         let snapshot = tokio::time::timeout(
             Duration::from_secs(2),
             request(&paths, ServerRequest::Snapshot),
@@ -1807,10 +1811,12 @@ mod tests {
                 ..
             })
         ));
-        assert!(std::fs::symlink_metadata(&symbolic_link)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&symbolic_link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[tokio::test]
@@ -1999,10 +2005,12 @@ mod tests {
         let replacement = UnixListener::bind(&socket).unwrap();
 
         server.shutdown().await.unwrap();
-        assert!(std::fs::symlink_metadata(&socket)
-            .unwrap()
-            .file_type()
-            .is_socket());
+        assert!(
+            std::fs::symlink_metadata(&socket)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
 
         drop(replacement);
         std::fs::remove_file(socket).unwrap();
@@ -2034,10 +2042,12 @@ mod tests {
             result,
             Err(ServerRuntimeError::ActiveControlSocket { .. })
         ));
-        assert!(std::fs::symlink_metadata(&socket)
-            .unwrap()
-            .file_type()
-            .is_socket());
+        assert!(
+            std::fs::symlink_metadata(&socket)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
 
         drop(replacement);
         std::fs::remove_file(socket).unwrap();
@@ -2123,8 +2133,6 @@ mod tests {
         assert_eq!(std::fs::read(target).unwrap(), b"original");
     }
 
-
-
     #[tokio::test]
     async fn add_user_rejects_a_fifo_bundle_parent_without_blocking() {
         let directory = tempfile::tempdir().unwrap();
@@ -2191,7 +2199,13 @@ mod tests {
         };
 
         assert!(matches!(
-            request(&paths, ServerRequest::SetConfig { config: updated.clone() }).await,
+            request(
+                &paths,
+                ServerRequest::SetConfig {
+                    config: updated.clone()
+                }
+            )
+            .await,
             ServerResponse::Config(_)
         ));
         assert!(matches!(
@@ -2209,7 +2223,9 @@ mod tests {
         let paths = test_paths(directory.path());
         write_test_server_material(&paths).await;
         let server = start_test_server(paths.clone()).await.unwrap();
-        let mut client = UnixControlClient::connect(paths.control_socket_path()).await.unwrap();
+        let mut client = UnixControlClient::connect(paths.control_socket_path())
+            .await
+            .unwrap();
         let moved_run_dir = directory.path().join("moved-run");
 
         std::fs::rename(&paths.run_dir, &moved_run_dir).unwrap();
@@ -2307,7 +2323,9 @@ mod tests {
     }
 
     async fn request_json(paths: &ServerPaths, request: serde_json::Value) -> ServerResponse {
-        let mut stream = UnixStream::connect(paths.control_socket_path()).await.unwrap();
+        let mut stream = UnixStream::connect(paths.control_socket_path())
+            .await
+            .unwrap();
         let body = serde_json::to_vec(&serde_json::json!({
             "protocol_version": 1,
             "request": request,
@@ -2337,5 +2355,4 @@ mod tests {
             run_dir: root.join("run"),
         }
     }
-
 }

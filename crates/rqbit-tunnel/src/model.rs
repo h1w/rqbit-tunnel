@@ -36,9 +36,7 @@ pub struct ServerEgressConfig {
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ServerConfigError {
-    #[error(
-        "server configuration schema version {actual} is unsupported (expected {expected})"
-    )]
+    #[error("server configuration schema version {actual} is unsupported (expected {expected})")]
     UnsupportedSchemaVersion { actual: u32, expected: u32 },
     #[error("the tunnel peer listener port must not be zero")]
     ZeroPeerListenPort,
@@ -146,9 +144,7 @@ impl EnrollmentBundle {
             client_private_key,
             server_public_key,
             server_addr: server_addr.parse().expect("valid test server address"),
-            socks_listen: "127.0.0.1:1080"
-                .parse()
-                .expect("valid test SOCKS address"),
+            socks_listen: "127.0.0.1:1080".parse().expect("valid test SOCKS address"),
             carriers: 4,
         }
     }
@@ -177,17 +173,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        EnrollmentBundle, ServerConfig, ServerConfigError, ServerEgressConfig,
-        SERVER_CONFIG_SCHEMA_VERSION,
+        EnrollmentBundle, SERVER_CONFIG_SCHEMA_VERSION, ServerConfig, ServerConfigError,
+        ServerEgressConfig,
     };
 
     #[test]
     fn enrollment_bundle_round_trips_hex_keys_without_leaking_extra_fields() {
         let bundle = EnrollmentBundle::for_test("alice", [7; 32], [8; 32], "203.0.113.8:4242");
         let encoded = serde_json::to_string(&bundle).unwrap();
-        assert!(encoded.contains("0707070707070707070707070707070707070707070707070707070707070707"));
+        assert!(
+            encoded.contains("0707070707070707070707070707070707070707070707070707070707070707")
+        );
         assert!(!encoded.contains("carrier_root"));
-        assert_eq!(serde_json::from_str::<EnrollmentBundle>(&encoded).unwrap(), bundle);
+        assert_eq!(
+            serde_json::from_str::<EnrollmentBundle>(&encoded).unwrap(),
+            bundle
+        );
     }
 
     #[test]

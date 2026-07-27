@@ -739,9 +739,8 @@ async fn acknowledge_tcp_credit(
             return;
         }
         apply_acknowledged_credit(&send_credit, &download_uncredited, requested, session);
-        let _ =
-            retire_finished_tcp_entry(tcp, stream_id, &download_uncredited, &download_finished)
-                .await;
+        let _ = retire_finished_tcp_entry(tcp, stream_id, &download_uncredited, &download_finished)
+            .await;
     }
 }
 
@@ -756,8 +755,7 @@ async fn finish_tcp_download(
 ) {
     let _download_gate = download_gate.lock().await;
     download_finished.store(true, Ordering::Release);
-    let _ =
-        retire_finished_tcp_entry(tcp, stream_id, download_uncredited, download_finished).await;
+    let _ = retire_finished_tcp_entry(tcp, stream_id, download_uncredited, download_finished).await;
 }
 
 /// Remove a completed TCP entry only after its final valid acknowledgement.
@@ -814,7 +812,6 @@ pub(crate) async fn run_server_relay(
         ..
     } = peer;
     let relay_shutdown = shutdown.child_token();
-
 
     let transport = Arc::new(Mutex::new(transport));
     // Cover lane: `next_tunnel_frame` funnels piece Request→Piece cover here and
@@ -1000,14 +997,8 @@ pub(crate) async fn run_server_relay(
                 // Acknowledge only payload the peer actually accepted from the
                 // destination, so peer credit and download accounting cannot
                 // exceed successful relay delivery.
-                acknowledge_tcp_credit(
-                    &tcp,
-                    stream_id,
-                    bytes,
-                    session.as_ref(),
-                    &relay_shutdown,
-                )
-                .await;
+                acknowledge_tcp_credit(&tcp, stream_id, bytes, session.as_ref(), &relay_shutdown)
+                    .await;
             }
             TunnelFrame::TcpReset { stream_id, .. } => {
                 let entry = { tcp.lock().await.remove(&stream_id) };
@@ -1102,12 +1093,9 @@ pub(crate) async fn run_server_relay(
                 }
             }
             TunnelFrame::Ping { nonce } => {
-                let _ = send_frame_until_cancelled(
-                    &sink,
-                    TunnelFrame::Pong { nonce },
-                    &relay_shutdown,
-                )
-                .await;
+                let _ =
+                    send_frame_until_cancelled(&sink, TunnelFrame::Pong { nonce }, &relay_shutdown)
+                        .await;
             }
             TunnelFrame::Pong { nonce } => {
                 let sent_at = ping_inflight.lock().unwrap().remove(&nonce);
@@ -1223,12 +1211,9 @@ async fn handle_tcp_stream(
     .await;
 
     if let Err(code) = result {
-        let _ = send_frame_until_cancelled(
-            &sink,
-            TunnelFrame::TcpReset { stream_id, code },
-            &token,
-        )
-        .await;
+        let _ =
+            send_frame_until_cancelled(&sink, TunnelFrame::TcpReset { stream_id, code }, &token)
+                .await;
     }
 
     finish_tcp_download(
@@ -1239,7 +1224,6 @@ async fn handle_tcp_stream(
         &download_gate,
     )
     .await;
-
 }
 
 async fn pump_peer_to_destination(
@@ -1426,12 +1410,9 @@ async fn open_and_pump(
         // Keep the stream token live until the ordered reset is queued; its
         // parent still cancels it immediately if relay/session shutdown wins.
         if !token.is_cancelled() {
-            let _ = send_frame_until_cancelled(
-                sink,
-                TunnelFrame::TcpReset { stream_id, code },
-                token,
-            )
-            .await;
+            let _ =
+                send_frame_until_cancelled(sink, TunnelFrame::TcpReset { stream_id, code }, token)
+                    .await;
         }
     }
 
@@ -1531,9 +1512,9 @@ async fn udp_recv_loop(
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex as ParkingMutex;
     use std::collections::{HashMap, HashSet};
     use std::net::Ipv6Addr;
-    use parking_lot::Mutex as ParkingMutex;
 
     use super::super::options::{TunnelServerSession, TunnelTrafficDirection};
 
@@ -1568,7 +1549,6 @@ mod tests {
 
         fn disconnected(&self) {}
     }
-
 
     use super::super::carrier::{TunnelCarrierConfig, TunnelCarrierStore};
     use super::super::carrier_chunk::{
@@ -2240,9 +2220,11 @@ mod tests {
 
         data_rx.try_recv().unwrap();
         assert!(send.await.unwrap());
-        assert_eq!(download_uncredited.load(Ordering::Relaxed), b"response".len() as u64);
+        assert_eq!(
+            download_uncredited.load(Ordering::Relaxed),
+            b"response".len() as u64
+        );
     }
-
 
     #[tokio::test]
     async fn closed_writer_data_lane_rejects_reserved_tcp_publication() {
@@ -2297,7 +2279,9 @@ mod tests {
         };
         let (to_dest_tx, to_dest_rx) = mpsc::channel(1);
         to_dest_tx
-            .send(PeerToDest::Data(Bytes::from_static(b"must not be accounted")))
+            .send(PeerToDest::Data(Bytes::from_static(
+                b"must not be accounted",
+            )))
             .await
             .expect("queue peer payload");
 
@@ -2329,12 +2313,13 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind destination listener");
-        let destination_addr = listener
-            .local_addr()
-            .expect("destination listener address");
+        let destination_addr = listener.local_addr().expect("destination listener address");
         let (reset_tx, reset_rx) = tokio::sync::oneshot::channel();
         let destination = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept destination connection");
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("accept destination connection");
             reset_rx.await.expect("request destination reset");
             #[allow(deprecated)]
             {
@@ -2409,32 +2394,31 @@ mod tests {
         );
 
         assert!(
-            result
-                .expect("relay pump must finish")
-                .is_ok(),
+            result.expect("relay pump must finish").is_ok(),
             "post-open destination reset is reported on the wire, not as a second caller reset"
         );
         destination
             .await
             .expect("destination reset task must not panic");
-        assert!(token.is_cancelled(), "stream tears down only after its reset is sent");
+        assert!(
+            token.is_cancelled(),
+            "stream tears down only after its reset is sent"
+        );
     }
     #[tokio::test(flavor = "current_thread")]
     async fn relay_shutdown_joins_idle_watchdog() {
-        let (exit_gate, _clear_exit_gate) =
-            super::super::flow::install_idle_guard_exit_gate();
+        let (exit_gate, _clear_exit_gate) = super::super::flow::install_idle_guard_exit_gate();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind destination listener");
-        let destination_addr = listener
-            .local_addr()
-            .expect("destination listener address");
+        let destination_addr = listener.local_addr().expect("destination listener address");
         let (close_destination, wait_for_close) = tokio::sync::oneshot::channel();
         let destination = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept destination connection");
-            wait_for_close
+            let (stream, _) = listener
+                .accept()
                 .await
-                .expect("close destination connection");
+                .expect("accept destination connection");
+            wait_for_close.await.expect("close destination connection");
             drop(stream);
         });
 
@@ -2515,8 +2499,6 @@ mod tests {
         close_destination
             .send(())
             .expect("release destination connection");
-        destination
-            .await
-            .expect("destination task must not panic");
+        destination.await.expect("destination task must not panic");
     }
 }
