@@ -393,6 +393,16 @@ impl UserRegistry {
         Ok(user.snapshot())
     }
 
+    pub async fn snapshots(&self) -> Result<Vec<UserSnapshot>, RegistryError> {
+        let mut users = self.users.write().await;
+        let mut snapshots = users
+            .values_mut()
+            .map(ManagedUser::snapshot)
+            .collect::<Vec<_>>();
+        snapshots.sort_by_key(|snapshot| snapshot.id);
+        Ok(snapshots)
+    }
+
     fn publish_enabled_key_map(&self, users: &HashMap<Uuid, ManagedUser>) {
         self.by_key.store(Arc::new(enabled_key_map(users)));
     }
@@ -788,6 +798,18 @@ mod tests {
             .find(|stored| stored.record.id == user_id)
             .unwrap()
             .traffic
+    }
+
+    #[tokio::test]
+    async fn snapshots_returns_every_current_user() {
+        let registry = test_registry().await;
+        let alice = registry.create_user("alice").await.unwrap().user;
+        let bob = registry.create_user("bob").await.unwrap().user;
+
+        let snapshots = registry.snapshots().await.unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots.iter().any(|snapshot| snapshot.id == alice.id));
+        assert!(snapshots.iter().any(|snapshot| snapshot.id == bob.id));
     }
 
     #[tokio::test(start_paused = true)]
