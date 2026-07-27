@@ -1411,23 +1411,24 @@ async fn open_and_pump(
         }
     }
 
-    token.cancel();
-    let _ = peer_to_dest.await;
-
-    match result_code {
+    if let Some(code) = result_code {
         // TcpOpened was already sent, so surface late errors as a reset here
         // rather than via the caller's Err path (which would double-signal).
-        Some(code) => {
+        // Keep the stream token live until the ordered reset is queued; its
+        // parent still cancels it immediately if relay/session shutdown wins.
+        if !token.is_cancelled() {
             let _ = send_frame_until_cancelled(
                 sink,
                 TunnelFrame::TcpReset { stream_id, code },
                 token,
             )
             .await;
-            Ok(())
         }
-        None => Ok(()),
     }
+
+    token.cancel();
+    let _ = peer_to_dest.await;
+    Ok(())
 }
 
 // ── Per-UDP-association egress ──────────────────────────────────────────────
@@ -2311,5 +2312,100 @@ mod tests {
             session.recorded().is_empty(),
             "a cancelled destination writer must not record payload after its parent has stopped"
         );
+    }
+    #[tokio::test]
+    async fn destination_read_error_after_tcp_opened_sends_one_reset() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind destination listener");
+        let destination_addr = listener
+            .local_addr()
+            .expect("destination listener address");
+        let (reset_tx, reset_rx) = tokio::sync::oneshot::channel();
+        let destination = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept destination connection");
+            reset_rx.await.expect("request destination reset");
+            #[allow(deprecated)]
+            {
+                stream
+                    .set_linger(Some(Duration::ZERO))
+                    .expect("configure destination reset");
+            }
+            drop(stream);
+        });
+
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        let (data_tx, mut data_rx) = mpsc::channel(1);
+        let sink = FrameSink {
+            control_tx,
+            data_tx,
+            data_liveness: Arc::new(ParkingMutex::new(DataLaneLiveness {
+                receiver_open: true,
+            })),
+        };
+        let token = CancellationToken::new();
+        let idle = IdleGuard::spawn(Duration::from_secs(60), token.clone());
+        let (_to_dest_tx, to_dest_rx) = mpsc::channel(1);
+        let session: Arc<dyn TunnelServerSession> = Arc::new(RecordingSession::new());
+        let egress = EgressPolicy::default();
+        let send_credit = SendCredit::with_window(0);
+        let download_uncredited = Arc::new(AtomicU64::new(0));
+        let download_gate = Arc::new(Mutex::new(()));
+        let observe_reset = async {
+            let opened = tokio::time::timeout(Duration::from_secs(1), control_rx.recv())
+                .await
+                .expect("TcpOpened must arrive before destination failure")
+                .expect("control lane must stay open");
+            assert!(
+                matches!(opened, TunnelFrame::TcpOpened { stream_id: 7, .. }),
+                "destination failure must occur after TcpOpened, got {opened:?}"
+            );
+            reset_tx.send(()).expect("signal destination reset");
+
+            let reset = tokio::time::timeout(Duration::from_secs(1), data_rx.recv())
+                .await
+                .expect("post-open destination error must emit TcpReset")
+                .expect("data lane must stay open");
+            assert_eq!(
+                reset,
+                TunnelFrame::TcpReset {
+                    stream_id: 7,
+                    code: TunnelErrorCode::ConnectionRefused,
+                }
+            );
+            assert!(
+                data_rx.try_recv().is_err(),
+                "a post-open destination error must emit exactly one TcpReset"
+            );
+        };
+        let pump = open_and_pump(
+            7,
+            "127.0.0.1".to_owned(),
+            destination_addr.port(),
+            &egress,
+            &sink,
+            session,
+            to_dest_rx,
+            &send_credit,
+            &idle,
+            download_uncredited,
+            download_gate,
+            &token,
+        );
+        let (result, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(1), pump),
+            observe_reset
+        );
+
+        assert!(
+            result
+                .expect("relay pump must finish")
+                .is_ok(),
+            "post-open destination reset is reported on the wire, not as a second caller reset"
+        );
+        destination
+            .await
+            .expect("destination reset task must not panic");
+        assert!(token.is_cancelled(), "stream tears down only after its reset is sent");
     }
 }
