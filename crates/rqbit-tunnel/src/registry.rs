@@ -1,6 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     future::Future,
+    ops::Bound::{Excluded, Unbounded},
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
@@ -22,7 +23,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    model::{TrafficTotals, UserRecord, UserSnapshot},
+    model::{
+        MAX_USER_NAME_BYTES, MAX_USER_PAGE_SIZE, TrafficTotals, UserPage, UserRecord,
+        UserSnapshot,
+    },
     store::{ServerStore, StoreError, current_unix_seconds},
 };
 
@@ -47,6 +51,12 @@ pub enum RegistryError {
     OperationTaskClosed,
     #[error("registry flush interval must not be zero")]
     ZeroFlushInterval,
+    #[error("user name is {length} bytes, exceeding the {max} byte control-plane limit")]
+    UserNameTooLong { length: usize, max: usize },
+    #[error("user page size {requested} is outside 1..={max}")]
+    InvalidPageSize { requested: usize, max: usize },
+    #[error("the legacy user list response exceeds one bounded page")]
+    PaginationRequired,
     #[error("user {0} does not exist")]
     UserNotFound(Uuid),
 }
@@ -55,7 +65,7 @@ pub enum RegistryError {
 pub struct UserRegistry {
     store: ServerStore,
     by_key: ArcSwap<HashMap<TunnelPublicKey, Arc<UserMeter>>>,
-    users: RwLock<HashMap<Uuid, ManagedUser>>,
+    users: RwLock<BTreeMap<Uuid, ManagedUser>>,
     flush_worker: FlushWorker,
     mutations: Semaphore,
 }
@@ -110,7 +120,7 @@ impl UserRegistry {
         }
 
         let stored_users = store.load_users().await?;
-        let mut users = HashMap::with_capacity(stored_users.len());
+        let mut users = BTreeMap::new();
 
         for stored in stored_users {
             let user_id = stored.record.id;
@@ -167,6 +177,7 @@ impl UserRegistry {
         name: impl Into<String>,
     ) -> Result<CreatedUser, RegistryError> {
         let name = name.into();
+        validate_user_name(&name)?;
         self.run_owned_operation(move |registry| async move {
             registry.create_user_inner(name).await
         })
@@ -393,17 +404,42 @@ impl UserRegistry {
         Ok(user.snapshot())
     }
 
-    pub async fn snapshots(&self) -> Result<Vec<UserSnapshot>, RegistryError> {
+    pub async fn snapshot_page(
+        &self,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<UserPage, RegistryError> {
+        if !(1..=MAX_USER_PAGE_SIZE).contains(&limit) {
+            return Err(RegistryError::InvalidPageSize {
+                requested: limit,
+                max: MAX_USER_PAGE_SIZE,
+            });
+        }
+
         let mut users = self.users.write().await;
-        let mut snapshots = users
-            .values_mut()
-            .map(ManagedUser::snapshot)
-            .collect::<Vec<_>>();
-        snapshots.sort_by_key(|snapshot| snapshot.id);
-        Ok(snapshots)
+        let start: std::ops::Bound<Uuid> = after.map_or(Unbounded, Excluded);
+        let mut entries = users.range_mut((start, Unbounded));
+        let mut snapshots = Vec::with_capacity(limit);
+        for _ in 0..limit {
+            let Some((_user_id, user)) = entries.next() else {
+                break;
+            };
+            snapshots.push(user.snapshot());
+        }
+        let next_page = entries
+            .next()
+            .is_some()
+            .then(|| snapshots.last().map(|snapshot| snapshot.id))
+            .flatten();
+
+        Ok(UserPage {
+            users: snapshots,
+            next_page,
+        })
     }
 
-    fn publish_enabled_key_map(&self, users: &HashMap<Uuid, ManagedUser>) {
+
+    fn publish_enabled_key_map(&self, users: &BTreeMap<Uuid, ManagedUser>) {
         self.by_key.store(Arc::new(enabled_key_map(users)));
     }
 
@@ -424,6 +460,29 @@ impl UserRegistry {
 
         Ok(())
     }
+}
+
+fn bounded_snapshot_name(name: &str) -> (String, Option<usize>) {
+    if name.len() <= MAX_USER_NAME_BYTES {
+        return (name.to_owned(), None);
+    }
+
+    let mut end = MAX_USER_NAME_BYTES;
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    (name[..end].to_owned(), Some(name.len()))
+}
+
+fn validate_user_name(name: &str) -> Result<(), RegistryError> {
+    if name.len() > MAX_USER_NAME_BYTES {
+        return Err(RegistryError::UserNameTooLong {
+            length: name.len(),
+            max: MAX_USER_NAME_BYTES,
+        });
+    }
+
+    Ok(())
 }
 
 
@@ -570,9 +629,11 @@ impl ManagedUser {
             }
         }
 
+        let (name, name_truncated_bytes) = bounded_snapshot_name(&self.record.name);
         UserSnapshot {
             id: self.record.id,
-            name: self.record.name.clone(),
+            name,
+            name_truncated_bytes,
             enabled: self.record.enabled,
             connected,
             traffic,
@@ -718,7 +779,7 @@ impl TunnelServerSession for UserMeter {
 
 
 
-fn enabled_key_map(users: &HashMap<Uuid, ManagedUser>) -> HashMap<TunnelPublicKey, Arc<UserMeter>> {
+fn enabled_key_map(users: &BTreeMap<Uuid, ManagedUser>) -> HashMap<TunnelPublicKey, Arc<UserMeter>> {
     users
         .values()
         .filter(|user| user.record.enabled)
@@ -741,7 +802,8 @@ mod tests {
     use rusqlite::{params, Connection};
 
     use crate::{
-        model::TrafficTotals,
+        ipc::protocol::{MAX_FRAME_BYTES, ServerResponse, encode_response},
+        model::{MAX_USER_NAME_BYTES, TrafficTotals, UserRecord},
         paths::ServerPaths,
         store::ServerStore,
     };
@@ -801,15 +863,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshots_returns_every_current_user() {
+    async fn snapshot_page_returns_every_current_user_when_the_page_is_large_enough() {
         let registry = test_registry().await;
         let alice = registry.create_user("alice").await.unwrap().user;
         let bob = registry.create_user("bob").await.unwrap().user;
 
-        let snapshots = registry.snapshots().await.unwrap();
-        assert_eq!(snapshots.len(), 2);
-        assert!(snapshots.iter().any(|snapshot| snapshot.id == alice.id));
-        assert!(snapshots.iter().any(|snapshot| snapshot.id == bob.id));
+        let page = registry.snapshot_page(None, 2).await.unwrap();
+        assert_eq!(page.users.len(), 2);
+        assert!(page.users.iter().any(|snapshot| snapshot.id == alice.id));
+        assert!(page.users.iter().any(|snapshot| snapshot.id == bob.id));
+        assert!(page.next_page.is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1193,5 +1256,57 @@ mod tests {
                 download: 5,
             }
         );
+    }
+    #[tokio::test]
+    async fn legacy_overlong_name_reopens_and_lists_with_bounded_display_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = ServerPaths::under(directory.path()).database_path();
+        let legacy_name = "é".repeat(MAX_FRAME_BYTES);
+        assert!(legacy_name.len() > MAX_FRAME_BYTES);
+        let user = UserRecord {
+            id: uuid::Uuid::new_v4(),
+            name: legacy_name.clone(),
+            public_key: [7; 32],
+            enabled: true,
+            created_at: 0,
+            reset_at: None,
+        };
+
+        let store = ServerStore::open(&database_path).await.unwrap();
+        store.create_user(&user).await.unwrap();
+        drop(store);
+
+        let registry = UserRegistry::open(ServerStore::open(&database_path).await.unwrap())
+            .await
+            .unwrap();
+        let page = registry.snapshot_page(None, 1).await.unwrap();
+        assert_eq!(page.users.len(), 1);
+        let snapshot = &page.users[0];
+        assert_eq!(snapshot.id, user.id);
+        assert!(snapshot.name.len() <= MAX_USER_NAME_BYTES);
+        assert_ne!(snapshot.name, legacy_name);
+        assert_eq!(
+            serde_json::to_value(snapshot).unwrap()["name_truncated_bytes"],
+            serde_json::json!(legacy_name.len())
+        );
+
+        registry.set_enabled(user.id, false).await.unwrap();
+        let stored = registry.store.load_users().await.unwrap().pop().unwrap();
+        assert_eq!(stored.record.name, legacy_name);
+        let encoded = encode_response(&ServerResponse::UserPage(page)).unwrap();
+        assert!(encoded.len() <= MAX_FRAME_BYTES);
+
+
+        registry.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_user_rejects_a_name_over_the_control_plane_limit() {
+        let registry = test_registry().await;
+
+        assert!(registry.create_user("x".repeat(65)).await.is_err());
+        assert!(registry.snapshot_page(None, 1).await.unwrap().users.is_empty());
+
+        registry.shutdown().await.unwrap();
     }
 }

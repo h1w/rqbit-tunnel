@@ -7,6 +7,15 @@ use uuid::Uuid;
 
 pub const BUNDLE_SCHEMA_VERSION: u32 = 1;
 pub const SERVER_CONFIG_SCHEMA_VERSION: u32 = 1;
+/// Maximum UTF-8 byte length accepted for an administrative user name.
+///
+/// Keeping names small bounds every control-plane snapshot without requiring a
+/// serializer to materialize an unbounded response.
+pub const MAX_USER_NAME_BYTES: usize = 64;
+/// Maximum users that can appear in one control-plane page.
+pub const MAX_USER_PAGE_SIZE: usize = 32;
+/// Default page size for a user list request.
+pub const DEFAULT_USER_PAGE_SIZE: usize = MAX_USER_PAGE_SIZE;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -95,6 +104,10 @@ pub struct UserRecord {
 pub struct UserSnapshot {
     pub id: Uuid,
     pub name: String,
+    /// `Some(original_byte_length)` means `name` is a bounded display prefix rather
+    /// than the complete stored name; use `id` as the management identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_truncated_bytes: Option<usize>,
     pub enabled: bool,
     pub connected: usize,
     pub traffic: TrafficTotals,
@@ -105,6 +118,13 @@ pub struct UserSnapshot {
 pub struct TrafficTotals {
     pub upload: u64,
     pub download: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserPage {
+    pub users: Vec<UserSnapshot>,
+    /// The last user identifier in this page, if another page is available.
+    pub next_page: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
