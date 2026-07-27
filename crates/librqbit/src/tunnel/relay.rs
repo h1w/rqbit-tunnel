@@ -554,6 +554,7 @@ pub(crate) async fn run_server_relay(
         mut read_half,
         write_half,
         carrier_peer,
+        ..
     } = peer;
 
     let transport = Arc::new(Mutex::new(transport));

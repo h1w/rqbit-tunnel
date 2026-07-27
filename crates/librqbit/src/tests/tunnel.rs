@@ -6,6 +6,25 @@ use crate::tests::test_util::tunnel_fixture::TunnelFixture;
 use crate::tunnel::frame::{TunnelDestination, TunnelFrame};
 use bytes::Bytes;
 
+struct TestTunnelServerSession;
+
+impl crate::tunnel::options::TunnelServerSession for TestTunnelServerSession {
+    fn record_payload(
+        &self,
+        _direction: crate::tunnel::options::TunnelTrafficDirection,
+        _bytes: usize,
+    ) {
+    }
+
+    fn cancellation_token(&self) -> tokio_util::sync::CancellationToken {
+        tokio_util::sync::CancellationToken::new()
+    }
+
+    fn connected(&self) {}
+
+    fn disconnected(&self) {}
+}
+
 #[tokio::test]
 async fn minimal_tunnel_fixture_does_not_hang() {
     let fixture = crate::tests::test_util::tunnel_fixture::TunnelFixture::start().await;
@@ -282,6 +301,7 @@ async fn server_seeds_unknown_client_key_instead_of_dropping() {
         peer_listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
         identity_key: server_sk,
         allowed_client_keys: allowed,
+        authorizer: None,
         egress_policy: EgressPolicy::default(),
         carrier_root: carrier_dir.path().to_path_buf(),
     };
@@ -383,6 +403,7 @@ async fn server_admits_valid_allowlisted_client_via_accept() {
         peer_listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
         identity_key: server_sk,
         allowed_client_keys: allowed,
+        authorizer: None,
         egress_policy: EgressPolicy::default(),
         carrier_root: carrier_dir.path().to_path_buf(),
     };
@@ -495,6 +516,7 @@ async fn active_probe_gets_seeded_and_stays_connected() {
         peer_listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
         identity_key: server_sk,
         allowed_client_keys: allowed,
+        authorizer: None,
         egress_policy: EgressPolicy::default(),
         carrier_root: carrier_dir.path().to_path_buf(),
     };
@@ -915,6 +937,7 @@ async fn server_tunnel_starts_on_fixed_port_without_double_bind() {
                 peer_listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
                 identity_key: server_sk,
                 allowed_client_keys: allowed,
+                authorizer: None,
                 egress_policy: EgressPolicy::default(),
                 carrier_root: dir.path().join("carrier"),
             })),
@@ -1064,6 +1087,7 @@ async fn build_real_relay_pair_with_store() -> (
         carrier_peer.set_authenticated(true);
         AdmittedPeer {
             client_key,
+            session: std::sync::Arc::new(TestTunnelServerSession),
             transport,
             read_half,
             write_half,
@@ -1642,6 +1666,7 @@ async fn start_live_carrier_pool(
         peer_listen: server_addr,
         identity_key: server_sk,
         allowed_client_keys,
+        authorizer: None,
         egress_policy: EgressPolicy {
             allow_loopback: true,
             ..Default::default()
@@ -2512,6 +2537,7 @@ async fn full_stack_masquerade_is_spec_shaped_and_probe_resistant() {
         peer_listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
         identity_key: server_sk,
         allowed_client_keys: allowed,
+        authorizer: None,
         egress_policy: EgressPolicy::default(),
         carrier_root: server_carrier_dir.path().to_path_buf(),
     };

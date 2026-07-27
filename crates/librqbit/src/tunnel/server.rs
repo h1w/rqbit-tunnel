@@ -12,11 +12,14 @@ use std::time::Duration;
 use peer_binary_protocol::{Message, extended::ExtendedMessage};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use super::carrier::TunnelCarrierStore;
 use super::crypto::{self, NoiseTransport, TunnelCryptoError};
 use super::frame::{TunnelPrivateKey, TunnelPublicKey};
-use super::options::TunnelServerOptions;
+use super::options::{
+    TunnelServerAuthorizer, TunnelServerOptions, TunnelServerSession, TunnelTrafficDirection,
+};
 use super::peer_wire_crypto::PeerWireCrypto;
 
 // ── Admission error ─────────────────────────────────────────────────────────
@@ -46,10 +49,35 @@ pub enum TunnelAdmissionError {
 /// `rq_tunnel` extended messages carrying Noise chunks, with piece cover).
 pub(crate) struct AdmittedPeer {
     pub client_key: TunnelPublicKey,
+    pub session: Arc<dyn TunnelServerSession>,
     pub transport: NoiseTransport,
     pub read_half: super::carrier_wire::CarrierReadHalf,
     pub write_half: super::carrier_wire::CarrierWriteHalf,
     pub carrier_peer: super::carrier_peer::TunnelCarrierPeer,
+}
+
+struct StaticAllowlistSession {
+    shutdown: CancellationToken,
+}
+
+impl StaticAllowlistSession {
+    fn new() -> Self {
+        Self {
+            shutdown: CancellationToken::new(),
+        }
+    }
+}
+
+impl TunnelServerSession for StaticAllowlistSession {
+    fn record_payload(&self, _direction: TunnelTrafficDirection, _bytes: usize) {}
+
+    fn cancellation_token(&self) -> CancellationToken {
+        self.shutdown.clone()
+    }
+
+    fn connected(&self) {}
+
+    fn disconnected(&self) {}
 }
 
 // ── Accept outcome ───────────────────────────────────────────────────────────
@@ -111,9 +139,13 @@ async fn seed_until_promoted(
     carrier_peer: &mut super::carrier_peer::TunnelCarrierPeer,
     identity_key: &TunnelPrivateKey,
     allowed: &HashSet<TunnelPublicKey>,
+    authorizer: Option<&Arc<dyn TunnelServerAuthorizer>>,
     idle: Duration,
     deadline: Duration,
-) -> Result<Option<(NoiseTransport, TunnelPublicKey)>, TunnelAdmissionError> {
+) -> Result<
+    Option<(NoiseTransport, TunnelPublicKey, Arc<dyn TunnelServerSession>)>,
+    TunnelAdmissionError,
+> {
     let seed = async {
         let mut defrag = super::carrier_chunk::CarrierDefragmenter::new(
             super::carrier_chunk::MAX_CARRIER_CIPHERTEXT,
@@ -161,8 +193,17 @@ async fn seed_until_promoted(
                             continue;
                         }
                         noise_attempts += 1;
-                        match crypto::responder_accept(identity_key, &ciphertext, allowed) {
-                            Ok((transport, key, reply)) => {
+                        match crypto::responder_accept_with(identity_key, &ciphertext, |key| {
+                            authorizer
+                                .and_then(|authorizer| authorizer.authorize(key))
+                                .or_else(|| {
+                                    allowed.contains(key).then(|| {
+                                        Arc::new(StaticAllowlistSession::new())
+                                            as Arc<dyn TunnelServerSession>
+                                    })
+                                })
+                        }) {
+                            Ok((transport, key, session, reply)) => {
                                 for chunk in super::carrier_chunk::chunk_ciphertext(&reply) {
                                     write_half.send_tunnel(&chunk).await.map_err(|e| {
                                         TunnelAdmissionError::CarrierHandshakeFailed(
@@ -170,7 +211,7 @@ async fn seed_until_promoted(
                                         )
                                     })?;
                                 }
-                                return Ok(Some((transport, key))); // PROMOTE
+                                return Ok(Some((transport, key, session))); // PROMOTE
                             }
                             Err(_) => {
                                 // Bad Noise / non-allowlisted key: no reply, no
@@ -212,6 +253,22 @@ async fn seed_until_promoted(
         Ok(result) => result,
         Err(_elapsed) => Ok(None), // overall seed-window elapsed: normal idle disconnect, no tell
     }
+}
+
+fn relay_shutdown(
+    peer_shutdown: CancellationToken,
+    session: &dyn TunnelServerSession,
+) -> CancellationToken {
+    let relay_shutdown = peer_shutdown.child_token();
+    let user_shutdown = session.cancellation_token();
+    let bridge_shutdown = relay_shutdown.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = peer_shutdown.cancelled() => bridge_shutdown.cancel(),
+            _ = user_shutdown.cancelled() => bridge_shutdown.cancel(),
+        }
+    });
+    relay_shutdown
 }
 
 // ── Pre-auth connection admission caps (Plan B, Task 2) ─────────────────────
@@ -431,12 +488,13 @@ impl TunnelServer {
             &mut carrier_peer,
             &self.options.identity_key,
             &self.options.allowed_client_keys,
+            self.options.authorizer.as_ref(),
             super::config::SEEDER_IDLE,
             super::config::SEED_WINDOW_DEADLINE,
         )
         .await?
         {
-            Some((transport, client_key)) => {
+            Some((transport, client_key, session)) => {
                 // Clear any transient pre-auth choke (from losing the optimistic
                 // upload-slot race) so the now-authenticated connection serves
                 // its post-auth cover Request/Piece traffic normally in the
@@ -452,8 +510,10 @@ impl TunnelServer {
                 // session without ever hitting the cap.
                 carrier_peer.set_authenticated(true);
                 self.peers.write().await.insert(client_key.clone(), true);
+                session.connected();
                 Ok(AcceptOutcome::Admitted(Box::new(AdmittedPeer {
                     client_key,
+                    session,
                     transport,
                     read_half,
                     write_half,
@@ -469,7 +529,7 @@ impl TunnelServer {
     pub async fn run(
         self: &Arc<Self>,
         listener: TcpListener,
-        shutdown: tokio_util::sync::CancellationToken,
+        shutdown: CancellationToken,
     ) {
         // Build the runtime egress policy once and share it across all peers.
         let egress = Arc::new(super::egress::EgressPolicy::from_config(
@@ -521,13 +581,18 @@ impl TunnelServer {
                                         // legitimate users.
                                         drop(_guard);
                                         let client_key = peer.client_key.clone();
+                                        let session = peer.session.clone();
+                                        let relay_shutdown =
+                                            relay_shutdown(peer_shutdown.clone(), session.as_ref());
                                         tracing::info!(?client_key, %addr, "tunnel peer admitted");
                                         super::relay::run_server_relay(
                                             *peer,
                                             egress,
-                                            peer_shutdown,
+                                            relay_shutdown,
                                         )
                                         .await;
+                                        peer_shutdown.cancel();
+                                        session.disconnected();
                                         server.remove_peer(&client_key).await;
                                     }
                                     Ok(AcceptOutcome::Seeded) => {
@@ -580,11 +645,17 @@ impl TunnelServer {
 mod tests {
     use std::collections::HashSet;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::super::frame::{TunnelPrivateKey, TunnelPublicKey};
-    use super::super::options::{EgressPolicy, TunnelServerOptions};
+    use super::super::options::{
+        EgressPolicy, TunnelServerAuthorizer, TunnelServerOptions, TunnelServerSession,
+        TunnelTrafficDirection,
+    };
     use super::*;
     use librqbit_core::Id20;
+    use tokio_util::sync::CancellationToken;
 
     fn known_key() -> TunnelPublicKey {
         let mut key = [0u8; 32];
@@ -613,8 +684,53 @@ mod tests {
             peer_listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
             identity_key: server_key(),
             allowed_client_keys: allowed,
+            authorizer: None,
             egress_policy: EgressPolicy::default(),
             carrier_root: std::path::PathBuf::from("/tmp/test-carrier"),
+        }
+    }
+
+    struct RecordingSession {
+        shutdown: CancellationToken,
+        connected: AtomicUsize,
+        disconnected: AtomicUsize,
+    }
+
+    impl RecordingSession {
+        fn new() -> Self {
+            Self {
+                shutdown: CancellationToken::new(),
+                connected: AtomicUsize::new(0),
+                disconnected: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl TunnelServerSession for RecordingSession {
+        fn record_payload(&self, _direction: TunnelTrafficDirection, _bytes: usize) {}
+
+        fn cancellation_token(&self) -> CancellationToken {
+            self.shutdown.clone()
+        }
+
+        fn connected(&self) {
+            self.connected.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn disconnected(&self) {
+            self.disconnected.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct KeyAuthorizer {
+        key: TunnelPublicKey,
+        session: Arc<RecordingSession>,
+    }
+
+    impl TunnelServerAuthorizer for KeyAuthorizer {
+        fn authorize(&self, key: &TunnelPublicKey) -> Option<Arc<dyn TunnelServerSession>> {
+            (key == &self.key)
+                .then(|| self.session.clone() as Arc<dyn TunnelServerSession>)
         }
     }
 
@@ -692,6 +808,25 @@ mod tests {
         // Full tracking is exercised via accept() in integration tests.
     }
 
+    #[tokio::test]
+    async fn cancelling_an_admitted_session_cancels_relay_shutdown() {
+        let global_shutdown = CancellationToken::new();
+        let session = RecordingSession::new();
+        let relay_shutdown = relay_shutdown(global_shutdown.child_token(), &session);
+
+        session.shutdown.cancel();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            relay_shutdown.cancelled(),
+        )
+        .await
+        .expect("session cancellation must cancel the relay token");
+        assert!(
+            !global_shutdown.is_cancelled(),
+            "session revocation must not cancel the global server token"
+        );
+    }
+
     #[test]
     fn server_rejects_unknown_client_after_static_key_handshake() {
         let err = TunnelAdmissionError::ClientNotAllowed(unknown_key());
@@ -751,6 +886,7 @@ mod tests {
                 &mut carrier_peer,
                 &identity_key,
                 &allowed,
+                None,
                 std::time::Duration::from_millis(500),
                 std::time::Duration::from_secs(5),
             )
@@ -817,7 +953,7 @@ mod tests {
             .expect("seed_until_promoted must not error");
         assert!(
             outcome.is_none(),
-            "expected no promotion after client disconnect, got {outcome:?}"
+            "expected no promotion after client disconnect"
         );
     }
 
@@ -853,6 +989,7 @@ mod tests {
                 &mut carrier_peer,
                 &identity_key,
                 &allowed,
+                None,
                 std::time::Duration::from_secs(5),
                 std::time::Duration::from_secs(30),
             )
@@ -888,7 +1025,9 @@ mod tests {
             .expect("server task join")
             .expect("seed_until_promoted must not error");
         match outcome {
-            Some((_transport, key)) => assert_eq!(key, client_pk, "promoted client key mismatch"),
+            Some((_transport, key, _session)) => {
+                assert_eq!(key, client_pk, "promoted client key mismatch")
+            }
             None => panic!("expected promotion for a valid allowlisted Noise handshake"),
         }
     }
@@ -956,6 +1095,7 @@ mod tests {
                 &mut carrier_peer,
                 &identity_key,
                 &allowed,
+                None,
                 std::time::Duration::from_secs(5),
                 std::time::Duration::from_secs(30),
             )
@@ -1004,7 +1144,9 @@ mod tests {
             .expect("server task join")
             .expect("seed_until_promoted must not error");
         match outcome {
-            Some((_t, key)) => assert_eq!(key, client_pk, "promoted client key mismatch"),
+            Some((_transport, key, _session)) => {
+                assert_eq!(key, client_pk, "promoted client key mismatch")
+            }
             None => panic!("a valid init after an out-of-band flood must still promote"),
         }
     }
@@ -1045,6 +1187,7 @@ mod tests {
                 &mut carrier_peer,
                 &identity_key,
                 &allowed,
+                None,
                 std::time::Duration::from_secs(5),
                 std::time::Duration::from_secs(30),
             )
@@ -1108,7 +1251,7 @@ mod tests {
             .expect("seed_until_promoted must not error");
         assert!(
             outcome.is_none(),
-            "a valid init sent AFTER the attempt cap is spent must not promote, got {outcome:?}"
+            "a valid init sent AFTER the attempt cap is spent must not promote"
         );
     }
 
@@ -1144,6 +1287,7 @@ mod tests {
                 &mut carrier_peer,
                 &identity_key,
                 &allowed,
+                None,
                 std::time::Duration::from_millis(500),
                 std::time::Duration::from_secs(5),
             )
@@ -1190,7 +1334,7 @@ mod tests {
             .await
             .expect("server task join")
             .expect("seed_until_promoted must not error");
-        assert!(outcome.is_none(), "no promotion expected, got {outcome:?}");
+        assert!(outcome.is_none(), "no promotion expected");
     }
 
     /// A promoted (authenticated) peer must have its PRE-AUTH pieces-served
@@ -1198,7 +1342,7 @@ mod tests {
     /// authenticated relay. Drives the full `accept` path, serving one pre-auth
     /// Piece first, then promoting.
     #[tokio::test]
-    async fn accept_resets_pieces_served_on_promotion() {
+    async fn accept_promotes_dynamic_authorized_peer() {
         use super::super::carrier_chunk::{
             CarrierDefragmenter, MAX_CARRIER_CIPHERTEXT, chunk_ciphertext, recv_one_ciphertext,
         };
@@ -1211,7 +1355,15 @@ mod tests {
         let (client_sk, client_pk) = crypto::generate_keypair();
         let (_dir, store) = test_carrier_store(&identity_key).await;
         let info_hash = store.descriptor().handshake_info_hash;
-        let opts = test_server_options(allowed_client_keys(std::slice::from_ref(&client_pk)));
+        let session = Arc::new(RecordingSession::new());
+        let opts = TunnelServerOptions {
+            allowed_client_keys: HashSet::new(),
+            authorizer: Some(Arc::new(KeyAuthorizer {
+                key: client_pk.clone(),
+                session: session.clone(),
+            })),
+            ..test_server_options(HashSet::new())
+        };
         let server = TunnelServer::new(opts, store.clone());
 
         let listener = tokio::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
@@ -1253,7 +1405,7 @@ mod tests {
         };
         assert!(got_piece, "expected a pre-auth Piece cover response");
 
-        // Now promote with a valid allowlisted Noise init.
+        // Now promote with a valid dynamically authorized Noise init.
         let (handshake, noise_msg) =
             crypto::initiator_start(&client_sk, &server_pub).expect("initiator_start");
         for chunk in chunk_ciphertext(&noise_msg) {
@@ -1284,8 +1436,18 @@ mod tests {
                     "a promoted peer must be marked authenticated so on_request skips the \
                      pre-auth pieces self-choke"
                 );
+                assert_eq!(
+                    session.connected.load(Ordering::Relaxed),
+                    1,
+                    "an admitted dynamic session must be connected exactly once"
+                );
+                assert_eq!(
+                    session.disconnected.load(Ordering::Relaxed),
+                    0,
+                    "disconnect must wait for the relay task to end"
+                );
             }
-            AcceptOutcome::Seeded => panic!("a valid allowlisted client must be Admitted"),
+            AcceptOutcome::Seeded => panic!("a valid dynamically authorized client must be Admitted"),
         }
     }
 
@@ -1327,6 +1489,7 @@ mod tests {
                 &mut carrier_peer,
                 &identity_key,
                 &allowed,
+                None,
                 std::time::Duration::from_secs(10),
                 std::time::Duration::from_millis(200),
             )
@@ -1370,7 +1533,7 @@ mod tests {
         let outcome = result.expect("seed_until_promoted must not error");
         assert!(
             outcome.is_none(),
-            "expected no promotion (peer never authenticated), got {outcome:?}"
+            "expected no promotion (peer never authenticated)"
         );
         assert!(
             elapsed < std::time::Duration::from_secs(2),

@@ -929,6 +929,7 @@ fn build_tunnel_opts(opts: &mut Opts) -> anyhow::Result<Option<TunnelOptions>> {
                 peer_listen,
                 identity_key,
                 allowed_client_keys,
+                authorizer: None,
                 egress_policy,
                 carrier_root,
             })))

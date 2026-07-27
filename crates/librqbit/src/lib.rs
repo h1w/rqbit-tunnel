@@ -111,7 +111,10 @@ pub use librqbit_core::torrent_metainfo::*;
 
 pub use tunnel::crypto::generate_keypair as tunnel_generate_keypair;
 pub use tunnel::frame::{TunnelPairingBundle, TunnelPrivateKey, TunnelPublicKey};
-pub use tunnel::options::{EgressPolicy, TunnelClientOptions, TunnelOptions, TunnelServerOptions};
+pub use tunnel::options::{
+    EgressPolicy, TunnelClientOptions, TunnelOptions, TunnelServerAuthorizer, TunnelServerOptions,
+    TunnelServerSession, TunnelTrafficDirection,
+};
 
 #[cfg(test)]
 mod tests;

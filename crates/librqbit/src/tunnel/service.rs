@@ -182,6 +182,7 @@ mod tests {
             peer_listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
             identity_key: dummy_private(),
             allowed_client_keys: allowed,
+            authorizer: None,
             egress_policy: EgressPolicy::default(),
             carrier_root: PathBuf::from("/tmp/test-carrier"),
         });

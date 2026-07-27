@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use super::frame::{TunnelPairingBundle, TunnelPrivateKey, TunnelPublicKey};
 
@@ -77,7 +78,27 @@ impl Default for TunnelClientOptions {
 
 // ── Server configuration ────────────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
+/// Direction of payload bytes sent through a tunnel session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TunnelTrafficDirection {
+    Upload,
+    Download,
+}
+
+/// Per-peer session state supplied by a dynamic server authorizer.
+pub trait TunnelServerSession: Send + Sync + 'static {
+    fn record_payload(&self, direction: TunnelTrafficDirection, bytes: usize);
+    fn cancellation_token(&self) -> tokio_util::sync::CancellationToken;
+    fn connected(&self);
+    fn disconnected(&self);
+}
+
+/// Authorizes remote client keys and supplies their per-peer session state.
+pub trait TunnelServerAuthorizer: Send + Sync + 'static {
+    fn authorize(&self, key: &TunnelPublicKey) -> Option<Arc<dyn TunnelServerSession>>;
+}
+
+#[derive(Clone)]
 pub struct TunnelServerOptions {
     /// Address to listen for incoming tunnel peer connections.
     pub peer_listen: SocketAddr,
@@ -88,11 +109,27 @@ pub struct TunnelServerOptions {
     /// Set of client public keys allowed to connect.  REQUIRED — validated by `validate()`.
     pub allowed_client_keys: HashSet<TunnelPublicKey>,
 
+    /// Optional dynamic authorizer used in addition to the static allowlist.
+    pub authorizer: Option<Arc<dyn TunnelServerAuthorizer>>,
+
     /// Network egress policy for tunneled traffic.
     pub egress_policy: EgressPolicy,
 
     /// Path to the carrier-torrent store root.
     pub carrier_root: PathBuf,
+}
+
+impl std::fmt::Debug for TunnelServerOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TunnelServerOptions")
+            .field("peer_listen", &self.peer_listen)
+            .field("identity_key", &self.identity_key)
+            .field("allowed_client_keys", &self.allowed_client_keys)
+            .field("authorizer", &self.authorizer.is_some())
+            .field("egress_policy", &self.egress_policy)
+            .field("carrier_root", &self.carrier_root)
+            .finish()
+    }
 }
 
 // ── Egress policy ────────────────────────────────────────────────────────────
@@ -146,7 +183,7 @@ impl TunnelOptions {
                 Ok(())
             }
             TunnelOptions::Server(opts) => {
-                if opts.allowed_client_keys.is_empty() {
+                if opts.allowed_client_keys.is_empty() && opts.authorizer.is_none() {
                     return Err(TunnelConfigError::EmptyClientAllowlist);
                 }
                 Ok(())
@@ -159,6 +196,7 @@ impl TunnelOptions {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::net::{Ipv4Addr, SocketAddrV4};
 
     use super::*;
@@ -173,6 +211,45 @@ mod tests {
         let mut key = [0u8; 32];
         key[0] = 1;
         TunnelPrivateKey(key)
+    }
+    struct DynamicSession;
+
+    impl TunnelServerSession for DynamicSession {
+        fn record_payload(&self, _direction: TunnelTrafficDirection, _bytes: usize) {}
+
+        fn cancellation_token(&self) -> tokio_util::sync::CancellationToken {
+            tokio_util::sync::CancellationToken::new()
+        }
+
+        fn connected(&self) {}
+
+        fn disconnected(&self) {}
+    }
+
+    struct DynamicAuthorizer;
+
+    impl TunnelServerAuthorizer for DynamicAuthorizer {
+        fn authorize(&self, key: &TunnelPublicKey) -> Option<Arc<dyn TunnelServerSession>> {
+            (key == &TunnelPublicKey([9; 32]))
+                .then(|| Arc::new(DynamicSession) as Arc<dyn TunnelServerSession>)
+        }
+    }
+
+    #[test]
+    fn dynamic_authorizer_allows_an_empty_static_allowlist() {
+        let authorizer: Arc<dyn TunnelServerAuthorizer> = Arc::new(DynamicAuthorizer);
+        assert!(authorizer.authorize(&TunnelPublicKey([9; 32])).is_some());
+
+        let options = TunnelOptions::Server(TunnelServerOptions {
+            peer_listen: SocketAddr::from(([0, 0, 0, 0], 9091)),
+            identity_key: dummy_private_key(),
+            allowed_client_keys: HashSet::new(),
+            authorizer: Some(authorizer),
+            egress_policy: EgressPolicy::default(),
+            carrier_root: PathBuf::from("/tmp"),
+        });
+
+        assert!(options.validate().is_ok());
     }
 
     #[test]
@@ -233,6 +310,7 @@ mod tests {
             peer_listen: SocketAddr::from(([0, 0, 0, 0], 9091)),
             identity_key: dummy_private_key(),
             allowed_client_keys: HashSet::new(),
+            authorizer: None,
             egress_policy: EgressPolicy::default(),
             carrier_root: PathBuf::from("/tmp"),
         };
@@ -251,6 +329,7 @@ mod tests {
             peer_listen: SocketAddr::from(([0, 0, 0, 0], 9091)),
             identity_key: dummy_private_key(),
             allowed_client_keys: allowed,
+            authorizer: None,
             egress_policy: EgressPolicy::default(),
             carrier_root: PathBuf::from("/tmp"),
         };
