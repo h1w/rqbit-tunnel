@@ -4,6 +4,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+use std::sync::Condvar;
+
 use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 use tokio::task::spawn_blocking;
@@ -81,11 +84,48 @@ pub enum StoreError {
 #[derive(Clone)]
 pub struct ServerStore {
     connection: Arc<Mutex<Connection>>,
+    #[cfg(test)]
+    set_enabled_pause: Arc<Mutex<Option<Arc<SetEnabledPause>>>>,
 }
 
 pub(crate) struct StoredUser {
     pub(crate) record: UserRecord,
     pub(crate) traffic: TrafficTotals,
+}
+
+#[cfg(test)]
+pub(crate) struct SetEnabledPause {
+    started: tokio::sync::Notify,
+    release: (Mutex<bool>, Condvar),
+}
+
+#[cfg(test)]
+impl SetEnabledPause {
+    fn new() -> Self {
+        Self {
+            started: tokio::sync::Notify::new(),
+            release: (Mutex::new(false), Condvar::new()),
+        }
+    }
+
+    pub(crate) async fn wait_started(&self) {
+        self.started.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        let mut released = self.release.0.lock().expect("set-enabled pause mutex poisoned");
+        *released = true;
+        self.release.1.notify_all();
+    }
+
+    fn wait_for_release(&self) {
+        let released = self.release.0.lock().expect("set-enabled pause mutex poisoned");
+        let _released = self
+            .release
+            .1
+            .wait_while(released, |released| !*released)
+            .expect("set-enabled pause mutex poisoned");
+    }
 }
 
 impl ServerStore {
@@ -113,7 +153,21 @@ impl ServerStore {
 
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
+            #[cfg(test)]
+            set_enabled_pause: Arc::new(Mutex::new(None)),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_set_enabled(&self) -> Arc<SetEnabledPause> {
+        let pause = Arc::new(SetEnabledPause::new());
+        let mut slot = self
+            .set_enabled_pause
+            .lock()
+            .expect("set-enabled pause mutex poisoned");
+        assert!(slot.is_none(), "a set-enabled pause is already installed");
+        *slot = Some(Arc::clone(&pause));
+        pause
     }
 
     pub async fn create_user(&self, user: &UserRecord) -> Result<(), StoreError> {
@@ -274,6 +328,13 @@ impl ServerStore {
     }
 
     pub async fn set_enabled(&self, user_id: Uuid, enabled: bool) -> Result<(), StoreError> {
+        #[cfg(test)]
+        let pause = self
+            .set_enabled_pause
+            .lock()
+            .expect("set-enabled pause mutex poisoned")
+            .take();
+
         self.run(move |connection| {
             let transaction = connection.transaction()?;
             require_user(
@@ -283,6 +344,11 @@ impl ServerStore {
                 )?,
                 user_id,
             )?;
+            #[cfg(test)]
+            if let Some(pause) = pause {
+                pause.started.notify_one();
+                pause.wait_for_release();
+            }
             transaction.commit()?;
             Ok(())
         })

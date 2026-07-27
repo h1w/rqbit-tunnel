@@ -1,7 +1,8 @@
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -14,7 +15,7 @@ use librqbit::{
 };
 use thiserror::Error;
 use tokio::{
-    sync::{Mutex, RwLock, Semaphore},
+    sync::{Mutex, RwLock, Semaphore, oneshot},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -42,6 +43,8 @@ pub enum RegistryError {
     FlushWorker(#[from] tokio::task::JoinError),
     #[error("registry mutation gate is closed")]
     MutationGateClosed,
+    #[error("registry operation task stopped before returning a result")]
+    OperationTaskClosed,
     #[error("registry flush interval must not be zero")]
     ZeroFlushInterval,
     #[error("user {0} does not exist")]
@@ -61,7 +64,7 @@ struct ManagedUser {
     record: UserRecord,
     counters: Arc<UserCounters>,
     meter: Arc<UserMeter>,
-    retired_meters: Vec<Arc<UserMeter>>,
+    retired_meters: Vec<Weak<UserMeter>>,
 }
 
 
@@ -138,10 +141,39 @@ impl UserRegistry {
         Ok(registry)
     }
 
+    async fn run_owned_operation<T, F, Fut>(
+        self: &Arc<Self>,
+        operation: F,
+    ) -> Result<T, RegistryError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<Self>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, RegistryError>> + Send + 'static,
+    {
+        let (result_sender, result_receiver) = oneshot::channel();
+        let registry = Arc::clone(self);
+        let _ = tokio::spawn(async move {
+            let result = operation(registry).await;
+            let _ = result_sender.send(result);
+        });
+
+        result_receiver
+            .await
+            .map_err(|_| RegistryError::OperationTaskClosed)?
+    }
+
     pub async fn create_user(
-        &self,
+        self: &Arc<Self>,
         name: impl Into<String>,
     ) -> Result<CreatedUser, RegistryError> {
+        let name = name.into();
+        self.run_owned_operation(move |registry| async move {
+            registry.create_user_inner(name).await
+        })
+        .await
+    }
+
+    async fn create_user_inner(&self, name: String) -> Result<CreatedUser, RegistryError> {
         let _mutation = self
             .mutations
             .acquire()
@@ -150,7 +182,7 @@ impl UserRegistry {
         let (client_private_key, client_public_key) = tunnel_generate_keypair();
         let user = UserRecord {
             id: Uuid::new_v4(),
-            name: name.into(),
+            name,
             public_key: client_public_key.0,
             enabled: true,
             created_at: current_unix_seconds()?,
@@ -178,7 +210,14 @@ impl UserRegistry {
         })
     }
 
-    pub async fn delete_user(&self, user_id: Uuid) -> Result<(), RegistryError> {
+    pub async fn delete_user(self: &Arc<Self>, user_id: Uuid) -> Result<(), RegistryError> {
+        self.run_owned_operation(move |registry| async move {
+            registry.delete_user_inner(user_id).await
+        })
+        .await
+    }
+
+    async fn delete_user_inner(&self, user_id: Uuid) -> Result<(), RegistryError> {
         let _mutation = self
             .mutations
             .acquire()
@@ -193,7 +232,7 @@ impl UserRegistry {
 
         self.store.delete_user(user_id).await?;
 
-        let removed = {
+        let mut removed = {
             let mut users = self.users.write().await;
             let removed = users
                 .remove(&user_id)
@@ -209,7 +248,12 @@ impl UserRegistry {
         Ok(())
     }
 
-    pub async fn flush(&self) -> Result<(), RegistryError> {
+    pub async fn flush(self: &Arc<Self>) -> Result<(), RegistryError> {
+        self.run_owned_operation(|registry| async move { registry.flush_inner().await })
+            .await
+    }
+
+    async fn flush_inner(&self) -> Result<(), RegistryError> {
         let _mutation = self
             .mutations
             .acquire()
@@ -231,12 +275,27 @@ impl UserRegistry {
     }
 
     /// Stops periodic persistence, waits for the worker, then flushes once.
-    pub async fn shutdown(&self) -> Result<(), RegistryError> {
-        self.flush_worker.stop().await?;
-        self.flush().await
+    pub async fn shutdown(self: &Arc<Self>) -> Result<(), RegistryError> {
+        self.run_owned_operation(|registry| async move { registry.shutdown_inner().await })
+            .await
     }
 
-    pub async fn reset_traffic(&self, user_id: Uuid) -> Result<(), RegistryError> {
+    async fn shutdown_inner(&self) -> Result<(), RegistryError> {
+        self.flush_worker.stop().await?;
+        self.flush_inner().await
+    }
+
+    pub async fn reset_traffic(
+        self: &Arc<Self>,
+        user_id: Uuid,
+    ) -> Result<(), RegistryError> {
+        self.run_owned_operation(move |registry| async move {
+            registry.reset_traffic_inner(user_id).await
+        })
+        .await
+    }
+
+    async fn reset_traffic_inner(&self, user_id: Uuid) -> Result<(), RegistryError> {
         let _mutation = self
             .mutations
             .acquire()
@@ -265,7 +324,22 @@ impl UserRegistry {
         Ok(())
     }
 
-    pub async fn set_enabled(&self, user_id: Uuid, enabled: bool) -> Result<(), RegistryError> {
+    pub async fn set_enabled(
+        self: &Arc<Self>,
+        user_id: Uuid,
+        enabled: bool,
+    ) -> Result<(), RegistryError> {
+        self.run_owned_operation(move |registry| async move {
+            registry.set_enabled_inner(user_id, enabled).await
+        })
+        .await
+    }
+
+    async fn set_enabled_inner(
+        &self,
+        user_id: Uuid,
+        enabled: bool,
+    ) -> Result<(), RegistryError> {
         let _mutation = self
             .mutations
             .acquire()
@@ -296,6 +370,7 @@ impl UserRegistry {
                 self.publish_enabled_key_map(&users);
                 None
             } else {
+                user.prune_retired_meters();
                 let meter = Arc::clone(&user.meter);
                 self.publish_enabled_key_map(&users);
                 Some(meter)
@@ -310,9 +385,9 @@ impl UserRegistry {
     }
 
     pub async fn snapshot(&self, user_id: Uuid) -> Result<UserSnapshot, RegistryError> {
-        let users = self.users.read().await;
+        let mut users = self.users.write().await;
         let user = users
-            .get(&user_id)
+            .get_mut(&user_id)
             .ok_or(RegistryError::UserNotFound(user_id))?;
 
         Ok(user.snapshot())
@@ -447,30 +522,42 @@ impl TunnelServerAuthorizer for UserRegistry {
 }
 
 impl ManagedUser {
-    fn meters(&self) -> Vec<Arc<UserMeter>> {
+    fn meters(&mut self) -> Vec<Arc<UserMeter>> {
+        self.prune_retired_meters();
+
         let mut meters = Vec::with_capacity(self.retired_meters.len() + 1);
         meters.push(Arc::clone(&self.meter));
-        meters.extend(self.retired_meters.iter().cloned());
+        meters.extend(
+            self.retired_meters
+                .iter()
+                .filter_map(Weak::upgrade),
+        );
         meters
     }
 
     fn replace_active_meter(&mut self) {
-        self.retired_meters.push(Arc::clone(&self.meter));
+        let retired = Arc::downgrade(&self.meter);
         self.meter = Arc::new(UserMeter::new(Arc::clone(&self.counters)));
+        self.retired_meters.push(retired);
+        self.prune_retired_meters();
     }
 
     fn reset_counters(&mut self) {
         self.counters.reset();
     }
 
-    fn snapshot(&self) -> UserSnapshot {
+    fn snapshot(&mut self) -> UserSnapshot {
+        self.prune_retired_meters();
+
         let traffic = self.counters.traffic();
         let mut connected = self.meter.connected();
         let mut last_seen = self.meter.last_seen();
 
         for retired in &self.retired_meters {
-            connected = connected.saturating_add(retired.connected());
-            last_seen = last_seen.max(retired.last_seen());
+            if let Some(retired) = retired.upgrade() {
+                connected = connected.saturating_add(retired.connected());
+                last_seen = last_seen.max(retired.last_seen());
+            }
         }
 
         UserSnapshot {
@@ -481,6 +568,11 @@ impl ManagedUser {
             traffic,
             last_seen,
         }
+    }
+
+    fn prune_retired_meters(&mut self) {
+        self.retired_meters
+            .retain(|meter| meter.strong_count() > 0);
     }
 }
 
@@ -652,10 +744,10 @@ mod tests {
     }
 
     impl Deref for TestRegistry {
-        type Target = UserRegistry;
+        type Target = Arc<UserRegistry>;
 
         fn deref(&self) -> &Self::Target {
-            self.registry.as_ref()
+            &self.registry
         }
     }
 
@@ -767,6 +859,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cancelling_set_enabled_after_its_store_write_keeps_live_and_durable_state_aligned() {
+        let (_directory, database_path, registry) =
+            test_registry_with_flush_interval(Duration::from_secs(60)).await;
+        let created = registry.create_user("alice").await.unwrap();
+        let user_id = created.user.id;
+        let public_key = created.user.public_key;
+        let pause = registry.store.pause_next_set_enabled();
+
+        let caller_registry = Arc::clone(&registry);
+        let caller = tokio::spawn(async move { caller_registry.set_enabled(user_id, false).await });
+        pause.wait_started().await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+
+        pause.release();
+        registry.flush().await.unwrap();
+
+        assert!(registry.authorize(&TunnelPublicKey(public_key)).is_none());
+        let reloaded = UserRegistry::open(ServerStore::open(database_path).await.unwrap())
+            .await
+            .unwrap();
+        assert!(
+            reloaded
+                .authorize(&TunnelPublicKey(public_key))
+                .is_none()
+        );
+        reloaded.shutdown().await.unwrap();
+        registry.shutdown().await.unwrap();
+    }
+
 
     #[tokio::test]
     async fn deleting_a_user_rejects_new_admission_and_cancels_existing_sessions() {
@@ -818,17 +941,18 @@ mod tests {
 
     #[tokio::test]
     async fn failed_flush_keeps_deltas_for_later_retry() {
-        let registry = test_registry().await;
+        let (_directory, database_path, registry) =
+            test_registry_with_flush_interval(Duration::from_secs(60)).await;
         let created = registry.create_user("alice").await.unwrap();
         let user = created.user;
         let session = registry.authorize(&TunnelPublicKey(user.public_key)).unwrap();
         session.record_payload(TunnelTrafficDirection::Upload, 9);
         session.record_payload(TunnelTrafficDirection::Download, 14);
 
-        let database_path = registry.database_path.clone();
+        let delete_path = database_path.clone();
         let restore_path = database_path.clone();
         tokio::task::spawn_blocking(move || {
-            let connection = Connection::open(database_path)?;
+            let connection = Connection::open(delete_path)?;
             connection.execute(
                 "DELETE FROM traffic_totals WHERE user_id = ?1",
                 params![user.id.to_string()],
@@ -868,13 +992,9 @@ mod tests {
                 download: 14,
             }
         );
-        let reloaded = UserRegistry::open(
-            ServerStore::open(registry.database_path.clone())
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let reloaded = UserRegistry::open(ServerStore::open(database_path).await.unwrap())
+            .await
+            .unwrap();
         assert_eq!(
             reloaded.snapshot(user.id).await.unwrap().traffic,
             TrafficTotals {
@@ -902,6 +1022,63 @@ mod tests {
                 .cancellation_token()
                 .is_cancelled()
         );
+    }
+
+    #[tokio::test]
+    async fn retired_session_authorized_before_reenable_remains_visible_after_connecting() {
+        let (_directory, _database_path, registry) =
+            test_registry_with_flush_interval(Duration::from_secs(60)).await;
+        let created = registry.create_user("alice").await.unwrap();
+        let user = created.user;
+        let retired = registry.authorize(&TunnelPublicKey(user.public_key)).unwrap();
+
+        registry.set_enabled(user.id, false).await.unwrap();
+        registry.set_enabled(user.id, true).await.unwrap();
+        retired.connected();
+
+        assert_eq!(registry.snapshot(user.id).await.unwrap().connected, 1);
+    }
+
+    #[tokio::test]
+    async fn inactive_reenable_cycles_do_not_retain_retired_meters() {
+        let (_directory, _database_path, registry) =
+            test_registry_with_flush_interval(Duration::from_secs(60)).await;
+        let created = registry.create_user("alice").await.unwrap();
+        let user = created.user;
+
+        for _ in 0..64 {
+            registry.set_enabled(user.id, false).await.unwrap();
+            registry.set_enabled(user.id, true).await.unwrap();
+        }
+
+        let users = registry.users.read().await;
+        assert!(
+            users
+                .get(&user.id)
+                .unwrap()
+                .retired_meters
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn draining_retired_sessions_remain_visible_and_are_cancelled_on_delete() {
+        let (_directory, _database_path, registry) =
+            test_registry_with_flush_interval(Duration::from_secs(60)).await;
+        let created = registry.create_user("alice").await.unwrap();
+        let user = created.user;
+        let retired = registry.authorize(&TunnelPublicKey(user.public_key)).unwrap();
+        retired.connected();
+
+        registry.set_enabled(user.id, false).await.unwrap();
+        registry.set_enabled(user.id, true).await.unwrap();
+        let active = registry.authorize(&TunnelPublicKey(user.public_key)).unwrap();
+        active.connected();
+
+        assert_eq!(registry.snapshot(user.id).await.unwrap().connected, 2);
+        registry.delete_user(user.id).await.unwrap();
+        assert!(retired.cancellation_token().is_cancelled());
+        assert!(active.cancellation_token().is_cancelled());
     }
 
     #[tokio::test]
