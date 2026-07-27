@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -284,6 +284,19 @@ pub fn derive_rates(
         .collect()
 }
 
+fn apply_pending_reset_rates(
+    rates: &mut HashMap<Uuid, TrafficRate>,
+    pending_resets: &mut HashSet<Uuid>,
+    snapshot: &ServerSnapshot,
+) {
+    for user in &snapshot.users {
+        if pending_resets.remove(&user.id) {
+            rates.insert(user.id, TrafficRate::default());
+        }
+    }
+    pending_resets.clear();
+}
+
 fn bytes_per_second(bytes: u64, elapsed: Duration) -> u64 {
     let elapsed_nanos = elapsed.as_nanos();
     if elapsed_nanos == 0 {
@@ -344,6 +357,7 @@ pub async fn run_server_tui(socket: PathBuf) -> Result<(), TuiError> {
     let mut terminal = TerminalSession::enter()?;
     let mut state = ServerTuiState::default();
     let mut previous_snapshot = None;
+    let mut pending_reset_users = HashSet::new();
     let mut refresh_due = true;
     let mut next_snapshot = Instant::now();
 
@@ -352,7 +366,7 @@ pub async fn run_server_tui(socket: PathBuf) -> Result<(), TuiError> {
             let sampled_at = Instant::now();
             match fetch_server_snapshot(&socket).await {
                 Ok(snapshot) => {
-                    let rates = previous_snapshot
+                    let mut rates = previous_snapshot
                         .as_ref()
                         .map(|(previous, previous_at)| {
                             derive_rates(
@@ -362,6 +376,7 @@ pub async fn run_server_tui(socket: PathBuf) -> Result<(), TuiError> {
                             )
                         })
                         .unwrap_or_default();
+                    apply_pending_reset_rates(&mut rates, &mut pending_reset_users, &snapshot);
                     state.apply_snapshot(snapshot.clone(), rates);
                     state.last_error = None;
                     previous_snapshot = Some((snapshot, sampled_at));
@@ -384,9 +399,18 @@ pub async fn run_server_tui(socket: PathBuf) -> Result<(), TuiError> {
                 && key.kind == KeyEventKind::Press
                 && let Some(action) = state.handle_key(key.code)
             {
+                let reset_user = match &action {
+                    TuiAction::ResetTraffic(id) => Some(*id),
+                    _ => None,
+                };
                 match execute_tui_action(&socket, action).await {
                     Ok(TuiLoop::Quit) => break,
-                    Ok(TuiLoop::Continue) => refresh_due = true,
+                    Ok(TuiLoop::Continue) => {
+                        if let Some(id) = reset_user {
+                            pending_reset_users.insert(id);
+                        }
+                        refresh_due = true;
+                    }
                     Err(error) => state.set_error(error.to_string()),
                 }
             }
@@ -620,11 +644,13 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use crossterm::event::KeyCode;
-    use std::time::Duration;
+    use std::{collections::HashSet, time::Duration};
 
     use crate::model::{ServerSnapshot, TrafficTotals, UserSnapshot};
 
-    use super::{Modal, ServerTuiState, TrafficRate, TuiAction, derive_rates};
+    use super::{
+        Modal, ServerTuiState, TrafficRate, TuiAction, apply_pending_reset_rates, derive_rates,
+    };
 
     fn sample_user() -> UserSnapshot {
         UserSnapshot {
@@ -701,5 +727,23 @@ mod tests {
         );
         assert_eq!(rates.get(&reset), Some(&TrafficRate::default()));
         assert_eq!(rates.get(&new), Some(&TrafficRate::default()));
+    }
+
+    #[test]
+    fn pending_reset_zeroes_the_first_successful_snapshot_rate() {
+        let id = uuid::Uuid::from_u128(9);
+        let previous = ServerSnapshot {
+            users: vec![user(id, 100, 100)],
+        };
+        let current = ServerSnapshot {
+            users: vec![user(id, 150, 150)],
+        };
+        let mut rates = derive_rates(&previous, &current, Duration::from_secs(1));
+        let mut pending_resets = HashSet::from([id]);
+
+        apply_pending_reset_rates(&mut rates, &mut pending_resets, &current);
+
+        assert_eq!(rates.get(&id), Some(&TrafficRate::default()));
+        assert!(pending_resets.is_empty());
     }
 }

@@ -475,8 +475,9 @@ async fn execute_server(command: ServerCommand) -> Result<(), CliError> {
 async fn run_server(options: ServerRunOptions) -> Result<(), CliError> {
     #[cfg(unix)]
     {
+        let mut signals = RegisteredShutdownSignals::register()?;
         let server = ManagedServer::start(server_paths_from_config(&options.config)?).await?;
-        wait_for_shutdown_signal().await?;
+        signals.wait().await;
         server.shutdown().await?;
         Ok(())
     }
@@ -489,19 +490,28 @@ async fn run_server(options: ServerRunOptions) -> Result<(), CliError> {
 }
 
 #[cfg(unix)]
-async fn wait_for_shutdown_signal() -> Result<(), CliError> {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let mut terminate = signal(SignalKind::terminate()).map_err(CliError::Signal)?;
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result.map_err(CliError::Signal),
-        _ = terminate.recv() => Ok(()),
-    }
+struct RegisteredShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
 }
 
-#[cfg(not(unix))]
-async fn wait_for_shutdown_signal() -> Result<(), CliError> {
-    tokio::signal::ctrl_c().await.map_err(CliError::Signal)
+#[cfg(unix)]
+impl RegisteredShutdownSignals {
+    fn register() -> Result<Self, CliError> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt()).map_err(CliError::Signal)?,
+            terminate: signal(SignalKind::terminate()).map_err(CliError::Signal)?,
+        })
+    }
+
+    async fn wait(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+    }
 }
 
 fn server_paths_from_config(config: &Path) -> Result<ServerPaths, CliError> {
@@ -547,19 +557,25 @@ async fn execute_users(socket: PathBuf, command: ServerUsersCommand) -> Result<(
                     export.display()
                 ),
             )?;
-            let response = request_server(
+            let response = match request_server(
                 &socket,
                 ServerRequest::AddUser {
                     name,
                     export_path: export.clone(),
                 },
             )
-            .await?;
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    if is_bundle_durability_uncertain(&error) {
+                        emit_bundle_export_diagnostics(&export, true);
+                    }
+                    return Err(error.into());
+                }
+            };
             let user = expect_user(response)?;
-            eprintln!("Enrollment bundle written to {}", export.display());
-            eprintln!(
-                "WARNING: this bundle contains an unencrypted client secret; protect it until import."
-            );
+            emit_bundle_export_diagnostics(&export, false);
             emit_user(&user, json)
         }
         ServerUsersCommand::Enable { id, json } => {
@@ -694,6 +710,37 @@ fn confirm_mutation(yes: bool, prompt: &str) -> Result<(), CliError> {
     }
 }
 
+fn is_bundle_durability_uncertain(error: &ControlError) -> bool {
+    matches!(
+        error,
+        ControlError::Server { code, .. } if code == "bundle_durability_uncertain"
+    )
+}
+
+fn bundle_export_diagnostics(export: &Path, durability_uncertain: bool) -> [String; 2] {
+    let destination = if durability_uncertain {
+        format!(
+            "Enrollment bundle destination may contain the bundle: {}",
+            export.display()
+        )
+    } else {
+        format!("Enrollment bundle written to {}", export.display())
+    };
+    let warning = if durability_uncertain {
+        "WARNING: this bundle contains an unencrypted client secret; its durability is uncertain, so inspect the destination before retrying.".to_owned()
+    } else {
+        "WARNING: this bundle contains an unencrypted client secret; protect it until import."
+            .to_owned()
+    };
+    [destination, warning]
+}
+
+fn emit_bundle_export_diagnostics(export: &Path, durability_uncertain: bool) {
+    for diagnostic in bundle_export_diagnostics(export, durability_uncertain) {
+        eprintln!("{diagnostic}");
+    }
+}
+
 fn emit_response_json(response: &ServerResponse) -> Result<(), CliError> {
     write_stdout_line(&render_json(response))
 }
@@ -755,13 +802,19 @@ fn format_user(user: &UserSnapshot) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::RegisteredShutdownSignals;
+
+    use std::path::Path;
+
     use crate::{
         ipc::protocol::ServerResponse,
         model::{TrafficTotals, UserSnapshot},
     };
 
     use super::{
-        Cli, Command, ServerCommand, ServerSettingsCommand, ServerUsersCommand, render_json,
+        Cli, Command, ControlError, ServerCommand, ServerSettingsCommand, ServerUsersCommand,
+        bundle_export_diagnostics, is_bundle_durability_uncertain, render_json,
     };
 
     fn sample_user() -> UserSnapshot {
@@ -787,6 +840,26 @@ mod tests {
             serde_json::from_str::<Vec<UserSnapshot>>(&stdout).unwrap()[0].name,
             "alice"
         );
+    }
+
+    #[test]
+    fn durability_uncertain_bundle_diagnostics_include_destination_and_secret_warning() {
+        let error = ControlError::Server {
+            code: "bundle_durability_uncertain".to_owned(),
+            message: "bundle sync failed".to_owned(),
+            recovery: "inspect the destination".to_owned(),
+        };
+
+        assert!(is_bundle_durability_uncertain(&error));
+        let diagnostics = bundle_export_diagnostics(Path::new("/secure/alice.bundle"), true);
+        assert!(diagnostics[0].contains("/secure/alice.bundle"));
+        assert!(diagnostics[1].contains("unencrypted client secret"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registers_server_shutdown_signals() {
+        let _signals = RegisteredShutdownSignals::register().unwrap();
     }
 
     #[test]
