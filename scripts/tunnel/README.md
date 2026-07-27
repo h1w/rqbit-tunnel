@@ -55,10 +55,17 @@ missing, or a complete identity has no state database, restore the original
 protected state from backup instead of allowing a new server identity to
 invalidate enrolled clients' bundles.
 
+On a refresh, the installer stops an active managed service and waits for
+`/run/rqbit-tunnel/server.sock` to disappear before replacing files and starting
+it again; the protected configuration, key, and database remain in place. If
+the unit is inactive while any control-socket path exists, it aborts rather than
+starting beside a manual or unknown server.
+
 After `daemon-reload` and `enable --now`, the installer waits up to 30 seconds
 for both `rqbit-tunnel-server.service` to be active and `server users list
---json` to succeed over the local control socket, then opens the server TUI.
-For automation, the TUI is skipped **only** by the explicit flag:
+--json` to succeed over the newly attributable local control socket, then opens
+the server TUI. For automation, the TUI is skipped **only** by the explicit
+flag:
 
 ```bash
 # Set PUBLIC_SERVER_IPV4 to the VPS's real reachable public IPv4 address.

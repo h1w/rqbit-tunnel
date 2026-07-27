@@ -116,10 +116,15 @@ address, never a wildcard, because enrollment bundles carry the address.
 
 The installation creates root-owned `/etc/rqbit-tunnel`,
 `/var/lib/rqbit-tunnel`, and `/run/rqbit-tunnel`; `server.key` is mode `0600`.
-It installs `rqbit-tunnel-server.service`, runs `daemon-reload`, enables and
-starts the service, then requires both an active systemd unit and local
-`server users list --json` health before opening the TUI. Automation must opt
-out explicitly and supply the trusted bundle paths:
+On refresh, the installer stops an active managed service and waits for its
+control socket to disappear before replacing files and starting it again; the
+protected configuration, key, and database stay intact. If the unit is inactive
+while a control-socket path exists, it aborts rather than starting beside an
+unknown server.
+
+It then runs `daemon-reload`, enables and starts the service, and requires both
+an active systemd unit and local `server users list --json` health before opening
+the TUI. Automation must opt out explicitly and supply the trusted bundle paths:
 
 ```bash
 # Set PUBLIC_SERVER_IPV4 to the VPS's real reachable public IPv4 address.

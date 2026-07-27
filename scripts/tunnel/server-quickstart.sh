@@ -13,6 +13,7 @@ readonly STATE_DIR='/var/lib/rqbit-tunnel'
 readonly STATE_DB="$STATE_DIR/server-state.db"
 readonly CARRIER_DIR="$STATE_DIR/carrier"
 readonly RUN_DIR='/run/rqbit-tunnel'
+readonly CONTROL_SOCKET="$RUN_DIR/server.sock"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 usage() {
@@ -182,6 +183,34 @@ valid_installed_key() {
     ' bash "$SERVER_KEY"
 }
 
+control_socket_exists() {
+    run_as_root test -e "$CONTROL_SOCKET" || run_as_root test -L "$CONTROL_SOCKET"
+}
+
+wait_for_control_socket_absence() {
+    local deadline=$((SECONDS + 30))
+
+    while control_socket_exists; do
+        if (( SECONDS >= deadline )); then
+            return 1
+        fi
+        sleep 1
+    done
+}
+
+establish_managed_socket_ownership() {
+    if run_as_root systemctl is-active --quiet "$SERVICE_NAME" >/dev/null 2>&1; then
+        printf 'Stopping the active managed server before applying the installation...\n' >&2
+        run_as_root systemctl stop "$SERVICE_NAME"
+        if ! wait_for_control_socket_absence; then
+            run_as_root systemctl --no-pager --full status "$SERVICE_NAME" >&2 || true
+            die "managed service stopped but $CONTROL_SOCKET is still present; inspect it rather than starting beside an unknown server"
+        fi
+    elif control_socket_exists; then
+        die "managed service is inactive but $CONTROL_SOCKET exists; inspect or remove the unknown control socket before continuing"
+    fi
+}
+
 wait_for_health() {
     local health_json deadline
 
@@ -309,17 +338,15 @@ if (( needs_key )); then
         die 'bundled key generation did not produce one exact 64-character hexadecimal server key'
 fi
 
+establish_managed_socket_ownership
+
 run_as_root install -d -o root -g root -m 0755 "$INSTALL_DIR"
 run_as_root install -d -o root -g root -m 0750 "$CONFIG_DIR"
 run_as_root install -d -o root -g root -m 0750 "$STATE_DIR"
 run_as_root install -d -o root -g root -m 0750 "$CARRIER_DIR"
 run_as_root install -d -o root -g root -m 0750 "$RUN_DIR"
 
-binary_changed=0
 if [[ -n "$binary_source" && "$binary_source" != "$INSTALL_BIN" ]]; then
-    if ! run_as_root cmp -s "$binary_source" "$INSTALL_BIN"; then
-        binary_changed=1
-    fi
     run_as_root install -o root -g root -m 0755 "$binary_source" "$INSTALL_BIN"
 fi
 run_as_root chown root:root "$INSTALL_BIN"
@@ -341,22 +368,9 @@ run_as_root chmod 0600 "$SERVER_KEY"
 
 run_as_root install -d -o root -g root -m 0755 /etc/systemd/system
 unit_destination="/etc/systemd/system/$SERVICE_NAME"
-unit_changed=0
-if ! run_as_root cmp -s "$unit_source" "$unit_destination"; then
-    unit_changed=1
-fi
-
-was_active=0
-if run_as_root systemctl is-active --quiet "$SERVICE_NAME" >/dev/null 2>&1; then
-    was_active=1
-fi
-
 run_as_root install -o root -g root -m 0644 "$unit_source" "$unit_destination"
 run_as_root systemctl daemon-reload
 run_as_root systemctl enable --now "$SERVICE_NAME"
-if (( was_active && (binary_changed || unit_changed || needs_config || needs_key) )); then
-    run_as_root systemctl restart "$SERVICE_NAME"
-fi
 
 # Generated private material is no longer needed before waiting or opening the TUI.
 cleanup
