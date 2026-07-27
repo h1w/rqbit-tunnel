@@ -322,10 +322,18 @@ impl ConfigAssignmentPause {
 }
 
 pub struct ManagedServer {
+    coordinator: Arc<ShutdownCoordinator>,
+}
+
+struct ShutdownCoordinator {
     inner: Arc<ManagedServerInner>,
     control_task: Mutex<Option<JoinHandle<Result<(), ServerRuntimeError>>>>,
-    shutdown_phase: Mutex<ShutdownPhase>,
-    shutdown_result: watch::Sender<Option<SharedShutdownResult>>,
+    phase: Mutex<ShutdownPhase>,
+    result: watch::Sender<Option<SharedShutdownResult>>,
+    #[cfg(test)]
+    started: AtomicBool,
+    #[cfg(test)]
+    started_notify: Notify,
 }
 
 struct ManagedServerInner {
@@ -341,6 +349,37 @@ struct ManagedServerInner {
     cleanup_complete: AtomicBool,
     #[cfg(test)]
     config_assignment_pause: Mutex<Option<Arc<ConfigAssignmentPause>>>,
+}
+
+struct ShutdownResultPublication {
+    sender: watch::Sender<Option<SharedShutdownResult>>,
+    published: bool,
+}
+
+impl ShutdownResultPublication {
+    fn new(sender: watch::Sender<Option<SharedShutdownResult>>) -> Self {
+        Self {
+            sender,
+            published: false,
+        }
+    }
+
+    fn publish(&mut self, result: SharedShutdownResult) {
+        self.sender.send_replace(Some(result));
+        self.published = true;
+    }
+}
+
+impl Drop for ShutdownResultPublication {
+    fn drop(&mut self) {
+        if !self.published {
+            self.sender
+                .send_replace(Some(SharedShutdownResult::Failed {
+                    code: ShutdownFailureCode::Cleanup,
+                    message: "the shutdown coordinator exited before completing cleanup".to_owned(),
+                }));
+        }
+    }
 }
 
 impl ManagedServer {
@@ -381,14 +420,15 @@ impl ManagedServer {
             }
         };
 
-        let (listener, control_socket_identity) = match bind_control_socket(&paths.control_socket_path()) {
-            Ok(listener) => listener,
-            Err(error) => {
-                session.stop().await;
-                let _ = registry.shutdown().await;
-                return Err(error);
-            }
-        };
+        let (listener, control_socket_identity) =
+            match bind_control_socket(&paths.control_socket_path()) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    session.stop().await;
+                    let _ = registry.shutdown().await;
+                    return Err(error);
+                }
+            };
         let inner = Arc::new(ManagedServerInner {
             paths,
             config: RwLock::new(config),
@@ -404,20 +444,37 @@ impl ManagedServer {
             config_assignment_pause: Mutex::new(None),
         });
         let control_task = tokio::spawn(serve_control_socket(listener, Arc::clone(&inner)));
-        let (shutdown_result, _) = watch::channel(None);
+        let (result, _) = watch::channel(None);
 
         Ok(Self {
-            inner,
-            control_task: Mutex::new(Some(control_task)),
-            shutdown_phase: Mutex::new(ShutdownPhase::Active),
-            shutdown_result,
+            coordinator: Arc::new(ShutdownCoordinator {
+                inner,
+                control_task: Mutex::new(Some(control_task)),
+                phase: Mutex::new(ShutdownPhase::Active),
+                result,
+                #[cfg(test)]
+                started: AtomicBool::new(false),
+                #[cfg(test)]
+                started_notify: Notify::new(),
+            }),
         })
     }
 
     pub async fn shutdown(&self) -> Result<(), ServerRuntimeError> {
-        let mut result = self.shutdown_result.subscribe();
+        self.coordinator.request_shutdown().await
+    }
+
+    #[cfg(test)]
+    async fn wait_until_shutdown_coordinator_started(&self) {
+        self.coordinator.wait_until_started().await;
+    }
+}
+
+impl ShutdownCoordinator {
+    async fn request_shutdown(self: &Arc<Self>) -> Result<(), ServerRuntimeError> {
+        let mut result = self.result.subscribe();
         let leader = {
-            let mut phase = self.shutdown_phase.lock().await;
+            let mut phase = self.phase.lock().await;
             match *phase {
                 ShutdownPhase::Active => {
                     *phase = ShutdownPhase::ShuttingDown;
@@ -428,10 +485,10 @@ impl ManagedServer {
         };
 
         if leader {
-            let outcome = self.shutdown_once().await;
-            let shared = SharedShutdownResult::from_result(&outcome);
-            self.shutdown_result.send_replace(Some(shared));
-            return outcome;
+            let coordinator = Arc::clone(self);
+            tokio::spawn(async move {
+                coordinator.run_shutdown().await;
+            });
         }
 
         loop {
@@ -445,6 +502,18 @@ impl ManagedServer {
                 });
             }
         }
+    }
+
+    async fn run_shutdown(self: Arc<Self>) {
+        #[cfg(test)]
+        {
+            self.started.store(true, Ordering::Release);
+            self.started_notify.notify_one();
+        }
+
+        let mut publication = ShutdownResultPublication::new(self.result.clone());
+        let outcome = self.shutdown_once().await;
+        publication.publish(SharedShutdownResult::from_result(&outcome));
     }
 
     async fn shutdown_once(&self) -> Result<(), ServerRuntimeError> {
@@ -463,13 +532,11 @@ impl ManagedServer {
     }
 
     #[cfg(test)]
-    async fn wait_until_shutdown_started(&self) {
-        loop {
-            if matches!(*self.shutdown_phase.lock().await, ShutdownPhase::ShuttingDown) {
-                return;
-            }
-            tokio::task::yield_now().await;
+    async fn wait_until_started(&self) {
+        if self.started.load(Ordering::Acquire) {
+            return;
         }
+        self.started_notify.notified().await;
     }
 }
 
@@ -1364,6 +1431,7 @@ mod tests {
 
         for index in 0..160 {
             server
+                .coordinator
                 .inner
                 .registry
                 .create_user(format!("{index:04}-{}", "x".repeat(512)))
@@ -1413,7 +1481,11 @@ mod tests {
             default_client_socks_listen: SocketAddr::from(([127, 0, 0, 1], 1082)),
             default_client_carriers: 6,
         };
-        let pause = server.inner.pause_next_config_assignment().await;
+        let pause = server
+            .coordinator
+            .inner
+            .pause_next_config_assignment()
+            .await;
         let first_socket = paths.control_socket_path();
         let first = tokio::spawn(async move {
             UnixControlClient::connect(first_socket)
@@ -1479,11 +1551,11 @@ mod tests {
         let paths = test_paths(directory.path());
         write_test_server_material(&paths).await;
         let server = Arc::new(ManagedServer::start(paths.clone()).await.unwrap());
-        let cleanup_gate = server.inner.cleanup_gate.lock().await;
+        let cleanup_gate = server.coordinator.inner.cleanup_gate.lock().await;
         let first_server = Arc::clone(&server);
         let first = tokio::spawn(async move { first_server.shutdown().await });
 
-        server.wait_until_shutdown_started().await;
+        server.wait_until_shutdown_coordinator_started().await;
         let second_server = Arc::clone(&server);
         let mut second = Box::pin(async move { second_server.shutdown().await });
         assert!(
@@ -1496,6 +1568,28 @@ mod tests {
         drop(cleanup_gate);
         first.await.unwrap().unwrap();
         second.await.unwrap();
+        assert!(!paths.control_socket_path().exists());
+    }
+
+    #[tokio::test]
+    async fn aborting_the_shutdown_leader_does_not_strand_followers() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = test_paths(directory.path());
+        write_test_server_material(&paths).await;
+        let server = Arc::new(ManagedServer::start(paths.clone()).await.unwrap());
+        let cleanup_gate = server.coordinator.inner.cleanup_gate.lock().await;
+        let leader_server = Arc::clone(&server);
+        let leader = tokio::spawn(async move { leader_server.shutdown().await });
+
+        server.wait_until_shutdown_coordinator_started().await;
+        leader.abort();
+        assert!(leader.await.unwrap_err().is_cancelled());
+
+        drop(cleanup_gate);
+        let follower = tokio::time::timeout(Duration::from_secs(2), server.shutdown())
+            .await
+            .expect("a follower must observe the detached shutdown coordinator");
+        follower.unwrap();
         assert!(!paths.control_socket_path().exists());
     }
 
