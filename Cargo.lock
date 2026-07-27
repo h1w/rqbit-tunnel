@@ -5180,7 +5180,6 @@ dependencies = [
  "crossterm",
  "directories",
  "hex 0.4.3",
- "librqbit",
  "ratatui",
  "rusqlite",
  "serde",
