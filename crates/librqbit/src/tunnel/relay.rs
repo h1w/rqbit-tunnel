@@ -21,10 +21,11 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use parking_lot::Mutex as ParkingMutex;
 use peer_binary_protocol::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -146,6 +147,36 @@ pub(crate) async fn next_tunnel_frame(
 ///
 /// See [`FrameSink::is_data`] for the exact per-variant routing and why
 /// `TcpFin`/`TcpReset` ride the ordered data lane rather than preempting.
+struct DataLaneLiveness {
+    receiver_open: bool,
+}
+
+/// Owns the writer-side data receiver and synchronously marks it unavailable
+/// before that receiver can be dropped, including when the writer task aborts.
+struct DataLaneReceiver {
+    receiver: mpsc::Receiver<TunnelFrame>,
+    liveness: Arc<ParkingMutex<DataLaneLiveness>>,
+}
+
+impl DataLaneReceiver {
+    fn new(
+        receiver: mpsc::Receiver<TunnelFrame>,
+        liveness: Arc<ParkingMutex<DataLaneLiveness>>,
+    ) -> Self {
+        Self { receiver, liveness }
+    }
+
+    async fn recv(&mut self) -> Option<TunnelFrame> {
+        self.receiver.recv().await
+    }
+}
+
+impl Drop for DataLaneReceiver {
+    fn drop(&mut self) {
+        self.liveness.lock().receiver_open = false;
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct FrameSink {
     /// Priority lane: `Ping`/`Pong`/`Credit` + lifecycle frames. Never paced.
@@ -153,6 +184,8 @@ pub(crate) struct FrameSink {
     /// Ordered lane: `TcpData` (paced) + `TcpFin`/`TcpReset`/`UdpDatagram`
     /// (unpaced). FIFO so a stream's close never overtakes its own data.
     data_tx: mpsc::Sender<TunnelFrame>,
+    /// Serializes accepted TCP publication with writer data-receiver teardown.
+    data_liveness: Arc<ParkingMutex<DataLaneLiveness>>,
 }
 
 enum LossySendOutcome {
@@ -240,6 +273,28 @@ impl FrameSink {
         self.data_tx.reserve().await.ok()
     }
 
+    /// Publish a reserved TCP frame only while the writer still owns its data
+    /// receiver. Both the liveness check and permit send are one synchronous
+    /// critical section, so a reserved permit cannot become dropped payload.
+    async fn publish_reserved_tcp_data<'a>(
+        &'a self,
+        permit: mpsc::Permit<'a, TunnelFrame>,
+        stream_id: u64,
+        bytes: Bytes,
+        pending: &AtomicU64,
+        download_gate: &Mutex<()>,
+    ) -> bool {
+        let _download_gate = download_gate.lock().await;
+        let liveness = self.data_liveness.lock();
+        if !liveness.receiver_open {
+            return false;
+        }
+        let len = bytes.len();
+        permit.send(TunnelFrame::TcpData { stream_id, bytes });
+        pending.fetch_add(len as u64, Ordering::Release);
+        true
+    }
+
     /// Best-effort enqueue for lossy traffic (UDP datagrams). Drops the frame
     /// if the destination lane is full instead of blocking the caller — which
     /// would head-of-line-block every other stream on this connection. Routes by
@@ -316,7 +371,11 @@ pub(crate) fn spawn_frame_writer(
     // priority lane the writer's `biased` select always drains first, so
     // `Ping`/`Pong`/`Credit` never wait behind a paced `TcpData` frame.
     let (control_tx, mut control_rx) = mpsc::channel::<TunnelFrame>(OUTBOUND_QUEUE);
-    let (data_tx, mut data_rx) = mpsc::channel::<TunnelFrame>(OUTBOUND_QUEUE);
+    let (data_tx, data_rx) = mpsc::channel::<TunnelFrame>(OUTBOUND_QUEUE);
+    let data_liveness = Arc::new(ParkingMutex::new(DataLaneLiveness {
+        receiver_open: true,
+    }));
+    let mut data_rx = DataLaneReceiver::new(data_rx, data_liveness.clone());
     let handle = tokio::spawn(async move {
         // Base instant for the pure `TokenBucket`'s injected clock — it never
         // calls `Instant::now()` itself, so it stays deterministically
@@ -520,6 +579,7 @@ pub(crate) fn spawn_frame_writer(
         FrameSink {
             control_tx,
             data_tx,
+            data_liveness,
         },
         handle,
     )
@@ -542,24 +602,6 @@ enum PeerToDest {
     Fin,
 }
 
-struct TcpDownloadState {
-    finished: AtomicBool,
-    credit_progress: AtomicU64,
-    reset: Notify,
-    cleanup: CancellationToken,
-}
-
-impl TcpDownloadState {
-    fn new() -> Self {
-        Self {
-            finished: AtomicBool::new(false),
-            credit_progress: AtomicU64::new(0),
-            reset: Notify::new(),
-            cleanup: CancellationToken::new(),
-        }
-    }
-}
-
 struct TcpEntry {
     to_dest: mpsc::Sender<PeerToDest>,
     /// Credit the server may use to send dest→peer data (granted by the client
@@ -569,8 +611,8 @@ struct TcpEntry {
     download_uncredited: Arc<AtomicU64>,
     /// Serializes TCP payload publication with incoming `Credit` processing.
     download_gate: Arc<Mutex<()>>,
-    /// Completion, credit progress, and cancellable stale-entry cleanup state.
-    download_state: Arc<TcpDownloadState>,
+    /// Set after the destination egress half stops producing payload.
+    download_finished: Arc<AtomicBool>,
     /// Bidirectional idle watchdog, poked on activity in either direction.
     idle: IdleGuard,
     shutdown: CancellationToken,
@@ -628,11 +670,8 @@ async fn enqueue_tcp_data(
     let Some(permit) = sink.reserve_data().await else {
         return false;
     };
-    let len = bytes.len();
-    let _download_gate = download_gate.lock().await;
-    permit.send(TunnelFrame::TcpData { stream_id, bytes });
-    pending.fetch_add(len as u64, Ordering::Release);
-    true
+    sink.publish_reserved_tcp_data(permit, stream_id, bytes, pending, download_gate)
+        .await
 }
 
 /// Apply one peer `Credit` after serializing with destination payload
@@ -649,28 +688,17 @@ async fn acknowledge_tcp_credit(
             (
                 entry.send_credit.clone(),
                 entry.download_uncredited.clone(),
-                entry.download_state.clone(),
+                entry.download_finished.clone(),
                 entry.download_gate.clone(),
             )
         })
     };
-    if let Some((send_credit, download_uncredited, download_state, download_gate)) = entry {
+    if let Some((send_credit, download_uncredited, download_finished, download_gate)) = entry {
         let _download_gate = download_gate.lock().await;
-        let accepted =
-            apply_acknowledged_credit(&send_credit, &download_uncredited, requested, session);
-        if accepted != 0 {
-            download_state
-                .credit_progress
-                .fetch_add(1, Ordering::Release);
-            download_state.reset.notify_one();
-        }
-        let _ = retire_finished_tcp_entry(
-            tcp,
-            stream_id,
-            &download_uncredited,
-            &download_state,
-        )
-        .await;
+        apply_acknowledged_credit(&send_credit, &download_uncredited, requested, session);
+        let _ =
+            retire_finished_tcp_entry(tcp, stream_id, &download_uncredited, &download_finished)
+                .await;
     }
 }
 
@@ -680,25 +708,13 @@ async fn finish_tcp_download(
     tcp: &TcpMap,
     stream_id: u64,
     download_uncredited: &Arc<AtomicU64>,
-    download_state: &Arc<TcpDownloadState>,
+    download_finished: &Arc<AtomicBool>,
     download_gate: &Arc<Mutex<()>>,
-    cleanup_after: Duration,
 ) {
-    let removed = {
-        let _download_gate = download_gate.lock().await;
-        download_state.finished.store(true, Ordering::Release);
-        retire_finished_tcp_entry(tcp, stream_id, download_uncredited, download_state).await
-    };
-    if !removed {
-        tokio::spawn(expire_finished_tcp_entry_after_idle(
-            tcp.clone(),
-            stream_id,
-            download_uncredited.clone(),
-            download_state.clone(),
-            download_gate.clone(),
-            cleanup_after,
-        ));
-    }
+    let _download_gate = download_gate.lock().await;
+    download_finished.store(true, Ordering::Release);
+    let _ =
+        retire_finished_tcp_entry(tcp, stream_id, download_uncredited, download_finished).await;
 }
 
 /// Remove a completed TCP entry only after its final valid acknowledgement.
@@ -709,15 +725,15 @@ async fn retire_finished_tcp_entry(
     tcp: &TcpMap,
     stream_id: u64,
     download_uncredited: &Arc<AtomicU64>,
-    download_state: &Arc<TcpDownloadState>,
+    download_finished: &Arc<AtomicBool>,
 ) -> bool {
     let entry = {
         let mut map = tcp.lock().await;
         let should_remove = match map.get(&stream_id) {
             Some(entry) => {
                 Arc::ptr_eq(&entry.download_uncredited, download_uncredited)
-                    && Arc::ptr_eq(&entry.download_state, download_state)
-                    && entry.download_state.finished.load(Ordering::Acquire)
+                    && Arc::ptr_eq(&entry.download_finished, download_finished)
+                    && entry.download_finished.load(Ordering::Acquire)
                     && entry.download_uncredited.load(Ordering::Acquire) == 0
             }
             None => false,
@@ -730,83 +746,10 @@ async fn retire_finished_tcp_entry(
     };
     let removed = entry.is_some();
     if let Some(entry) = entry {
-        entry.download_state.cleanup.cancel();
         entry.send_credit.close();
         entry.shutdown.cancel();
     }
     removed
-}
-
-async fn expire_finished_tcp_entry_after_idle(
-    tcp: TcpMap,
-    stream_id: u64,
-    download_uncredited: Arc<AtomicU64>,
-    download_state: Arc<TcpDownloadState>,
-    download_gate: Arc<Mutex<()>>,
-    cleanup_after: Duration,
-) {
-    let mut progress = download_state.credit_progress.load(Ordering::Acquire);
-    loop {
-        tokio::select! {
-            _ = download_state.cleanup.cancelled() => return,
-            _ = download_state.reset.notified() => {
-                progress = download_state.credit_progress.load(Ordering::Acquire);
-                continue;
-            }
-            _ = tokio::time::sleep(cleanup_after) => {}
-        }
-        let _download_gate = download_gate.lock().await;
-        if download_state.cleanup.is_cancelled() {
-            return;
-        }
-        let next_progress = download_state.credit_progress.load(Ordering::Acquire);
-        if next_progress != progress {
-            progress = next_progress;
-            continue;
-        }
-        expire_finished_tcp_entry(
-            &tcp,
-            stream_id,
-            &download_uncredited,
-            &download_state,
-        )
-        .await;
-        return;
-    }
-}
-
-/// Expire a completed entry only after its peer makes no credit progress for
-/// the configured idle interval.
-///
-/// The caller holds the entry's `download_gate`, preserving the same identity
-/// and publication ordering checks used by normal credit retirement.
-async fn expire_finished_tcp_entry(
-    tcp: &TcpMap,
-    stream_id: u64,
-    download_uncredited: &Arc<AtomicU64>,
-    download_state: &Arc<TcpDownloadState>,
-) {
-    let entry = {
-        let mut map = tcp.lock().await;
-        let should_remove = match map.get(&stream_id) {
-            Some(entry) => {
-                Arc::ptr_eq(&entry.download_uncredited, download_uncredited)
-                    && Arc::ptr_eq(&entry.download_state, download_state)
-                    && entry.download_state.finished.load(Ordering::Acquire)
-            }
-            None => false,
-        };
-        if should_remove {
-            map.remove(&stream_id)
-        } else {
-            None
-        }
-    };
-    if let Some(entry) = entry {
-        entry.download_state.cleanup.cancel();
-        entry.send_credit.close();
-        entry.shutdown.cancel();
-    }
 }
 
 /// Run the full egress relay for one admitted peer until the peer disconnects
@@ -931,7 +874,7 @@ pub(crate) async fn run_server_relay(
                 let send_credit = SendCredit::with_window(OPEN_WINDOW);
                 let download_uncredited = Arc::new(AtomicU64::new(0));
                 let download_gate = Arc::new(Mutex::new(()));
-                let download_state = Arc::new(TcpDownloadState::new());
+                let download_finished = Arc::new(AtomicBool::new(false));
                 let idle = IdleGuard::spawn(egress.idle_timeout, stream_token.clone());
                 map.insert(
                     stream_id,
@@ -940,7 +883,7 @@ pub(crate) async fn run_server_relay(
                         send_credit: send_credit.clone(),
                         download_uncredited: download_uncredited.clone(),
                         download_gate: download_gate.clone(),
-                        download_state: download_state.clone(),
+                        download_finished: download_finished.clone(),
                         idle: idle.clone(),
                         shutdown: stream_token.clone(),
                     },
@@ -958,7 +901,7 @@ pub(crate) async fn run_server_relay(
                     to_dest_rx,
                     send_credit,
                     download_uncredited,
-                    download_state,
+                    download_finished,
                     download_gate,
                     idle,
                     stream_token,
@@ -994,7 +937,6 @@ pub(crate) async fn run_server_relay(
             }
             TunnelFrame::TcpReset { stream_id, .. } => {
                 if let Some(entry) = tcp.lock().await.remove(&stream_id) {
-                    entry.download_state.cleanup.cancel();
                     entry.send_credit.close();
                     entry.shutdown.cancel();
                 }
@@ -1082,7 +1024,6 @@ pub(crate) async fn run_server_relay(
 
     // Peer gone: tear everything down.
     for (_, entry) in tcp.lock().await.drain() {
-        entry.download_state.cleanup.cancel();
         entry.send_credit.close();
         entry.shutdown.cancel();
     }
@@ -1150,7 +1091,7 @@ async fn handle_tcp_stream(
     to_dest_rx: mpsc::Receiver<PeerToDest>,
     send_credit: SendCredit,
     download_uncredited: Arc<AtomicU64>,
-    download_state: Arc<TcpDownloadState>,
+    download_finished: Arc<AtomicBool>,
     download_gate: Arc<Mutex<()>>,
     idle: IdleGuard,
     token: CancellationToken,
@@ -1179,9 +1120,8 @@ async fn handle_tcp_stream(
         &tcp,
         stream_id,
         &download_uncredited,
-        &download_state,
+        &download_finished,
         &download_gate,
-        egress.idle_timeout,
     )
     .await;
 
@@ -1902,14 +1842,31 @@ mod tests {
         assert_eq!(take_acknowledged(&pending, 4096), 1024);
         assert_eq!(pending.load(Ordering::Relaxed), 0);
 
-        let pending = AtomicU64::new(1024);
+        let stream_id = 7;
+        let download_uncredited = Arc::new(AtomicU64::new(1024));
+        let download_finished = Arc::new(AtomicBool::new(false));
+        let download_gate = Arc::new(Mutex::new(()));
+        let shutdown = CancellationToken::new();
+        let idle = IdleGuard::spawn(Duration::from_secs(60), shutdown.clone());
+        let (to_dest, _to_dest_rx) = mpsc::channel(1);
         let send_credit = SendCredit::with_window(0);
-        let session = RecordingSession::new();
-        assert_eq!(
-            apply_acknowledged_credit(&send_credit, &pending, 4096, &session),
-            1024
+        let tcp: TcpMap = Arc::new(Mutex::new(HashMap::new()));
+        tcp.lock().await.insert(
+            stream_id,
+            TcpEntry {
+                to_dest,
+                send_credit: send_credit.clone(),
+                download_uncredited: download_uncredited.clone(),
+                download_gate,
+                download_finished,
+                idle,
+                shutdown: shutdown.clone(),
+            },
         );
-        assert_eq!(pending.load(Ordering::Relaxed), 0);
+        let session = RecordingSession::new();
+
+        acknowledge_tcp_credit(&tcp, stream_id, 4096, &session).await;
+        assert_eq!(download_uncredited.load(Ordering::Relaxed), 0);
         assert_eq!(
             session.recorded(),
             vec![(TunnelTrafficDirection::Download, 1024)]
@@ -1921,6 +1878,7 @@ mod tests {
                 .is_err(),
             "the credit grant must not exceed successfully forwarded bytes"
         );
+        shutdown.cancel();
     }
 
     #[tokio::test]
@@ -1948,6 +1906,9 @@ mod tests {
         let sink = FrameSink {
             control_tx,
             data_tx,
+            data_liveness: Arc::new(ParkingMutex::new(DataLaneLiveness {
+                receiver_open: true,
+            })),
         };
         let session = RecordingSession::new();
         let payload = Bytes::from_static(b"response");
@@ -1990,6 +1951,9 @@ mod tests {
         let sink = FrameSink {
             control_tx,
             data_tx,
+            data_liveness: Arc::new(ParkingMutex::new(DataLaneLiveness {
+                receiver_open: true,
+            })),
         };
         let session = RecordingSession::new();
 
@@ -2007,7 +1971,7 @@ mod tests {
     async fn closed_tcp_stream_keeps_download_accounting_until_credit_arrives() {
         let stream_id = 7;
         let download_uncredited = Arc::new(AtomicU64::new(1024));
-        let download_state = Arc::new(TcpDownloadState::new());
+        let download_finished = Arc::new(AtomicBool::new(false));
         let download_gate = Arc::new(Mutex::new(()));
         let shutdown = CancellationToken::new();
         let idle = IdleGuard::spawn(Duration::from_secs(60), shutdown.clone());
@@ -2019,7 +1983,7 @@ mod tests {
                 to_dest,
                 send_credit: SendCredit::with_window(0),
                 download_uncredited: download_uncredited.clone(),
-                download_state: download_state.clone(),
+                download_finished: download_finished.clone(),
                 download_gate: download_gate.clone(),
                 idle,
                 shutdown,
@@ -2031,16 +1995,14 @@ mod tests {
             &tcp,
             stream_id,
             &download_uncredited,
-            &download_state,
+            &download_finished,
             &download_gate,
-            Duration::from_secs(60),
         )
         .await;
         assert!(tcp.lock().await.contains_key(&stream_id));
 
         acknowledge_tcp_credit(&tcp, stream_id, 4096, &session).await;
         assert!(!tcp.lock().await.contains_key(&stream_id));
-        assert!(download_state.cleanup.is_cancelled());
         assert_eq!(
             session.recorded(),
             vec![(TunnelTrafficDirection::Download, 1024)]
@@ -2061,6 +2023,9 @@ mod tests {
         let sink = FrameSink {
             control_tx,
             data_tx,
+            data_liveness: Arc::new(ParkingMutex::new(DataLaneLiveness {
+                receiver_open: true,
+            })),
         };
         let download_uncredited = Arc::new(AtomicU64::new(0));
         let download_gate = Arc::new(Mutex::new(()));
@@ -2093,103 +2058,37 @@ mod tests {
         assert_eq!(download_uncredited.load(Ordering::Relaxed), b"response".len() as u64);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn uncredited_closed_tcp_stream_expires() {
-        let stream_id = 7;
-        let download_uncredited = Arc::new(AtomicU64::new(1024));
-        let download_state = Arc::new(TcpDownloadState::new());
-        let download_gate = Arc::new(Mutex::new(()));
-        let shutdown = CancellationToken::new();
-        let idle = IdleGuard::spawn(Duration::from_secs(60), shutdown.clone());
-        let (to_dest, _to_dest_rx) = mpsc::channel(1);
-        let tcp: TcpMap = Arc::new(Mutex::new(HashMap::new()));
-        tcp.lock().await.insert(
-            stream_id,
-            TcpEntry {
-                to_dest,
-                send_credit: SendCredit::with_window(0),
-                download_uncredited: download_uncredited.clone(),
-                download_state: download_state.clone(),
-                download_gate: download_gate.clone(),
-                idle,
-                shutdown,
-            },
+
+    #[tokio::test]
+    async fn closed_writer_data_lane_rejects_reserved_tcp_publication() {
+        let data_liveness = Arc::new(ParkingMutex::new(DataLaneLiveness {
+            receiver_open: true,
+        }));
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        let (data_tx, data_rx) = mpsc::channel(1);
+        let sink = FrameSink {
+            control_tx,
+            data_tx,
+            data_liveness: data_liveness.clone(),
+        };
+        let permit = sink.reserve_data().await.unwrap();
+        drop(DataLaneReceiver::new(data_rx, data_liveness));
+
+        let download_uncredited = AtomicU64::new(0);
+        let download_gate = Mutex::new(());
+        assert!(
+            !sink
+                .publish_reserved_tcp_data(
+                    permit,
+                    7,
+                    Bytes::from_static(b"response"),
+                    &download_uncredited,
+                    &download_gate,
+                )
+                .await
         );
-
-        finish_tcp_download(
-            &tcp,
-            stream_id,
-            &download_uncredited,
-            &download_state,
-            &download_gate,
-            Duration::from_secs(1),
-        )
-        .await;
-        assert!(tcp.lock().await.contains_key(&stream_id));
-
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::advance(Duration::from_secs(1)).await;
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        assert!(!tcp.lock().await.contains_key(&stream_id));
+        assert_eq!(download_uncredited.load(Ordering::Relaxed), 0);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn download_credit_progress_resets_finished_stream_expiry() {
-        let stream_id = 7;
-        let download_uncredited = Arc::new(AtomicU64::new(1024));
-        let download_state = Arc::new(TcpDownloadState::new());
-        let download_gate = Arc::new(Mutex::new(()));
-        let shutdown = CancellationToken::new();
-        let idle = IdleGuard::spawn(Duration::from_secs(60), shutdown.clone());
-        let (to_dest, _to_dest_rx) = mpsc::channel(1);
-        let tcp: TcpMap = Arc::new(Mutex::new(HashMap::new()));
-        tcp.lock().await.insert(
-            stream_id,
-            TcpEntry {
-                to_dest,
-                send_credit: SendCredit::with_window(0),
-                download_uncredited: download_uncredited.clone(),
-                download_state: download_state.clone(),
-                download_gate: download_gate.clone(),
-                idle,
-                shutdown,
-            },
-        );
-        let session = RecordingSession::new();
-
-        finish_tcp_download(
-            &tcp,
-            stream_id,
-            &download_uncredited,
-            &download_state,
-            &download_gate,
-            Duration::from_secs(1),
-        )
-        .await;
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-
-        acknowledge_tcp_credit(&tcp, stream_id, 512, &session).await;
-        tokio::time::advance(Duration::from_secs(1)).await;
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        assert!(tcp.lock().await.contains_key(&stream_id));
-
-        tokio::time::advance(Duration::from_secs(1)).await;
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        assert!(!tcp.lock().await.contains_key(&stream_id));
-        assert_eq!(
-            session.recorded(),
-            vec![(TunnelTrafficDirection::Download, 512)]
-        );
-    }
 
 }
