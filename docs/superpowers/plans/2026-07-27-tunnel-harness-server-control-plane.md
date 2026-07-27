@@ -366,18 +366,20 @@ git commit -m "feat(tunnel): meter successful relay payload"
 #[tokio::test]
 async fn disabling_a_user_rejects_new_admission_and_cancels_existing_sessions() {
     let registry = test_registry().await;
-    let user = registry.create_user("alice").await.unwrap();
-    let session = registry.authorize(&user.public_key).unwrap();
+    let created = registry.create_user("alice").await.unwrap();
+    let user = created.user;
+    let session = registry.authorize(&TunnelPublicKey(user.public_key)).unwrap();
     registry.set_enabled(user.id, false).await.unwrap();
-    assert!(registry.authorize(&user.public_key).is_none());
+    assert!(registry.authorize(&TunnelPublicKey(user.public_key)).is_none());
     assert!(session.cancellation_token().is_cancelled());
 }
 
 #[tokio::test]
 async fn flush_persists_both_direction_deltas() {
     let registry = test_registry().await;
-    let user = registry.create_user("alice").await.unwrap();
-    let session = registry.authorize(&user.public_key).unwrap();
+    let created = registry.create_user("alice").await.unwrap();
+    let user = created.user;
+    let session = registry.authorize(&TunnelPublicKey(user.public_key)).unwrap();
     session.record_payload(TunnelTrafficDirection::Upload, 9);
     session.record_payload(TunnelTrafficDirection::Download, 14);
     registry.flush().await.unwrap();
@@ -417,6 +419,8 @@ Use `Transaction` for create/delete/enable/reset and `spawn_blocking` for every 
 - [ ] **Step 4: Implement `UserRegistry` as the core authorizer**
 
 Maintain `ArcSwap<HashMap<TunnelPublicKey, Arc<UserMeter>>>`. `UserMeter` owns atomics for both totals, a `CancellationToken`, connected-count, and last-seen timestamp. Implement `TunnelServerAuthorizer` and `TunnelServerSession` directly; `record_payload` is one relaxed atomic increment plus a dirty flag, and never touches SQLite.
+
+`create_user` generates an X25519 pair and returns a non-serializable `CreatedUser { user: UserRecord, client_private_key: TunnelPrivateKey }`. Persist only `user.public_key`; the caller must immediately write the private key into an explicit enrollment bundle or drop it. The registry never stores, snapshots, logs, or returns a client private key after this one-time result. Convert `user.public_key` to `TunnelPublicKey` only at the dynamic-authorizer map boundary.
 
 ```rust
 impl TunnelServerAuthorizer for UserRegistry {
