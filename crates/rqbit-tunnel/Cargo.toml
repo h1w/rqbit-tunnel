@@ -29,3 +29,4 @@ librqbit = { workspace = true, default-features = false, features = ["tracing-su
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
