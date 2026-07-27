@@ -89,6 +89,8 @@ struct FlushWorker {
     join: Mutex<Option<JoinHandle<()>>>,
     #[cfg(test)]
     flush_completed: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    started: Arc<tokio::sync::Notify>,
 }
 
 impl UserRegistry {
@@ -347,6 +349,8 @@ impl FlushWorker {
             join: Mutex::new(None),
             #[cfg(test)]
             flush_completed: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            started: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -360,11 +364,16 @@ impl FlushWorker {
         let flush_completed = Some(Arc::clone(&self.flush_completed));
         #[cfg(not(test))]
         let flush_completed = None;
+        #[cfg(test)]
+        let started = Some(Arc::clone(&self.started));
+        #[cfg(not(test))]
+        let started = None;
         let join = tokio::spawn(run_flush_worker(
             registry,
             cancellation,
             interval,
             flush_completed,
+            started,
         ));
 
         let mut join_slot = self.join.lock().await;
@@ -395,8 +404,12 @@ async fn run_flush_worker(
     cancellation: CancellationToken,
     interval: Duration,
     flush_completed: Option<Arc<tokio::sync::Notify>>,
+    started: Option<Arc<tokio::sync::Notify>>,
 ) {
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    if let Some(started) = started {
+        started.notify_one();
+    }
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
@@ -689,7 +702,7 @@ mod tests {
     async fn periodic_flush_persists_dirty_traffic_without_an_admin_mutation() {
         let (_directory, _database_path, registry) =
             test_registry_with_flush_interval(Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
+        registry.flush_worker.started.notified().await;
 
         let created = registry.create_user("alice").await.unwrap();
         let user = created.user;
@@ -698,7 +711,6 @@ mod tests {
         session.record_payload(TunnelTrafficDirection::Download, 14);
 
         tokio::time::advance(Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
         registry.flush_worker.flush_completed.notified().await;
 
         assert_eq!(
