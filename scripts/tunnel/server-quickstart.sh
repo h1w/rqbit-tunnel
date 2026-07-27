@@ -91,7 +91,8 @@ existing_regular_file_as_root() {
 }
 
 valid_port() {
-    [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$1 <= 65535 ))
+    [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] &&
+        (( 10#$1 >= 1024 && 10#$1 <= 65535 ))
 }
 
 is_routable_ipv4() {
@@ -105,6 +106,7 @@ is_routable_ipv4() {
 
     first=$((10#$first))
     second=$((10#$second))
+    third=$((10#$third))
     if (( first == 0 || first == 10 || first == 127 || first >= 224 )); then
         return 1
     fi
@@ -117,7 +119,20 @@ is_routable_ipv4() {
     if (( first == 172 && second >= 16 && second <= 31 )); then
         return 1
     fi
-    if (( first == 192 && second == 168 )); then
+    if (( first == 192 )); then
+        # Conservative 192.0.0/24 handling plus non-global IANA special-use ranges.
+        if (( (second == 0 && (third == 0 || third == 2)) ||
+            (second == 88 && third == 99) ||
+            second == 168 )); then
+            return 1
+        fi
+    fi
+    if (( first == 198 )); then
+        if (( second == 18 || second == 19 || (second == 51 && third == 100) )); then
+            return 1
+        fi
+    fi
+    if (( first == 203 && second == 0 && third == 113 )); then
         return 1
     fi
 }
@@ -170,10 +185,11 @@ valid_installed_key() {
 wait_for_health() {
     local health_json deadline
 
-    printf 'Waiting for managed server health via its local control socket...\n' >&2
+    printf 'Waiting for an active managed server and local control socket health...\n' >&2
     deadline=$((SECONDS + 30))
     while (( SECONDS < deadline )); do
-        if health_json=$(run_as_root "$INSTALL_BIN" server users list --json 2>/dev/null); then
+        if run_as_root systemctl is-active --quiet "$SERVICE_NAME" >/dev/null 2>&1 &&
+            health_json=$(run_as_root "$INSTALL_BIN" server users list --json 2>/dev/null); then
             case "$health_json" in
                 \{*|\[* ) return 0 ;;
             esac
@@ -182,7 +198,7 @@ wait_for_health() {
     done
 
     run_as_root systemctl --no-pager --full status "$SERVICE_NAME" >&2 || true
-    die 'managed server did not return JSON health within 30 seconds'
+    die 'managed server did not become active and return JSON health within 30 seconds'
 }
 
 skip_tui=0
@@ -204,7 +220,8 @@ while (($#)); do
 done
 
 peer_port=${PEER_PORT:-4242}
-valid_port "$peer_port" || die 'PEER_PORT must be an integer from 1 through 65535'
+valid_port "$peer_port" ||
+    die 'PEER_PORT must be an unprivileged integer from 1024 through 65535 (the service drops all capabilities)'
 
 unit_source=${RQBIT_TUNNEL_UNIT:-"$SCRIPT_DIR/../../systemd/$SERVICE_NAME"}
 unit_source=$(absolute_path "$unit_source")
@@ -229,10 +246,14 @@ managed_state_exists=0
 if existing_regular_file_as_root "$STATE_DB"; then
     managed_state_exists=1
 fi
-if (( needs_config || needs_key )); then
-    if (( needs_config != needs_key || managed_state_exists )); then
-        die 'managed server identity is incomplete; restore the original server.json and server.key instead of generating replacement enrollment identity'
-    fi
+if (( needs_config && needs_key )); then
+    (( ! managed_state_exists )) ||
+        die 'managed server state exists without its original server.json and server.key; restore the protected identity instead of generating a replacement'
+elif (( ! needs_config && ! needs_key )); then
+    (( managed_state_exists )) ||
+        die 'managed server.json and server.key exist without server-state.db; restore the original managed state before continuing'
+else
+    die 'managed server identity is incomplete; restore the original server.json and server.key instead of generating replacement enrollment identity'
 fi
 
 binary_source=${RQBIT_TUNNEL_BIN:-}

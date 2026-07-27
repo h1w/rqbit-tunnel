@@ -45,20 +45,24 @@ uses systemd. It creates and restricts:
 
 The initial configuration uses a nonzero `peer_listen` address, blocks private,
 loopback, link-local, and multicast egress by default, and sets client SOCKS
-to `127.0.0.1:1080`. Open the configured peer TCP port (default `4242`) in the
-VPS firewall.
+to `127.0.0.1:1080`. `PEER_PORT` must be in `1024..=65535` because the service
+deliberately drops all Linux capabilities. Open the configured peer TCP port
+(default `4242`) in the VPS firewall.
 
-The installer creates the configuration and key only for an empty managed
-installation. If a configuration, key, or `server-state.db` is incomplete,
-restore the original protected pair from backup instead of allowing a new server
-identity to invalidate enrolled clients' bundles.
+The installer creates the configuration and key only for a fresh managed
+installation with no identity or `server-state.db`. If either identity file is
+missing, or a complete identity has no state database, restore the original
+protected state from backup instead of allowing a new server identity to
+invalidate enrolled clients' bundles.
 
 After `daemon-reload` and `enable --now`, the installer waits up to 30 seconds
-for `server users list --json` to succeed over the local control socket, then
-opens the server TUI. For automation, the TUI is skipped **only** by the
-explicit flag:
+for both `rqbit-tunnel-server.service` to be active and `server users list
+--json` to succeed over the local control socket, then opens the server TUI.
+For automation, the TUI is skipped **only** by the explicit flag:
 
 ```bash
+# Set PUBLIC_SERVER_IPV4 to the VPS's real reachable public IPv4 address.
+SERVER_IP="$PUBLIC_SERVER_IPV4" \
 RQBIT_TUNNEL_BIN=/srv/rqbit-release/rqbit-tunnel \
 RQBIT_KEYGEN_BIN=/srv/rqbit-release/rqbit \
 ./scripts/tunnel/server-quickstart.sh --skip-tui
