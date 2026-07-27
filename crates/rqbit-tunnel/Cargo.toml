@@ -3,6 +3,12 @@ name = "rqbit-tunnel"
 version.workspace = true
 edition = "2024"
 
+[features]
+default = ["default-tls"]
+default-tls = ["librqbit/default-tls"]
+rust-tls = ["librqbit/rust-tls"]
+
+
 [dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "sync", "time"] }
 tokio-util.workspace = true
@@ -18,3 +24,8 @@ sha2.workspace = true
 directories.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
+arc-swap.workspace = true
+librqbit = { workspace = true, default-features = false, features = ["tracing-subscriber-utils"] }
+
+[dev-dependencies]
+tempfile.workspace = true
