@@ -24,7 +24,7 @@ use bytes::Bytes;
 use peer_binary_protocol::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -40,6 +40,7 @@ use super::flow::{
     record_ping_sent,
 };
 use super::frame::{TunnelDestination, TunnelErrorCode, TunnelFrame};
+use super::options::{TunnelServerSession, TunnelTrafficDirection};
 use super::server::AdmittedPeer;
 
 // ── Shared wire helpers ─────────────────────────────────────────────────────
@@ -154,6 +155,18 @@ pub(crate) struct FrameSink {
     data_tx: mpsc::Sender<TunnelFrame>,
 }
 
+enum LossySendOutcome {
+    Queued,
+    Dropped,
+    Closed,
+}
+
+impl LossySendOutcome {
+    fn is_alive(self) -> bool {
+        !matches!(self, Self::Closed)
+    }
+}
+
 impl FrameSink {
     /// Routing table (the ONLY place a frame is classified). Returns `true` for
     /// the ordered data lane, `false` for the control priority lane.
@@ -221,6 +234,12 @@ impl FrameSink {
         tx.send(frame).await.is_ok()
     }
 
+    /// Reserve data-lane capacity before taking a stream-specific accounting
+    /// gate, so writer backpressure cannot stall relay frame processing.
+    async fn reserve_data(&self) -> Option<mpsc::Permit<'_, TunnelFrame>> {
+        self.data_tx.reserve().await.ok()
+    }
+
     /// Best-effort enqueue for lossy traffic (UDP datagrams). Drops the frame
     /// if the destination lane is full instead of blocking the caller — which
     /// would head-of-line-block every other stream on this connection. Routes by
@@ -228,6 +247,10 @@ impl FrameSink {
     /// never flood the control priority lane). Returns `false` only if the peer
     /// connection is gone.
     pub(crate) fn try_send_lossy(&self, frame: TunnelFrame) -> bool {
+        self.try_send_lossy_outcome(frame).is_alive()
+    }
+
+    fn try_send_lossy_outcome(&self, frame: TunnelFrame) -> LossySendOutcome {
         use mpsc::error::TrySendError;
         let tx = if Self::is_data(&frame) {
             &self.data_tx
@@ -235,9 +258,9 @@ impl FrameSink {
             &self.control_tx
         };
         match tx.try_send(frame) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) => true, // dropped; connection still alive
-            Err(TrySendError::Closed(_)) => false,
+            Ok(()) => LossySendOutcome::Queued,
+            Err(TrySendError::Full(_)) => LossySendOutcome::Dropped,
+            Err(TrySendError::Closed(_)) => LossySendOutcome::Closed,
         }
     }
 }
@@ -519,11 +542,35 @@ enum PeerToDest {
     Fin,
 }
 
+struct TcpDownloadState {
+    finished: AtomicBool,
+    credit_progress: AtomicU64,
+    reset: Notify,
+    cleanup: CancellationToken,
+}
+
+impl TcpDownloadState {
+    fn new() -> Self {
+        Self {
+            finished: AtomicBool::new(false),
+            credit_progress: AtomicU64::new(0),
+            reset: Notify::new(),
+            cleanup: CancellationToken::new(),
+        }
+    }
+}
+
 struct TcpEntry {
     to_dest: mpsc::Sender<PeerToDest>,
     /// Credit the server may use to send dest→peer data (granted by the client
     /// via `Credit` frames as it drains its local socket).
     send_credit: SendCredit,
+    /// Payload accepted by the peer but not yet acknowledged with `Credit`.
+    download_uncredited: Arc<AtomicU64>,
+    /// Serializes TCP payload publication with incoming `Credit` processing.
+    download_gate: Arc<Mutex<()>>,
+    /// Completion, credit progress, and cancellable stale-entry cleanup state.
+    download_state: Arc<TcpDownloadState>,
     /// Bidirectional idle watchdog, poked on activity in either direction.
     idle: IdleGuard,
     shutdown: CancellationToken,
@@ -541,6 +588,227 @@ type UdpMap = Arc<Mutex<HashMap<u64, UdpEntry>>>;
 /// for. Mirrors the client mux's identical bookkeeping.
 type PingInflight = Arc<StdMutex<HashMap<u64, Instant>>>;
 
+fn take_acknowledged(pending: &AtomicU64, requested: u32) -> usize {
+    let mut observed = pending.load(Ordering::Acquire);
+    loop {
+        let accepted = observed.min(u64::from(requested));
+        match pending.compare_exchange_weak(
+            observed,
+            observed - accepted,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return accepted as usize,
+            Err(next) => observed = next,
+        }
+    }
+}
+
+fn apply_acknowledged_credit(
+    send_credit: &SendCredit,
+    pending: &AtomicU64,
+    requested: u32,
+    session: &dyn TunnelServerSession,
+) -> usize {
+    let accepted = take_acknowledged(pending, requested);
+    if accepted != 0 {
+        send_credit.grant(accepted);
+        session.record_payload(TunnelTrafficDirection::Download, accepted);
+    }
+    accepted
+}
+
+async fn enqueue_tcp_data(
+    sink: &FrameSink,
+    stream_id: u64,
+    bytes: Bytes,
+    pending: &AtomicU64,
+    download_gate: &Mutex<()>,
+) -> bool {
+    let Some(permit) = sink.reserve_data().await else {
+        return false;
+    };
+    let len = bytes.len();
+    let _download_gate = download_gate.lock().await;
+    permit.send(TunnelFrame::TcpData { stream_id, bytes });
+    pending.fetch_add(len as u64, Ordering::Release);
+    true
+}
+
+/// Apply one peer `Credit` after serializing with destination payload
+/// publication for this stream.
+async fn acknowledge_tcp_credit(
+    tcp: &TcpMap,
+    stream_id: u64,
+    requested: u32,
+    session: &dyn TunnelServerSession,
+) {
+    let entry = {
+        let map = tcp.lock().await;
+        map.get(&stream_id).map(|entry| {
+            (
+                entry.send_credit.clone(),
+                entry.download_uncredited.clone(),
+                entry.download_state.clone(),
+                entry.download_gate.clone(),
+            )
+        })
+    };
+    if let Some((send_credit, download_uncredited, download_state, download_gate)) = entry {
+        let _download_gate = download_gate.lock().await;
+        let accepted =
+            apply_acknowledged_credit(&send_credit, &download_uncredited, requested, session);
+        if accepted != 0 {
+            download_state
+                .credit_progress
+                .fetch_add(1, Ordering::Release);
+            download_state.reset.notify_one();
+        }
+        let _ = retire_finished_tcp_entry(
+            tcp,
+            stream_id,
+            &download_uncredited,
+            &download_state,
+        )
+        .await;
+    }
+}
+
+/// Mark the egress half closed while retaining its entry until every accepted
+/// destination payload has been acknowledged.
+async fn finish_tcp_download(
+    tcp: &TcpMap,
+    stream_id: u64,
+    download_uncredited: &Arc<AtomicU64>,
+    download_state: &Arc<TcpDownloadState>,
+    download_gate: &Arc<Mutex<()>>,
+    cleanup_after: Duration,
+) {
+    let removed = {
+        let _download_gate = download_gate.lock().await;
+        download_state.finished.store(true, Ordering::Release);
+        retire_finished_tcp_entry(tcp, stream_id, download_uncredited, download_state).await
+    };
+    if !removed {
+        tokio::spawn(expire_finished_tcp_entry_after_idle(
+            tcp.clone(),
+            stream_id,
+            download_uncredited.clone(),
+            download_state.clone(),
+            download_gate.clone(),
+            cleanup_after,
+        ));
+    }
+}
+
+/// Remove a completed TCP entry only after its final valid acknowledgement.
+///
+/// Callers hold the entry's `download_gate`, so no accepted `TcpData` can be
+/// published or acknowledged while this checks the outstanding count.
+async fn retire_finished_tcp_entry(
+    tcp: &TcpMap,
+    stream_id: u64,
+    download_uncredited: &Arc<AtomicU64>,
+    download_state: &Arc<TcpDownloadState>,
+) -> bool {
+    let entry = {
+        let mut map = tcp.lock().await;
+        let should_remove = match map.get(&stream_id) {
+            Some(entry) => {
+                Arc::ptr_eq(&entry.download_uncredited, download_uncredited)
+                    && Arc::ptr_eq(&entry.download_state, download_state)
+                    && entry.download_state.finished.load(Ordering::Acquire)
+                    && entry.download_uncredited.load(Ordering::Acquire) == 0
+            }
+            None => false,
+        };
+        if should_remove {
+            map.remove(&stream_id)
+        } else {
+            None
+        }
+    };
+    let removed = entry.is_some();
+    if let Some(entry) = entry {
+        entry.download_state.cleanup.cancel();
+        entry.send_credit.close();
+        entry.shutdown.cancel();
+    }
+    removed
+}
+
+async fn expire_finished_tcp_entry_after_idle(
+    tcp: TcpMap,
+    stream_id: u64,
+    download_uncredited: Arc<AtomicU64>,
+    download_state: Arc<TcpDownloadState>,
+    download_gate: Arc<Mutex<()>>,
+    cleanup_after: Duration,
+) {
+    let mut progress = download_state.credit_progress.load(Ordering::Acquire);
+    loop {
+        tokio::select! {
+            _ = download_state.cleanup.cancelled() => return,
+            _ = download_state.reset.notified() => {
+                progress = download_state.credit_progress.load(Ordering::Acquire);
+                continue;
+            }
+            _ = tokio::time::sleep(cleanup_after) => {}
+        }
+        let _download_gate = download_gate.lock().await;
+        if download_state.cleanup.is_cancelled() {
+            return;
+        }
+        let next_progress = download_state.credit_progress.load(Ordering::Acquire);
+        if next_progress != progress {
+            progress = next_progress;
+            continue;
+        }
+        expire_finished_tcp_entry(
+            &tcp,
+            stream_id,
+            &download_uncredited,
+            &download_state,
+        )
+        .await;
+        return;
+    }
+}
+
+/// Expire a completed entry only after its peer makes no credit progress for
+/// the configured idle interval.
+///
+/// The caller holds the entry's `download_gate`, preserving the same identity
+/// and publication ordering checks used by normal credit retirement.
+async fn expire_finished_tcp_entry(
+    tcp: &TcpMap,
+    stream_id: u64,
+    download_uncredited: &Arc<AtomicU64>,
+    download_state: &Arc<TcpDownloadState>,
+) {
+    let entry = {
+        let mut map = tcp.lock().await;
+        let should_remove = match map.get(&stream_id) {
+            Some(entry) => {
+                Arc::ptr_eq(&entry.download_uncredited, download_uncredited)
+                    && Arc::ptr_eq(&entry.download_state, download_state)
+                    && entry.download_state.finished.load(Ordering::Acquire)
+            }
+            None => false,
+        };
+        if should_remove {
+            map.remove(&stream_id)
+        } else {
+            None
+        }
+    };
+    if let Some(entry) = entry {
+        entry.download_state.cleanup.cancel();
+        entry.send_credit.close();
+        entry.shutdown.cancel();
+    }
+}
+
 /// Run the full egress relay for one admitted peer until the peer disconnects
 /// or `shutdown` fires.
 pub(crate) async fn run_server_relay(
@@ -550,6 +818,7 @@ pub(crate) async fn run_server_relay(
 ) {
     let AdmittedPeer {
         client_key,
+        session,
         transport,
         mut read_half,
         write_half,
@@ -660,12 +929,18 @@ pub(crate) async fn run_server_relay(
                 // is guaranteed to hold a full window — so a stalled destination
                 // can never head-of-line-block the shared reader.
                 let send_credit = SendCredit::with_window(OPEN_WINDOW);
+                let download_uncredited = Arc::new(AtomicU64::new(0));
+                let download_gate = Arc::new(Mutex::new(()));
+                let download_state = Arc::new(TcpDownloadState::new());
                 let idle = IdleGuard::spawn(egress.idle_timeout, stream_token.clone());
                 map.insert(
                     stream_id,
                     TcpEntry {
                         to_dest: to_dest_tx,
                         send_credit: send_credit.clone(),
+                        download_uncredited: download_uncredited.clone(),
+                        download_gate: download_gate.clone(),
+                        download_state: download_state.clone(),
                         idle: idle.clone(),
                         shutdown: stream_token.clone(),
                     },
@@ -677,10 +952,14 @@ pub(crate) async fn run_server_relay(
                     host,
                     port,
                     egress.clone(),
+                    session.clone(),
                     sink.clone(),
                     tcp.clone(),
                     to_dest_rx,
                     send_credit,
+                    download_uncredited,
+                    download_state,
+                    download_gate,
                     idle,
                     stream_token,
                 ));
@@ -708,15 +987,14 @@ pub(crate) async fn run_server_relay(
                 }
             }
             TunnelFrame::Credit { stream_id, bytes } => {
-                // The client drained `bytes` of dest→peer data; replenish the
-                // server's send credit for this stream.
-                let map = tcp.lock().await;
-                if let Some(entry) = map.get(&stream_id) {
-                    entry.send_credit.grant(bytes as usize);
-                }
+                // Acknowledge only payload the peer actually accepted from the
+                // destination, so peer credit and download accounting cannot
+                // exceed successful relay delivery.
+                acknowledge_tcp_credit(&tcp, stream_id, bytes, session.as_ref()).await;
             }
             TunnelFrame::TcpReset { stream_id, .. } => {
                 if let Some(entry) = tcp.lock().await.remove(&stream_id) {
+                    entry.download_state.cleanup.cancel();
                     entry.send_credit.close();
                     entry.shutdown.cancel();
                 }
@@ -754,6 +1032,7 @@ pub(crate) async fn run_server_relay(
                     association_id,
                     socket,
                     sink.clone(),
+                    session.clone(),
                     idle,
                     token,
                 ));
@@ -772,7 +1051,9 @@ pub(crate) async fn run_server_relay(
                     idle.poke();
                     match egress.authorize(&destination, EgressTransport::Udp).await {
                         Ok(resolved) => {
-                            let _ = socket.send_to(&bytes, resolved.selected).await;
+                            let _ =
+                                send_udp_payload(socket.as_ref(), resolved.selected, &bytes, session.as_ref())
+                                    .await;
                         }
                         Err(e) => {
                             tracing::debug!(association_id, error = %e, "udp egress denied");
@@ -801,6 +1082,7 @@ pub(crate) async fn run_server_relay(
 
     // Peer gone: tear everything down.
     for (_, entry) in tcp.lock().await.drain() {
+        entry.download_state.cleanup.cancel();
         entry.send_credit.close();
         entry.shutdown.cancel();
     }
@@ -862,10 +1144,14 @@ async fn handle_tcp_stream(
     host: String,
     port: u16,
     egress: Arc<EgressPolicy>,
+    session: Arc<dyn TunnelServerSession>,
     sink: FrameSink,
     tcp: TcpMap,
     to_dest_rx: mpsc::Receiver<PeerToDest>,
     send_credit: SendCredit,
+    download_uncredited: Arc<AtomicU64>,
+    download_state: Arc<TcpDownloadState>,
+    download_gate: Arc<Mutex<()>>,
     idle: IdleGuard,
     token: CancellationToken,
 ) {
@@ -875,9 +1161,12 @@ async fn handle_tcp_stream(
         port,
         &egress,
         &sink,
+        session,
         to_dest_rx,
         &send_credit,
         &idle,
+        download_uncredited.clone(),
+        download_gate.clone(),
         &token,
     )
     .await;
@@ -886,11 +1175,16 @@ async fn handle_tcp_stream(
         sink.send(TunnelFrame::TcpReset { stream_id, code }).await;
     }
 
-    // Deregister the stream (unless it was already replaced).
-    if let Some(entry) = tcp.lock().await.remove(&stream_id) {
-        entry.send_credit.close();
-        entry.shutdown.cancel();
-    }
+    finish_tcp_download(
+        &tcp,
+        stream_id,
+        &download_uncredited,
+        &download_state,
+        &download_gate,
+        egress.idle_timeout,
+    )
+    .await;
+
 }
 
 /// Authorize + connect the destination, then pump both directions until the
@@ -903,9 +1197,12 @@ async fn open_and_pump(
     port: u16,
     egress: &EgressPolicy,
     sink: &FrameSink,
+    session: Arc<dyn TunnelServerSession>,
     mut to_dest_rx: mpsc::Receiver<PeerToDest>,
     send_credit: &SendCredit,
     idle: &IdleGuard,
+    download_uncredited: Arc<AtomicU64>,
+    download_gate: Arc<Mutex<()>>,
     token: &CancellationToken,
 ) -> Result<(), TunnelErrorCode> {
     let destination = parse_destination(&host, port);
@@ -949,6 +1246,7 @@ async fn open_and_pump(
     let pd_token = token.clone();
     let pd_sink = sink.clone();
     let pd_idle = idle.clone();
+    let pd_session = session;
     let peer_to_dest: JoinHandle<()> = tokio::spawn(async move {
         loop {
             let msg = tokio::select! {
@@ -961,6 +1259,7 @@ async fn open_and_pump(
                     if dest_write.write_all(&bytes).await.is_err() {
                         break;
                     }
+                    pd_session.record_payload(TunnelTrafficDirection::Upload, n);
                     pd_idle.poke();
                     if !pd_sink
                         .send(TunnelFrame::Credit {
@@ -1004,12 +1303,14 @@ async fn open_and_pump(
                     break;
                 }
                 idle.poke();
-                if !sink
-                    .send(TunnelFrame::TcpData {
-                        stream_id,
-                        bytes: Bytes::copy_from_slice(&buf[..n]),
-                    })
-                    .await
+                if !enqueue_tcp_data(
+                    sink,
+                    stream_id,
+                    Bytes::copy_from_slice(&buf[..n]),
+                    &download_uncredited,
+                    download_gate.as_ref(),
+                )
+                .await
                 {
                     break;
                 }
@@ -1038,10 +1339,44 @@ async fn open_and_pump(
 
 // ── Per-UDP-association egress ──────────────────────────────────────────────
 
+async fn send_udp_payload(
+    socket: &UdpSocket,
+    destination: SocketAddr,
+    bytes: &[u8],
+    session: &dyn TunnelServerSession,
+) -> std::io::Result<usize> {
+    let sent = socket.send_to(bytes, destination).await?;
+    session.record_payload(TunnelTrafficDirection::Upload, sent);
+    Ok(sent)
+}
+
+fn queue_udp_response(
+    sink: &FrameSink,
+    association_id: u64,
+    source: SocketAddr,
+    bytes: Bytes,
+    session: &dyn TunnelServerSession,
+) -> bool {
+    let len = bytes.len();
+    match sink.try_send_lossy_outcome(TunnelFrame::UdpDatagram {
+        association_id,
+        destination: TunnelDestination::Ip(source),
+        bytes,
+    }) {
+        LossySendOutcome::Queued => {
+            session.record_payload(TunnelTrafficDirection::Download, len);
+            true
+        }
+        LossySendOutcome::Dropped => true,
+        LossySendOutcome::Closed => false,
+    }
+}
+
 async fn udp_recv_loop(
     association_id: u64,
     socket: Arc<UdpSocket>,
     sink: FrameSink,
+    session: Arc<dyn TunnelServerSession>,
     idle: IdleGuard,
     token: CancellationToken,
 ) {
@@ -1055,11 +1390,13 @@ async fn udp_recv_loop(
             Ok((n, src)) => {
                 idle.poke();
                 // Lossy: drop under congestion rather than stall other streams.
-                let alive = sink.try_send_lossy(TunnelFrame::UdpDatagram {
+                let alive = queue_udp_response(
+                    &sink,
                     association_id,
-                    destination: TunnelDestination::Ip(src),
-                    bytes: Bytes::copy_from_slice(&buf[..n]),
-                });
+                    src,
+                    Bytes::copy_from_slice(&buf[..n]),
+                    session.as_ref(),
+                );
                 if !alive {
                     break;
                 }
@@ -1074,7 +1411,44 @@ async fn udp_recv_loop(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+    use std::net::Ipv6Addr;
+    use parking_lot::Mutex as ParkingMutex;
+
+    use super::super::options::{TunnelServerSession, TunnelTrafficDirection};
+
+    struct RecordingSession {
+        payloads: ParkingMutex<Vec<(TunnelTrafficDirection, usize)>>,
+        shutdown: CancellationToken,
+    }
+
+    impl RecordingSession {
+        fn new() -> Self {
+            Self {
+                payloads: ParkingMutex::new(Vec::new()),
+                shutdown: CancellationToken::new(),
+            }
+        }
+
+        fn recorded(&self) -> Vec<(TunnelTrafficDirection, usize)> {
+            self.payloads.lock().clone()
+        }
+    }
+
+    impl TunnelServerSession for RecordingSession {
+        fn record_payload(&self, direction: TunnelTrafficDirection, bytes: usize) {
+            self.payloads.lock().push((direction, bytes));
+        }
+
+        fn cancellation_token(&self) -> CancellationToken {
+            self.shutdown.clone()
+        }
+
+        fn connected(&self) {}
+
+        fn disconnected(&self) {}
+    }
+
 
     use super::super::carrier::{TunnelCarrierConfig, TunnelCarrierStore};
     use super::super::carrier_chunk::{CarrierDefragmenter, MAX_CARRIER_CIPHERTEXT};
@@ -1522,4 +1896,300 @@ mod tests {
 
         shutdown.cancel();
     }
+    #[tokio::test]
+    async fn credit_is_bounded_by_forwarded_bytes() {
+        let pending = AtomicU64::new(1024);
+        assert_eq!(take_acknowledged(&pending, 4096), 1024);
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+
+        let pending = AtomicU64::new(1024);
+        let send_credit = SendCredit::with_window(0);
+        let session = RecordingSession::new();
+        assert_eq!(
+            apply_acknowledged_credit(&send_credit, &pending, 4096, &session),
+            1024
+        );
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            session.recorded(),
+            vec![(TunnelTrafficDirection::Download, 1024)]
+        );
+        assert!(send_credit.reserve(1024).await);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), send_credit.reserve(1))
+                .await
+                .is_err(),
+            "the credit grant must not exceed successfully forwarded bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_udp_send_to_records_no_upload_payload() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let session = RecordingSession::new();
+
+        assert!(
+            send_udp_payload(
+                &socket,
+                SocketAddr::from((Ipv6Addr::LOCALHOST, 9)),
+                b"payload",
+                &session,
+            )
+            .await
+            .is_err()
+        );
+        assert!(session.recorded().is_empty());
+    }
+
+    #[test]
+    fn accepted_udp_response_queues_its_datagram_and_records_download() {
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        let (data_tx, mut data_rx) = mpsc::channel(1);
+        let sink = FrameSink {
+            control_tx,
+            data_tx,
+        };
+        let session = RecordingSession::new();
+        let payload = Bytes::from_static(b"response");
+
+        assert!(queue_udp_response(
+            &sink,
+            7,
+            SocketAddr::from(([127, 0, 0, 1], 9000)),
+            payload.clone(),
+            &session,
+        ));
+        match data_rx.try_recv().unwrap() {
+            TunnelFrame::UdpDatagram {
+                association_id,
+                bytes,
+                ..
+            } => {
+                assert_eq!(association_id, 7);
+                assert_eq!(bytes, payload);
+            }
+            frame => panic!("expected queued UDP response, got {frame:?}"),
+        }
+        assert_eq!(
+            session.recorded(),
+            vec![(TunnelTrafficDirection::Download, payload.len())]
+        );
+    }
+
+    #[test]
+    fn dropped_udp_response_records_no_download_payload() {
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        let (data_tx, _data_rx) = mpsc::channel(1);
+        data_tx
+            .try_send(TunnelFrame::UdpDatagram {
+                association_id: 1,
+                destination: TunnelDestination::Ip(SocketAddr::from(([127, 0, 0, 1], 9000))),
+                bytes: Bytes::new(),
+            })
+            .unwrap();
+        let sink = FrameSink {
+            control_tx,
+            data_tx,
+        };
+        let session = RecordingSession::new();
+
+        assert!(queue_udp_response(
+            &sink,
+            7,
+            SocketAddr::from(([127, 0, 0, 1], 9000)),
+            Bytes::from_static(b"response"),
+            &session,
+        ));
+        assert!(session.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_tcp_stream_keeps_download_accounting_until_credit_arrives() {
+        let stream_id = 7;
+        let download_uncredited = Arc::new(AtomicU64::new(1024));
+        let download_state = Arc::new(TcpDownloadState::new());
+        let download_gate = Arc::new(Mutex::new(()));
+        let shutdown = CancellationToken::new();
+        let idle = IdleGuard::spawn(Duration::from_secs(60), shutdown.clone());
+        let (to_dest, _to_dest_rx) = mpsc::channel(1);
+        let tcp: TcpMap = Arc::new(Mutex::new(HashMap::new()));
+        tcp.lock().await.insert(
+            stream_id,
+            TcpEntry {
+                to_dest,
+                send_credit: SendCredit::with_window(0),
+                download_uncredited: download_uncredited.clone(),
+                download_state: download_state.clone(),
+                download_gate: download_gate.clone(),
+                idle,
+                shutdown,
+            },
+        );
+        let session = RecordingSession::new();
+
+        finish_tcp_download(
+            &tcp,
+            stream_id,
+            &download_uncredited,
+            &download_state,
+            &download_gate,
+            Duration::from_secs(60),
+        )
+        .await;
+        assert!(tcp.lock().await.contains_key(&stream_id));
+
+        acknowledge_tcp_credit(&tcp, stream_id, 4096, &session).await;
+        assert!(!tcp.lock().await.contains_key(&stream_id));
+        assert!(download_state.cleanup.is_cancelled());
+        assert_eq!(
+            session.recorded(),
+            vec![(TunnelTrafficDirection::Download, 1024)]
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_data_waits_for_queue_capacity_before_taking_credit_gate() {
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        let (data_tx, mut data_rx) = mpsc::channel(1);
+        data_tx
+            .try_send(TunnelFrame::UdpDatagram {
+                association_id: 1,
+                destination: TunnelDestination::Ip(SocketAddr::from(([127, 0, 0, 1], 9000))),
+                bytes: Bytes::new(),
+            })
+            .unwrap();
+        let sink = FrameSink {
+            control_tx,
+            data_tx,
+        };
+        let download_uncredited = Arc::new(AtomicU64::new(0));
+        let download_gate = Arc::new(Mutex::new(()));
+        let send = tokio::spawn({
+            let sink = sink.clone();
+            let download_uncredited = download_uncredited.clone();
+            let download_gate = download_gate.clone();
+            async move {
+                enqueue_tcp_data(
+                    &sink,
+                    7,
+                    Bytes::from_static(b"response"),
+                    &download_uncredited,
+                    &download_gate,
+                )
+                .await
+            }
+        });
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            download_gate.try_lock().is_ok(),
+            "waiting for data-lane capacity must not block the relay reader on this stream"
+        );
+
+        data_rx.try_recv().unwrap();
+        assert!(send.await.unwrap());
+        assert_eq!(download_uncredited.load(Ordering::Relaxed), b"response".len() as u64);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uncredited_closed_tcp_stream_expires() {
+        let stream_id = 7;
+        let download_uncredited = Arc::new(AtomicU64::new(1024));
+        let download_state = Arc::new(TcpDownloadState::new());
+        let download_gate = Arc::new(Mutex::new(()));
+        let shutdown = CancellationToken::new();
+        let idle = IdleGuard::spawn(Duration::from_secs(60), shutdown.clone());
+        let (to_dest, _to_dest_rx) = mpsc::channel(1);
+        let tcp: TcpMap = Arc::new(Mutex::new(HashMap::new()));
+        tcp.lock().await.insert(
+            stream_id,
+            TcpEntry {
+                to_dest,
+                send_credit: SendCredit::with_window(0),
+                download_uncredited: download_uncredited.clone(),
+                download_state: download_state.clone(),
+                download_gate: download_gate.clone(),
+                idle,
+                shutdown,
+            },
+        );
+
+        finish_tcp_download(
+            &tcp,
+            stream_id,
+            &download_uncredited,
+            &download_state,
+            &download_gate,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(tcp.lock().await.contains_key(&stream_id));
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!tcp.lock().await.contains_key(&stream_id));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_credit_progress_resets_finished_stream_expiry() {
+        let stream_id = 7;
+        let download_uncredited = Arc::new(AtomicU64::new(1024));
+        let download_state = Arc::new(TcpDownloadState::new());
+        let download_gate = Arc::new(Mutex::new(()));
+        let shutdown = CancellationToken::new();
+        let idle = IdleGuard::spawn(Duration::from_secs(60), shutdown.clone());
+        let (to_dest, _to_dest_rx) = mpsc::channel(1);
+        let tcp: TcpMap = Arc::new(Mutex::new(HashMap::new()));
+        tcp.lock().await.insert(
+            stream_id,
+            TcpEntry {
+                to_dest,
+                send_credit: SendCredit::with_window(0),
+                download_uncredited: download_uncredited.clone(),
+                download_state: download_state.clone(),
+                download_gate: download_gate.clone(),
+                idle,
+                shutdown,
+            },
+        );
+        let session = RecordingSession::new();
+
+        finish_tcp_download(
+            &tcp,
+            stream_id,
+            &download_uncredited,
+            &download_state,
+            &download_gate,
+            Duration::from_secs(1),
+        )
+        .await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        acknowledge_tcp_credit(&tcp, stream_id, 512, &session).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(tcp.lock().await.contains_key(&stream_id));
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!tcp.lock().await.contains_key(&stream_id));
+        assert_eq!(
+            session.recorded(),
+            vec![(TunnelTrafficDirection::Download, 512)]
+        );
+    }
+
 }
