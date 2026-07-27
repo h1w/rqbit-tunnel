@@ -109,7 +109,7 @@ pub use librqbit_core::magnet::*;
 pub use librqbit_core::peer_id::*;
 pub use librqbit_core::torrent_metainfo::*;
 
-pub use tunnel::crypto::generate_keypair as tunnel_generate_keypair;
+pub use tunnel::crypto::{generate_keypair as tunnel_generate_keypair, tunnel_public_key};
 pub use tunnel::frame::{TunnelPairingBundle, TunnelPrivateKey, TunnelPublicKey};
 pub use tunnel::options::{
     EgressPolicy, TunnelClientOptions, TunnelOptions, TunnelServerAuthorizer, TunnelServerOptions,

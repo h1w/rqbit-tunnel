@@ -29,8 +29,24 @@ impl ServerPaths {
         }
     }
 
+    pub fn config_path(&self) -> PathBuf {
+        self.config_dir.join("server.json")
+    }
+
+    pub fn server_key_path(&self) -> PathBuf {
+        self.config_dir.join("server.key")
+    }
+
+    pub fn carrier_root(&self) -> PathBuf {
+        self.data_dir.join("carrier")
+    }
+
+    pub fn control_socket_path(&self) -> PathBuf {
+        self.run_dir.join("server.sock")
+    }
+
     pub fn database_path(&self) -> PathBuf {
-        self.data_dir.join("server.sqlite3")
+        self.data_dir.join("server-state.db")
     }
 }
 
@@ -57,5 +73,17 @@ mod tests {
         assert_eq!(paths.config_dir, root.join("etc/rqbit-tunnel"));
         assert_eq!(paths.data_dir, root.join("var/lib/rqbit-tunnel"));
         assert_eq!(paths.run_dir, root.join("run/rqbit-tunnel"));
+    }
+
+    #[test]
+    fn server_artifact_paths_use_the_managed_layout() {
+        let root = Path::new("/tmp/rqbit-tunnel-stage");
+        let paths = ServerPaths::under(root);
+
+        assert_eq!(paths.config_path(), root.join("etc/rqbit-tunnel/server.json"));
+        assert_eq!(paths.server_key_path(), root.join("etc/rqbit-tunnel/server.key"));
+        assert_eq!(paths.carrier_root(), root.join("var/lib/rqbit-tunnel/carrier"));
+        assert_eq!(paths.control_socket_path(), root.join("run/rqbit-tunnel/server.sock"));
+        assert_eq!(paths.database_path(), root.join("var/lib/rqbit-tunnel/server-state.db"));
     }
 }

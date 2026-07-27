@@ -2,15 +2,60 @@ use std::net::SocketAddr;
 
 use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use thiserror::Error;
 use uuid::Uuid;
 
 pub const BUNDLE_SCHEMA_VERSION: u32 = 1;
+pub const SERVER_CONFIG_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub schema_version: u32,
-    pub server_addr: SocketAddr,
-    pub carriers: usize,
+    pub peer_listen: SocketAddr,
+    pub egress: ServerEgressConfig,
+    pub default_client_socks_listen: SocketAddr,
+    pub default_client_carriers: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerEgressConfig {
+    pub allow_private: bool,
+    pub allow_loopback: bool,
+    pub allow_link_local: bool,
+    pub allow_multicast: bool,
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum ServerConfigError {
+    #[error(
+        "server configuration schema version {actual} is unsupported (expected {expected})"
+    )]
+    UnsupportedSchemaVersion { actual: u32, expected: u32 },
+    #[error("the tunnel peer listener port must not be zero")]
+    ZeroPeerListenPort,
+    #[error("default client carrier count {actual} must be in 1..=16")]
+    InvalidDefaultClientCarriers { actual: usize },
+}
+
+impl ServerConfig {
+    pub fn validate(&self) -> Result<(), ServerConfigError> {
+        if self.schema_version != SERVER_CONFIG_SCHEMA_VERSION {
+            return Err(ServerConfigError::UnsupportedSchemaVersion {
+                actual: self.schema_version,
+                expected: SERVER_CONFIG_SCHEMA_VERSION,
+            });
+        }
+        if self.peer_listen.port() == 0 {
+            return Err(ServerConfigError::ZeroPeerListenPort);
+        }
+        if !(1..=16).contains(&self.default_client_carriers) {
+            return Err(ServerConfigError::InvalidDefaultClientCarriers {
+                actual: self.default_client_carriers,
+            });
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,7 +156,10 @@ where
 }
 #[cfg(test)]
 mod tests {
-    use super::EnrollmentBundle;
+    use super::{
+        EnrollmentBundle, ServerConfig, ServerConfigError, ServerEgressConfig,
+        SERVER_CONFIG_SCHEMA_VERSION,
+    };
 
     #[test]
     fn enrollment_bundle_round_trips_hex_keys_without_leaking_extra_fields() {
@@ -120,5 +168,43 @@ mod tests {
         assert!(encoded.contains("0707070707070707070707070707070707070707070707070707070707070707"));
         assert!(!encoded.contains("carrier_root"));
         assert_eq!(serde_json::from_str::<EnrollmentBundle>(&encoded).unwrap(), bundle);
+    }
+
+    #[test]
+    fn server_config_rejects_unsupported_schema_zero_peer_port_and_invalid_carriers() {
+        let valid = ServerConfig {
+            schema_version: SERVER_CONFIG_SCHEMA_VERSION,
+            peer_listen: "127.0.0.1:4242".parse().unwrap(),
+            egress: ServerEgressConfig {
+                allow_private: false,
+                allow_loopback: false,
+                allow_link_local: false,
+                allow_multicast: false,
+            },
+            default_client_socks_listen: "127.0.0.1:1080".parse().unwrap(),
+            default_client_carriers: 4,
+        };
+        assert!(valid.validate().is_ok());
+
+        let mut invalid = valid.clone();
+        invalid.schema_version = SERVER_CONFIG_SCHEMA_VERSION + 1;
+        assert!(matches!(
+            invalid.validate(),
+            Err(ServerConfigError::UnsupportedSchemaVersion { .. })
+        ));
+
+        let mut invalid = valid.clone();
+        invalid.peer_listen = "127.0.0.1:0".parse().unwrap();
+        assert!(matches!(
+            invalid.validate(),
+            Err(ServerConfigError::ZeroPeerListenPort)
+        ));
+
+        let mut invalid = valid.clone();
+        invalid.default_client_carriers = 17;
+        assert!(matches!(
+            invalid.validate(),
+            Err(ServerConfigError::InvalidDefaultClientCarriers { .. })
+        ));
     }
 }

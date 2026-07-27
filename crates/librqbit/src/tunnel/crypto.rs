@@ -294,6 +294,14 @@ pub fn generate_keypair() -> (TunnelPrivateKey, TunnelPublicKey) {
     (TunnelPrivateKey(private), TunnelPublicKey(public))
 }
 
+/// Derive the X25519 public key corresponding to a tunnel private key.
+///
+/// This keeps callers outside the tunnel implementation independent from the
+/// Curve25519 implementation details.
+pub fn tunnel_public_key(private: &TunnelPrivateKey) -> TunnelPublicKey {
+    public_key(private)
+}
+
 // ── Carrier hash derivation ─────────────────────────────────────────────────
 
 /// Derive the x25519 public key from a private key (Curve25519 base-point
@@ -352,17 +360,17 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::cell::Cell;
 
-    /// Linchpin: our `public_key` derivation MUST match the public key snow
-    /// produced for the same private key, otherwise the client (deriving the
-    /// carrier hash from the pinned server *public* key) and the server
-    /// (deriving it from its own *private* key) would disagree and the MSE
-    /// handshake would fail.
+    /// Linchpin: our public `tunnel_public_key` derivation MUST match the
+    /// public key snow produced for the same private key, otherwise the client
+    /// (deriving the carrier hash from the pinned server *public* key) and the
+    /// server (deriving it from its own *private* key) would disagree and the
+    /// MSE handshake would fail.
     #[test]
-    fn public_key_matches_generated_keypair() {
+    fn tunnel_public_key_matches_generated_keypair() {
         for _ in 0..16 {
             let (priv_key, pub_key) = generate_keypair();
             assert_eq!(
-                public_key(&priv_key),
+                tunnel_public_key(&priv_key),
                 pub_key,
                 "derived public key must equal snow's public key"
             );
