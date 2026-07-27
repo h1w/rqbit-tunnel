@@ -12,6 +12,7 @@ use std::time::Duration;
 use peer_binary_protocol::{Message, extended::ExtendedMessage};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use super::carrier::TunnelCarrierStore;
@@ -258,17 +259,18 @@ async fn seed_until_promoted(
 fn relay_shutdown(
     peer_shutdown: CancellationToken,
     session: &dyn TunnelServerSession,
-) -> CancellationToken {
+) -> (CancellationToken, JoinHandle<()>) {
     let relay_shutdown = peer_shutdown.child_token();
     let user_shutdown = session.cancellation_token();
     let bridge_shutdown = relay_shutdown.clone();
-    tokio::spawn(async move {
+    let bridge = tokio::spawn(async move {
         tokio::select! {
+            biased;
             _ = peer_shutdown.cancelled() => bridge_shutdown.cancel(),
             _ = user_shutdown.cancelled() => bridge_shutdown.cancel(),
         }
     });
-    relay_shutdown
+    (relay_shutdown, bridge)
 }
 
 // ── Pre-auth connection admission caps (Plan B, Task 2) ─────────────────────
@@ -524,8 +526,8 @@ impl TunnelServer {
         }
     }
 
-    /// Run the accept loop on the given listener, spawning relay tasks
-    /// for each admitted peer.
+    /// Run the accept loop on the given listener, owning every accepted peer
+    /// task until it has stopped.
     pub async fn run(
         self: &Arc<Self>,
         listener: TcpListener,
@@ -535,9 +537,21 @@ impl TunnelServer {
         let egress = Arc::new(super::egress::EgressPolicy::from_config(
             &self.options.egress_policy,
         ));
+        let mut peer_tasks = JoinSet::new();
 
         loop {
             tokio::select! {
+                biased;
+
+                _ = shutdown.cancelled() => {
+                    tracing::info!("tunnel server shutting down");
+                    break;
+                }
+                Some(result) = peer_tasks.join_next(), if !peer_tasks.is_empty() => {
+                    if let Err(error) = result {
+                        tracing::debug!(%error, "tunnel peer task stopped unexpectedly");
+                    }
+                }
                 result = listener.accept() => {
                     match result {
                         Ok((stream, addr)) => {
@@ -563,12 +577,17 @@ impl TunnelServer {
                             let server = Arc::clone(self);
                             let egress = egress.clone();
                             let peer_shutdown = shutdown.child_token();
-                            tokio::spawn(async move {
+                            let _ = peer_tasks.spawn(async move {
                                 // Held for the task's whole lifetime; its Drop
                                 // decrements the per-IP/global counts on every
                                 // exit path (promoted, seeded-out, error).
                                 let _guard = guard;
-                                match server.accept(stream).await {
+                                let accepted = tokio::select! {
+                                    biased;
+                                    _ = peer_shutdown.cancelled() => return,
+                                    result = server.accept(stream) => result,
+                                };
+                                match accepted {
                                     Ok(AcceptOutcome::Admitted(peer)) => {
                                         // Authenticated (allowlisted): release the
                                         // pre-auth seeder slot BEFORE relaying. The
@@ -582,7 +601,7 @@ impl TunnelServer {
                                         drop(_guard);
                                         let client_key = peer.client_key.clone();
                                         let session = peer.session.clone();
-                                        let relay_shutdown =
+                                        let (relay_shutdown, relay_shutdown_bridge) =
                                             relay_shutdown(peer_shutdown.clone(), session.as_ref());
                                         tracing::info!(?client_key, %addr, "tunnel peer admitted");
                                         super::relay::run_server_relay(
@@ -592,6 +611,7 @@ impl TunnelServer {
                                         )
                                         .await;
                                         peer_shutdown.cancel();
+                                        let _ = relay_shutdown_bridge.await;
                                         session.disconnected();
                                         server.remove_peer(&client_key).await;
                                     }
@@ -615,10 +635,12 @@ impl TunnelServer {
                         }
                     }
                 }
-                _ = shutdown.cancelled() => {
-                    tracing::info!("tunnel server shutting down");
-                    break;
-                }
+            }
+        }
+
+        while let Some(result) = peer_tasks.join_next().await {
+            if let Err(error) = result {
+                tracing::debug!(%error, "tunnel peer task stopped unexpectedly");
             }
         }
     }
@@ -812,7 +834,7 @@ mod tests {
     async fn cancelling_an_admitted_session_cancels_relay_shutdown() {
         let global_shutdown = CancellationToken::new();
         let session = RecordingSession::new();
-        let relay_shutdown = relay_shutdown(global_shutdown.child_token(), &session);
+        let (relay_shutdown, bridge) = relay_shutdown(global_shutdown.child_token(), &session);
 
         session.shutdown.cancel();
         tokio::time::timeout(
@@ -825,6 +847,7 @@ mod tests {
             !global_shutdown.is_cancelled(),
             "session revocation must not cancel the global server token"
         );
+        bridge.await.expect("relay cancellation bridge must stop");
     }
 
     #[test]

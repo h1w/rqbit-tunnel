@@ -1083,7 +1083,10 @@ impl Session {
         self.root_span.as_ref().and_then(|s| s.id())
     }
 
-    /// Stop the session and all managed tasks.
+    /// Stop the session and cancel all managed work.
+    ///
+    /// For tunnel sessions, this also waits until the tunnel service has joined
+    /// its server roots and their relay descendants before returning.
     pub async fn stop(&self) {
         let torrents = self
             .db
@@ -1098,8 +1101,12 @@ impl Session {
             }
         }
         self.cancellation_token.cancel();
-        // this sucks, but hopefully will be enough
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Some(tunnel_service) = self.tunnel_service() {
+            tunnel_service.shutdown().await;
+        } else {
+            // Preserve the established grace period for non-tunnel sessions.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     }
 
     /// Run a callback given the currently managed torrents.
@@ -1839,6 +1846,87 @@ mod tests {
     use librqbit_core::torrent_metainfo::{TorrentMetaV1, torrent_from_bytes};
 
     use super::torrent_file_from_info_bytes;
+    use std::collections::HashSet;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::time::Duration;
+
+    use tokio::io::AsyncReadExt;
+
+    use crate::tunnel::carrier_identity::build_carrier_store;
+    use crate::tunnel::crypto::generate_keypair;
+    use crate::tunnel::options::{EgressPolicy, TunnelOptions, TunnelServerOptions};
+    use crate::tunnel::peer_wire_crypto::PeerWireCrypto;
+
+    use super::{Session, SessionOptions};
+
+    #[tokio::test]
+    async fn concurrent_stop_waits_for_tunnel_server_peer_tasks() {
+        let server_carrier_root = tempfile::tempdir().expect("server carrier root");
+        let client_carrier_root = tempfile::tempdir().expect("client carrier root");
+        let output_root = tempfile::tempdir().expect("session output root");
+        let (server_key, server_public_key) = generate_keypair();
+        let (_client_key, client_public_key) = generate_keypair();
+        let peer_listen = {
+            let probe = std::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+                .expect("reserve tunnel listener address");
+            probe.local_addr().expect("reserved listener address")
+        };
+
+        let mut allowed_client_keys = HashSet::new();
+        allowed_client_keys.insert(client_public_key);
+        let options = SessionOptions {
+            dht: None,
+            disable_trackers: true,
+            disable_local_service_discovery: true,
+            tunnel: Some(TunnelOptions::Server(TunnelServerOptions {
+                peer_listen,
+                identity_key: server_key,
+                allowed_client_keys,
+                authorizer: None,
+                egress_policy: EgressPolicy {
+                    allow_loopback: true,
+                    ..Default::default()
+                },
+                carrier_root: server_carrier_root.path().to_owned(),
+            })),
+            ..Default::default()
+        };
+        let session = Session::new_with_opts(output_root.path().to_owned(), options)
+            .await
+            .expect("start tunnel server session");
+
+        let client_store = build_carrier_store(client_carrier_root.path(), &server_public_key)
+            .await
+            .expect("build matching client carrier");
+        let client_io = tokio::net::TcpStream::connect(peer_listen)
+            .await
+            .expect("connect to tunnel server");
+        let encrypted = PeerWireCrypto::initiator(
+            client_io,
+            client_store.descriptor().handshake_info_hash,
+        )
+        .await
+        .expect("complete MSE handshake");
+
+        tokio::join!(session.stop(), session.stop());
+
+        let mut reader = encrypted.reader;
+        let mut bytes = [0u8; 1024];
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if reader
+                    .read(&mut bytes)
+                    .await
+                    .expect("read tunnel peer after session stop")
+                    == 0
+                {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("Session::stop must not return while a tunnel peer task still owns the socket");
+    }
 
     #[test]
     fn test_torrent_file_from_info_and_bytes() {

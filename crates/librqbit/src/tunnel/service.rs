@@ -10,6 +10,8 @@
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::session::Session;
@@ -21,11 +23,12 @@ use super::socks::SocksIngress;
 
 /// Handle to a running tunnel service.
 ///
-/// Created by [`TunnelService::start`] and stored on [`Session`].  When the
-/// session's cancellation token fires (or [`shutdown`](Self::shutdown) is
-/// called explicitly) the background tasks are torn down.
+/// Created by [`TunnelService::start`] and stored on [`Session`].  Its
+/// [`shutdown`](Self::shutdown) method cancels the service and does not return
+/// until every service root task has exited.
 pub struct TunnelService {
     shutdown: CancellationToken,
+    roots: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl TunnelService {
@@ -41,9 +44,7 @@ impl TunnelService {
         options.validate()?;
 
         let shutdown = session.cancellation_token().child_token();
-        let service = Arc::new(Self {
-            shutdown: shutdown.clone(),
-        });
+        let mut roots = Vec::new();
 
         match options {
             TunnelOptions::Client(opts) => {
@@ -63,9 +64,9 @@ impl TunnelService {
 
                 let ingress = SocksIngress::new(local_addr);
                 let socks_shutdown = shutdown.clone();
-                tokio::spawn(async move {
+                roots.push(tokio::spawn(async move {
                     ingress.run(listener, pool, socks_shutdown).await;
-                });
+                }));
 
                 tracing::info!("tunnel client SOCKS5 listening on {local_addr}");
             }
@@ -90,7 +91,7 @@ impl TunnelService {
                 if let Some(dht) = session.get_dht() {
                     let announce_port = local_addr.port();
                     let stream = dht.get_peers(announce_hash, Some(announce_port));
-                    tokio::spawn(run_dht_announce(stream, shutdown.clone()));
+                    roots.push(tokio::spawn(run_dht_announce(stream, shutdown.clone())));
                     tracing::info!(
                         ?announce_hash,
                         port = announce_port,
@@ -100,23 +101,31 @@ impl TunnelService {
 
                 let server = TunnelServer::new(opts, carrier_store);
                 let server_shutdown = shutdown.clone();
-                tokio::spawn(async move {
+                roots.push(tokio::spawn(async move {
                     server.run(listener, server_shutdown).await;
-                });
+                }));
 
                 tracing::info!("tunnel server listening on {local_addr}");
             }
         }
 
-        Ok(service)
+        Ok(Arc::new(Self {
+            shutdown,
+            roots: Mutex::new(roots),
+        }))
     }
 
-    /// Initiate graceful shutdown of the tunnel service.
+    /// Cancel the service and wait for every service root to exit.
     ///
-    /// Cancels the child token, which causes the server accept loop and
-    /// any relay tasks to exit.
+    /// Concurrent callers serialize on the root-task collection, so each
+    /// returns only after cancellation has been observed and all roots have
+    /// been joined.
     pub async fn shutdown(&self) {
         self.shutdown.cancel();
+        let mut roots = self.roots.lock().await;
+        while let Some(root) = roots.pop() {
+            let _ = root.await;
+        }
     }
 }
 
