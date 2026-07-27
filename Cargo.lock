@@ -5176,15 +5176,19 @@ dependencies = [
 name = "rqbit-tunnel"
 version = "9.0.0-rc.0"
 dependencies = [
+ "arc-swap",
  "clap",
  "crossterm",
  "directories",
  "hex 0.4.3",
+ "libc",
+ "librqbit",
  "ratatui",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

@@ -1393,25 +1393,7 @@ pub(crate) async fn spawn_test_server(socket: &Path) -> ManagedServer {
 #[cfg(test)]
 async fn start_test_server(paths: ServerPaths) -> Result<ManagedServer, ServerRuntimeError> {
     let _start_gate = TEST_SERVER_START_GATE.lock().await;
-    let mut last_error = None;
-    for _ in 0..8 {
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("allocate a test tunnel port");
-        let peer_listen = listener
-            .local_addr()
-            .expect("read test tunnel listener address");
-        drop(listener);
-        write_test_server_config(&paths, peer_listen);
-
-        match ManagedServer::start(paths.clone()).await {
-            Ok(server) => return Ok(server),
-            Err(error @ ServerRuntimeError::SessionStart) => last_error = Some(error),
-            Err(error) => return Err(error),
-        }
-    }
-
-    Err(last_error.expect("test server startup exhausted its peer-port retries"))
+    start_test_server_with_candidates_locked(&paths, std::iter::empty()).await
 }
 
 #[cfg(test)]
@@ -1423,18 +1405,55 @@ where
     I: IntoIterator<Item = std::net::SocketAddr>,
 {
     let _start_gate = TEST_SERVER_START_GATE.lock().await;
+    start_test_server_with_candidates_locked(&paths, candidates).await
+}
+
+#[cfg(test)]
+async fn start_test_server_with_candidates_locked<I>(
+    paths: &ServerPaths,
+    candidates: I,
+) -> Result<ManagedServer, ServerRuntimeError>
+where
+    I: IntoIterator<Item = std::net::SocketAddr>,
+{
     let mut last_error = None;
     for peer_listen in candidates {
-        write_test_server_config(&paths, peer_listen);
-
-        match ManagedServer::start(paths.clone()).await {
-            Ok(server) => return Ok(server),
-            Err(error @ ServerRuntimeError::SessionStart) => last_error = Some(error),
-            Err(error) => return Err(error),
+        if let Some(server) = try_start_test_server(paths, peer_listen, &mut last_error).await? {
+            return Ok(server);
         }
     }
 
-    Err(last_error.expect("test server startup exhausted its supplied peer-port candidates"))
+    for _ in 0..8 {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("allocate a test tunnel port");
+        let peer_listen = listener
+            .local_addr()
+            .expect("read test tunnel listener address");
+        drop(listener);
+        if let Some(server) = try_start_test_server(paths, peer_listen, &mut last_error).await? {
+            return Ok(server);
+        }
+    }
+
+    Err(last_error.expect("test server startup exhausted its peer-port retries"))
+}
+
+#[cfg(test)]
+async fn try_start_test_server(
+    paths: &ServerPaths,
+    peer_listen: std::net::SocketAddr,
+    last_error: &mut Option<ServerRuntimeError>,
+) -> Result<Option<ManagedServer>, ServerRuntimeError> {
+    write_test_server_config(paths, peer_listen);
+    match ManagedServer::start(paths.clone()).await {
+        Ok(server) => Ok(Some(server)),
+        Err(error @ ServerRuntimeError::SessionStart) => {
+            *last_error = Some(error);
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -2275,16 +2294,9 @@ mod tests {
             .await
             .unwrap();
         let busy_address = busy_listener.local_addr().unwrap();
-        let fallback_listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        let server = start_test_server_with_peer_candidates(paths.clone(), [busy_address])
             .await
             .unwrap();
-        let fallback_address = fallback_listener.local_addr().unwrap();
-        drop(fallback_listener);
-
-        let server =
-            start_test_server_with_peer_candidates(paths.clone(), [busy_address, fallback_address])
-                .await
-                .unwrap();
         drop(busy_listener);
 
         assert!(matches!(
