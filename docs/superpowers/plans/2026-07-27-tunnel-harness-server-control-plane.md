@@ -138,10 +138,11 @@ git commit -m "feat(tunnel): scaffold managed harness model"
 - Modify: `crates/librqbit/src/tunnel/options.rs`
 - Modify: `crates/librqbit/src/tunnel/crypto.rs`
 - Modify: `crates/librqbit/src/tunnel/server.rs`
+- Modify: `crates/librqbit/src/tunnel/relay.rs` (mechanical `AdmittedPeer` destructuring only)
 - Modify: `crates/librqbit/src/tunnel/service.rs`
 - Modify: `crates/librqbit/src/lib.rs`
 - Modify: `crates/rqbit/src/main.rs`
-- Modify: `crates/librqbit/tests/tunnel.rs`
+- Modify: `crates/librqbit/src/tests/tunnel.rs`
 - Test: inline tests in `options.rs`, `crypto.rs`, and `server.rs`
 
 - [ ] **Step 0: Map every exported option callsite before changing it**
@@ -202,7 +203,7 @@ pub struct TunnelServerOptions {
 }
 ```
 
-Validation must reject an empty static set only when `authorizer.is_none()`. Re-export the traits and direction from `librqbit::lib`. Update every existing `TunnelServerOptions` struct literal—including `rqbit::build_tunnel_opts`, `librqbit` inline tests, and `crates/librqbit/tests/tunnel.rs`—to set `authorizer: None`, so the direct `--tunnel-allowed-clients` CLI keeps its current behavior.
+Validation must reject an empty static set only when `authorizer.is_none()`. Re-export the traits and direction from `librqbit::lib`. Update every existing `TunnelServerOptions` struct literal—including `rqbit::build_tunnel_opts`, `librqbit` inline tests, and `crates/librqbit/src/tests/tunnel.rs`—to set `authorizer: None`, so the direct `--tunnel-allowed-clients` CLI keeps its current behavior.
 
 - [ ] **Step 4: Refactor Noise admission to retain a session exactly once**
 
@@ -229,6 +230,8 @@ pub(crate) fn responder_accept_with<T>(
 Keep `responder_accept` as the existing static-allowlist wrapper using `then_some(())`, so its present tests and direct callers retain their behavior.
 
 In `server.rs`, make `seed_until_promoted` return `Arc<dyn TunnelServerSession>` with the transport/key. Add `session` to `AdmittedPeer`, call `session.connected()` after promotion, and call `session.disconnected()` exactly once when the relay task ends. Static allowlist admission receives a no-op session implementation.
+
+The added `session` field requires `relay.rs` to ignore it in the existing exhaustive `AdmittedPeer` destructuring. Make only that compile migration in this task; Task 3 owns all relay accounting behavior.
 
 - [ ] **Step 5: Add revocation-aware cancellation to the server task**
 
@@ -264,7 +267,7 @@ Expected: all selected tests pass; static rejection behavior remains unchanged.
 Commit:
 
 ```bash
-git add crates/librqbit/src/tunnel/{options.rs,crypto.rs,server.rs,service.rs} crates/librqbit/src/lib.rs crates/librqbit/tests/tunnel.rs crates/rqbit/src/main.rs
+git add crates/librqbit/src/tunnel/{options.rs,crypto.rs,server.rs,service.rs,relay.rs} crates/librqbit/src/lib.rs crates/librqbit/src/tests/tunnel.rs crates/rqbit/src/main.rs
 git commit -m "feat(tunnel): support dynamic server authorization"
 ```
 
