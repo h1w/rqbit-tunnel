@@ -4,7 +4,7 @@ version.workspace = true
 edition = "2024"
 
 [dependencies]
-librqbit = { workspace = true, features = ["default-tls", "tracing-subscriber-utils"] }
+librqbit = { workspace = true, features = ["rust-tls", "tracing-subscriber-utils"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "sync", "time"] }
 tokio-util.workspace = true
 serde = { workspace = true, features = ["derive"] }
