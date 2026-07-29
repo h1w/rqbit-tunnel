@@ -11,10 +11,14 @@ readonly CONFIG_PATH="$CONFIG_DIR/server.json"
 readonly SERVER_KEY="$CONFIG_DIR/server.key"
 readonly STATE_DIR='/var/lib/rqbit-tunnel'
 readonly STATE_DB="$STATE_DIR/server-state.db"
+readonly EXPORT_DIR="$STATE_DIR/enrollments"
 readonly CARRIER_DIR="$STATE_DIR/carrier"
 readonly RUN_DIR='/run/rqbit-tunnel'
 readonly CONTROL_SOCKET="$RUN_DIR/server.sock"
+readonly INSTALL_LOCK='/run/rqbit-tunnel-server.install.lock'
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+INSTALL_LOCK_FD=''
+INSTALL_LOCK_PID=''
 
 usage() {
     cat <<'EOF'
@@ -72,15 +76,25 @@ run_as_root() {
     fi
 }
 
+run_as_root_noninteractive() {
+    if (( EUID == 0 )); then
+        "$@"
+    else
+        sudo -n -- "$@"
+    fi
+}
+
 existing_regular_file_as_root() {
     local path=$1 parent=${1%/*}
 
-    # First installs can prepare source material without elevation. Once the
-    # protected parent exists, inspect it as root so access denial is never
-    # misclassified as a missing config or key.
-    if [[ ! -e "$parent" && ! -L "$parent" ]]; then
+    if run_as_root test -L "$parent"; then
+        die "$parent exists but is a symbolic link"
+    fi
+    if ! run_as_root test -e "$parent"; then
         return 1
     fi
+    run_as_root test -d "$parent" || die "$parent exists but is not a directory"
+
     if run_as_root test -L "$path"; then
         die "$path exists but is a symbolic link"
     fi
@@ -230,6 +244,75 @@ wait_for_health() {
     die 'managed server did not become active and return JSON health within 30 seconds'
 }
 
+acquire_install_lock() {
+    local lock_status read_fd write_fd holder_pid
+
+    if (( EUID != 0 )); then
+        command -v sudo >/dev/null 2>&1 ||
+            die 'root privileges are required for installation; run as root or install sudo'
+        sudo -v ||
+            die 'could not authenticate sudo for managed server installation'
+    fi
+
+    coproc INSTALL_LOCK_HOLDER {
+        run_as_root_noninteractive bash -c '
+            set -euo pipefail
+            lock=$1
+            command -v flock >/dev/null 2>&1 || {
+                printf "error\n"
+                exit 127
+            }
+            exec 9>"$lock"
+            if ! flock -n 9; then
+                printf "locked\n"
+                exit 75
+            fi
+            printf "ready\n"
+            cat >/dev/null
+        ' bash "$INSTALL_LOCK"
+    }
+    read_fd=${INSTALL_LOCK_HOLDER[0]}
+    write_fd=${INSTALL_LOCK_HOLDER[1]}
+    holder_pid=$INSTALL_LOCK_HOLDER_PID
+
+    if ! IFS= read -r lock_status <&"$read_fd"; then
+        exec {read_fd}>&-
+        exec {write_fd}>&-
+        wait "$holder_pid" >/dev/null 2>&1 || true
+        die 'could not acquire the managed server installation lock'
+    fi
+    exec {read_fd}>&-
+
+    case "$lock_status" in
+        ready)
+            exec {INSTALL_LOCK_FD}>&"$write_fd"
+            exec {write_fd}>&-
+            INSTALL_LOCK_PID=$holder_pid
+            ;;
+        locked)
+            exec {write_fd}>&-
+            wait "$holder_pid" >/dev/null 2>&1 || true
+            die 'another installation is already in progress'
+            ;;
+        *)
+            exec {write_fd}>&-
+            wait "$holder_pid" >/dev/null 2>&1 || true
+            die 'could not acquire the managed server installation lock'
+            ;;
+    esac
+}
+
+release_install_lock() {
+    if [[ -n "$INSTALL_LOCK_FD" ]]; then
+        exec {INSTALL_LOCK_FD}>&-
+        INSTALL_LOCK_FD=''
+    fi
+    if [[ -n "$INSTALL_LOCK_PID" ]]; then
+        wait "$INSTALL_LOCK_PID" >/dev/null 2>&1 || true
+        INSTALL_LOCK_PID=''
+    fi
+}
+
 skip_tui=0
 while (($#)); do
     case "$1" in
@@ -248,11 +331,19 @@ while (($#)); do
     shift
 done
 
+acquire_install_lock
+
 peer_port=${PEER_PORT:-4242}
 valid_port "$peer_port" ||
     die 'PEER_PORT must be an unprivileged integer from 1024 through 65535 (the service drops all capabilities)'
 
-unit_source=${RQBIT_TUNNEL_UNIT:-"$SCRIPT_DIR/../../systemd/$SERVICE_NAME"}
+if [[ -n ${RQBIT_TUNNEL_UNIT:-} ]]; then
+    unit_source=$RQBIT_TUNNEL_UNIT
+elif [[ -f "$SCRIPT_DIR/systemd/$SERVICE_NAME" ]]; then
+    unit_source="$SCRIPT_DIR/systemd/$SERVICE_NAME"
+else
+    unit_source="$SCRIPT_DIR/../../systemd/$SERVICE_NAME"
+fi
 unit_source=$(absolute_path "$unit_source")
 require_regular_file "$unit_source"
 
@@ -275,7 +366,9 @@ managed_state_exists=0
 if existing_regular_file_as_root "$STATE_DB"; then
     managed_state_exists=1
 fi
+fresh_identity=0
 if (( needs_config && needs_key )); then
+    fresh_identity=1
     (( ! managed_state_exists )) ||
         die 'managed server state exists without its original server.json and server.key; restore the protected identity instead of generating a replacement'
 elif (( ! needs_config && ! needs_key )); then
@@ -294,10 +387,38 @@ elif (( ! installed_binary_exists )); then
 fi
 
 staging=$(mktemp -d "${TMPDIR:-/tmp}/rqbit-tunnel-install.XXXXXX")
-cleanup() {
+fresh_config_installed=0
+fresh_key_installed=0
+service_start_attempted=0
+cleanup_staging() {
     if [[ -n "${staging:-}" ]]; then
         rm -rf -- "$staging"
     fi
+}
+
+cleanup() {
+    local status=$?
+
+    if (( status != 0 && fresh_identity )); then
+        if (( service_start_attempted )); then
+            run_as_root systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+        fi
+        if ! run_as_root test -e "$STATE_DB" && ! run_as_root test -L "$STATE_DB"; then
+            if (( fresh_key_installed || fresh_config_installed )); then
+                printf 'Rolling back incomplete fresh server identity...\n' >&2
+            fi
+            if (( fresh_key_installed )); then
+                run_as_root rm -f -- "$SERVER_KEY" || true
+            fi
+            if (( fresh_config_installed )); then
+                run_as_root rm -f -- "$CONFIG_PATH" || true
+            fi
+        fi
+    fi
+
+    cleanup_staging
+    release_install_lock
+    return "$status"
 }
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
@@ -307,7 +428,8 @@ if (( needs_config )); then
     cat >"$staging/server.json" <<EOF
 {
   "schema_version": 1,
-  "peer_listen": "$server_ip:$peer_port",
+  "peer_listen": "0.0.0.0:$peer_port",
+  "advertised_peer": "$server_ip:$peer_port",
   "egress": {
     "allow_private": false,
     "allow_loopback": false,
@@ -344,6 +466,7 @@ run_as_root install -d -o root -g root -m 0755 "$INSTALL_DIR"
 run_as_root install -d -o root -g root -m 0750 "$CONFIG_DIR"
 run_as_root install -d -o root -g root -m 0750 "$STATE_DIR"
 run_as_root install -d -o root -g root -m 0750 "$CARRIER_DIR"
+run_as_root install -d -o root -g root -m 0700 "$EXPORT_DIR"
 run_as_root install -d -o root -g root -m 0750 "$RUN_DIR"
 
 if [[ -n "$binary_source" && "$binary_source" != "$INSTALL_BIN" ]]; then
@@ -354,6 +477,7 @@ run_as_root chmod 0755 "$INSTALL_BIN"
 
 if (( needs_config )); then
     run_as_root install -o root -g root -m 0600 "$staging/server.json" "$CONFIG_PATH"
+    fresh_config_installed=1
 fi
 run_as_root chown root:root "$CONFIG_PATH"
 run_as_root chmod 0600 "$CONFIG_PATH"
@@ -361,6 +485,7 @@ run_as_root chmod 0600 "$CONFIG_PATH"
 if (( needs_key )); then
     # Do not retain or copy the generated client material; only install server.key.
     run_as_root install -o root -g root -m 0600 "$staging/server.key" "$SERVER_KEY"
+    fresh_key_installed=1
 fi
 valid_installed_key || die "$SERVER_KEY must contain exactly one 64-character hexadecimal key"
 run_as_root chown root:root "$SERVER_KEY"
@@ -370,10 +495,11 @@ run_as_root install -d -o root -g root -m 0755 /etc/systemd/system
 unit_destination="/etc/systemd/system/$SERVICE_NAME"
 run_as_root install -o root -g root -m 0644 "$unit_source" "$unit_destination"
 run_as_root systemctl daemon-reload
+service_start_attempted=1
 run_as_root systemctl enable --now "$SERVICE_NAME"
 
 # Generated private material is no longer needed before waiting or opening the TUI.
-cleanup
+cleanup_staging
 staging=''
 
 wait_for_health

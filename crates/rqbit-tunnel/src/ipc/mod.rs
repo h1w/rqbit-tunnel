@@ -1,7 +1,11 @@
 pub mod protocol;
+#[cfg(unix)]
 pub mod unix;
 
-#[cfg(test)]
+#[cfg(windows)]
+pub mod windows;
+
+#[cfg(all(test, unix))]
 mod tests {
     use tokio::{io::AsyncWriteExt, net::UnixStream};
 

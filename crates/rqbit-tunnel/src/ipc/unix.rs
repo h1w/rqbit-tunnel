@@ -12,8 +12,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::protocol::{
-    MAX_FRAME_BYTES, ProtocolError, ServerRequest, ServerResponse, decode_request, decode_response,
-    encode_request, encode_response,
+    ClientError, ClientRequest, ClientResponse, MAX_FRAME_BYTES, ProtocolError, ServerRequest,
+    ServerResponse, decode_client_request, decode_client_response, decode_request, decode_response,
+    encode_client_request, encode_client_response, encode_request, encode_response,
 };
 
 #[derive(Debug, Error)]
@@ -58,6 +59,33 @@ impl UnixControlClient {
     }
 }
 
+/// A bounded, read-only control client for a managed tunnel client.
+pub struct UnixClientControlClient {
+    stream: UnixStream,
+}
+
+impl UnixClientControlClient {
+    pub async fn connect(path: impl AsRef<Path>) -> Result<Self, UnixControlError> {
+        let path = path.as_ref().to_path_buf();
+        let stream =
+            UnixStream::connect(&path)
+                .await
+                .map_err(|source| UnixControlError::Connect {
+                    path: path.clone(),
+                    source,
+                })?;
+        Ok(Self { stream })
+    }
+
+    pub async fn request(
+        &mut self,
+        request: ClientRequest,
+    ) -> Result<ClientResponse, UnixControlError> {
+        write_client_request(&mut self.stream, &request).await?;
+        read_client_response(&mut self.stream).await
+    }
+}
+
 pub(crate) async fn read_request<R>(reader: &mut R) -> Result<ServerRequest, UnixControlError>
 where
     R: AsyncRead + Unpin,
@@ -74,6 +102,27 @@ where
     W: AsyncWrite + Unpin,
 {
     let body = encode_request(request)?;
+    write_frame(writer, &body).await
+}
+
+pub(crate) async fn read_client_request<R>(
+    reader: &mut R,
+) -> Result<ClientRequest, UnixControlError>
+where
+    R: AsyncRead + Unpin,
+{
+    let body = read_frame(reader).await?;
+    Ok(decode_client_request(&body)?)
+}
+
+pub(crate) async fn write_client_request<W>(
+    writer: &mut W,
+    request: &ClientRequest,
+) -> Result<(), UnixControlError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let body = encode_client_request(request)?;
     write_frame(writer, &body).await
 }
 
@@ -96,6 +145,27 @@ where
     write_frame(writer, &body).await
 }
 
+pub(crate) async fn read_client_response<R>(
+    reader: &mut R,
+) -> Result<ClientResponse, UnixControlError>
+where
+    R: AsyncRead + Unpin,
+{
+    let body = read_frame(reader).await?;
+    Ok(decode_client_response(&body)?)
+}
+
+pub(crate) async fn write_client_response<W>(
+    writer: &mut W,
+    response: &ClientResponse,
+) -> Result<(), UnixControlError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let body = encode_client_response(response)?;
+    write_frame(writer, &body).await
+}
+
 /// Writes a response, replacing an oversized normal payload with a small typed error.
 pub(crate) async fn write_bounded_response<W>(
     writer: &mut W,
@@ -107,6 +177,22 @@ where
     match write_response(writer, response).await {
         Err(UnixControlError::Protocol(ProtocolError::EncodedFrameTooLarge { .. })) => {
             write_response(writer, &response_too_large()).await
+        }
+        result => result,
+    }
+}
+
+/// Writes a client response, replacing an oversized snapshot with a small typed error.
+pub(crate) async fn write_bounded_client_response<W>(
+    writer: &mut W,
+    response: &ClientResponse,
+) -> Result<(), UnixControlError>
+where
+    W: AsyncWrite + Unpin,
+{
+    match write_client_response(writer, response).await {
+        Err(UnixControlError::Protocol(ProtocolError::EncodedFrameTooLarge { .. })) => {
+            write_client_response(writer, &client_response_too_large()).await
         }
         result => result,
     }
@@ -131,6 +217,21 @@ where
     tokio::select! {
         _ = shutdown.cancelled() => Ok(ControlResponseWrite::Cancelled),
         result = write_bounded_response(writer, response) => result.map(|()| ControlResponseWrite::Written),
+    }
+}
+
+/// Writes a bounded client response unless managed-client shutdown wins the race.
+pub(crate) async fn write_client_response_until_shutdown<W>(
+    writer: &mut W,
+    response: &ClientResponse,
+    shutdown: &CancellationToken,
+) -> Result<ControlResponseWrite, UnixControlError>
+where
+    W: AsyncWrite + Unpin,
+{
+    tokio::select! {
+        _ = shutdown.cancelled() => Ok(ControlResponseWrite::Cancelled),
+        result = write_bounded_client_response(writer, response) => result.map(|()| ControlResponseWrite::Written),
     }
 }
 
@@ -198,6 +299,14 @@ fn response_too_large() -> ServerResponse {
         "response_too_large",
         "The requested response exceeds the 64 KiB control-plane frame limit.",
         "Narrow or page the query before retrying. If this command may have changed server state, inspect state before retrying.",
+    ))
+}
+
+fn client_response_too_large() -> ClientResponse {
+    ClientResponse::Error(ClientError::new(
+        "response_too_large",
+        "The requested client snapshot exceeds the 64 KiB control-plane frame limit.",
+        "Restart the local client service and retry the read-only snapshot request.",
     ))
 }
 

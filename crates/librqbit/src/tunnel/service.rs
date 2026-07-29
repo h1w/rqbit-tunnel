@@ -7,6 +7,7 @@
 /// The service is started during Session construction via
 /// `TunnelService::start()` and shut down when the session cancellation token
 /// is triggered.
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
@@ -21,6 +22,31 @@ use super::options::TunnelOptions;
 use super::server::TunnelServer;
 use super::socks::SocksIngress;
 
+/// Immutable snapshot of a running tunnel service.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TunnelServiceStatus {
+    Client {
+        socks_listen: SocketAddr,
+        configured_carriers: usize,
+        live_carriers: usize,
+    },
+    Server {
+        peer_listen: SocketAddr,
+        admitted_peers: usize,
+    },
+}
+
+enum TunnelServiceStatusSource {
+    Client {
+        socks_listen: SocketAddr,
+        pool: Arc<CarrierPool>,
+    },
+    Server {
+        peer_listen: SocketAddr,
+        server: Arc<TunnelServer>,
+    },
+}
+
 /// Handle to a running tunnel service.
 ///
 /// Created by [`TunnelService::start`] and stored on [`Session`].  Its
@@ -29,6 +55,7 @@ use super::socks::SocksIngress;
 pub struct TunnelService {
     shutdown: CancellationToken,
     roots: Mutex<Vec<JoinHandle<()>>>,
+    status: TunnelServiceStatusSource,
 }
 
 impl TunnelService {
@@ -46,7 +73,7 @@ impl TunnelService {
         let shutdown = session.cancellation_token().child_token();
         let mut roots = Vec::new();
 
-        match options {
+        let status = match options {
             TunnelOptions::Client(opts) => {
                 // ── Bind SOCKS5 listener up front ───────────────────────────
                 // The listener stays up for the whole session; the tunnel
@@ -63,12 +90,18 @@ impl TunnelService {
                 let pool = CarrierPool::start(opts, dht, shutdown.clone()).await?;
 
                 let ingress = SocksIngress::new(local_addr);
+                let socks_pool = Arc::clone(&pool);
                 let socks_shutdown = shutdown.clone();
                 roots.push(tokio::spawn(async move {
-                    ingress.run(listener, pool, socks_shutdown).await;
+                    ingress.run(listener, socks_pool, socks_shutdown).await;
                 }));
 
                 tracing::info!("tunnel client SOCKS5 listening on {local_addr}");
+
+                TunnelServiceStatusSource::Client {
+                    socks_listen: local_addr,
+                    pool,
+                }
             }
             TunnelOptions::Server(opts) => {
                 let listener = TcpListener::bind(opts.peer_listen).await?;
@@ -100,19 +133,46 @@ impl TunnelService {
                 }
 
                 let server = TunnelServer::new(opts, carrier_store);
+                let server_for_task = Arc::clone(&server);
                 let server_shutdown = shutdown.clone();
                 roots.push(tokio::spawn(async move {
-                    server.run(listener, server_shutdown).await;
+                    server_for_task.run(listener, server_shutdown).await;
                 }));
 
                 tracing::info!("tunnel server listening on {local_addr}");
+
+                TunnelServiceStatusSource::Server {
+                    peer_listen: local_addr,
+                    server,
+                }
             }
-        }
+        };
 
         Ok(Arc::new(Self {
             shutdown,
             roots: Mutex::new(roots),
+            status,
         }))
+    }
+
+    /// Return an immutable snapshot of the service role and live state.
+    pub fn status(&self) -> TunnelServiceStatus {
+        match &self.status {
+            TunnelServiceStatusSource::Client { socks_listen, pool } => {
+                TunnelServiceStatus::Client {
+                    socks_listen: *socks_listen,
+                    configured_carriers: pool.carrier_count(),
+                    live_carriers: pool.live_count(),
+                }
+            }
+            TunnelServiceStatusSource::Server {
+                peer_listen,
+                server,
+            } => TunnelServiceStatus::Server {
+                peer_listen: *peer_listen,
+                admitted_peers: server.peer_count(),
+            },
+        }
     }
 
     /// Cancel the service and wait for every service root to exit.
@@ -159,6 +219,9 @@ mod tests {
     use super::super::options::{
         EgressPolicy, TunnelClientOptions, TunnelOptions, TunnelServerOptions,
     };
+    use crate::session::{Session, SessionOptions};
+
+    use super::TunnelServiceStatus;
 
     fn dummy_key() -> TunnelPublicKey {
         TunnelPublicKey([1u8; 32])
@@ -196,6 +259,51 @@ mod tests {
             carrier_root: PathBuf::from("/tmp/test-carrier"),
         });
         assert!(opts.validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn unreachable_client_reports_configured_and_no_live_carriers() {
+        let tempdir = tempfile::tempdir().expect("create temporary client root");
+        let session = Session::new_with_opts(
+            tempdir.path().join("downloads"),
+            SessionOptions {
+                dht: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                persistence: None,
+                tunnel: Some(TunnelOptions::Client(TunnelClientOptions {
+                    socks_listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                    server_addr: Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1))),
+                    expected_server_key: dummy_key(),
+                    carriers: 1,
+                    carrier_root: tempdir.path().join("carrier"),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("start tunnel client session");
+
+        let status = session
+            .tunnel_service()
+            .expect("tunnel client service must be installed")
+            .status();
+        match status {
+            TunnelServiceStatus::Client {
+                socks_listen,
+                configured_carriers,
+                live_carriers,
+            } => {
+                assert_eq!(socks_listen.ip(), std::net::IpAddr::V4(Ipv4Addr::LOCALHOST));
+                assert_ne!(socks_listen.port(), 0);
+                assert_eq!(configured_carriers, 1);
+                assert_eq!(live_carriers, 0);
+            }
+            TunnelServiceStatus::Server { .. } => panic!("client must report client status"),
+        }
+
+        session.stop().await;
     }
 
     #[tokio::test]

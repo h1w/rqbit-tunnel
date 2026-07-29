@@ -195,7 +195,7 @@ enum LossySendOutcome {
 }
 
 impl LossySendOutcome {
-    fn is_alive(self) -> bool {
+    fn is_alive(&self) -> bool {
         !matches!(self, Self::Closed)
     }
 }

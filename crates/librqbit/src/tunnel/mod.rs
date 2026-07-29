@@ -30,7 +30,6 @@
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::needless_return)]
 #![allow(clippy::never_loop)]
-#![allow(clippy::useless_borrows_in_formatting)]
 #![allow(clippy::while_let_loop)]
 
 pub(crate) mod carrier;

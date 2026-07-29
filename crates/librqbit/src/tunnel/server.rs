@@ -134,6 +134,7 @@ pub(crate) enum AcceptOutcome {
 /// indefinitely, driving unbounded disk/CPU/bandwidth use. On `deadline`
 /// elapsing this returns `Ok(None)` — an ordinary idle disconnect, not an
 /// error, so a censor probing the rendezvous learns nothing from it.
+#[allow(clippy::too_many_arguments)]
 async fn seed_until_promoted(
     read_half: &mut super::carrier_wire::CarrierReadHalf,
     write_half: &mut super::carrier_wire::CarrierWriteHalf,
@@ -365,8 +366,10 @@ fn try_admit_seeder_conn(
 
 pub(crate) struct TunnelServer {
     options: TunnelServerOptions,
-    /// Connected peer keys tracked for admission state.
-    peers: RwLock<HashMap<TunnelPublicKey, bool>>,
+    /// Active connection counts keyed by admitted peer.
+    peers: RwLock<HashMap<TunnelPublicKey, usize>>,
+    /// Exact synchronous count mirrored from successful peer-map transitions.
+    admitted_peers: AtomicUsize,
     /// Deterministic synthetic carrier torrent shared with clients via the
     /// DHT rendezvous key (`descriptor().handshake_info_hash`). Consumed by
     /// [`CarrierWire::establish`] in [`accept`](Self::accept) to present a real
@@ -396,6 +399,7 @@ impl TunnelServer {
         Arc::new(Self {
             options,
             peers: RwLock::new(HashMap::new()),
+            admitted_peers: AtomicUsize::new(0),
             carrier_store,
             upload_slots: Arc::new(Semaphore::new(super::config::SEEDER_UPLOAD_SLOTS)),
             seeder_conns: Arc::new(StdMutex::new(HashMap::new())),
@@ -515,7 +519,7 @@ impl TunnelServer {
                 // ongoing post-auth piece-cover cadence must run for the whole
                 // session without ever hitting the cap.
                 carrier_peer.set_authenticated(true);
-                self.peers.write().await.insert(client_key.clone(), true);
+                self.insert_peer(client_key.clone()).await;
                 session.connected();
                 Ok(AcceptOutcome::Admitted(Box::new(AdmittedPeer {
                     client_key,
@@ -645,14 +649,35 @@ impl TunnelServer {
         }
     }
 
+    async fn insert_peer(&self, key: TunnelPublicKey) {
+        let mut peers = self.peers.write().await;
+        if let Some(connections) = peers.get_mut(&key) {
+            *connections += 1;
+        } else {
+            peers.insert(key, 1);
+            self.admitted_peers.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Return the number of currently admitted peers.
-    pub async fn peer_count(&self) -> usize {
-        self.peers.read().await.len()
+    pub fn peer_count(&self) -> usize {
+        self.admitted_peers.load(Ordering::Relaxed)
     }
 
     /// Remove a peer from tracking (called on disconnect).
     pub(crate) async fn remove_peer(&self, key: &TunnelPublicKey) {
-        self.peers.write().await.remove(key);
+        let mut peers = self.peers.write().await;
+        let remove_peer = match peers.get_mut(key) {
+            Some(connections) => {
+                *connections -= 1;
+                *connections == 0
+            }
+            None => false,
+        };
+        if remove_peer {
+            peers.remove(key);
+            self.admitted_peers.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// Check whether a specific client key is admitted.
@@ -815,18 +840,37 @@ mod tests {
         let opts = test_server_options(allowed_client_keys(&[known_key()]));
         let (_dir, store) = test_carrier_store(&opts.identity_key).await;
         let server = TunnelServer::new(opts, store);
-        assert_eq!(server.peer_count().await, 0);
+        assert_eq!(server.peer_count(), 0);
     }
 
     #[tokio::test]
-    async fn server_peer_tracking_api() {
+    async fn server_peer_count_tracks_duplicate_connections_and_missing_remove() {
         let opts = test_server_options(allowed_client_keys(&[known_key()]));
         let (_dir, store) = test_carrier_store(&opts.identity_key).await;
         let server = TunnelServer::new(opts, store);
+        let key = known_key();
 
-        assert_eq!(server.peer_count().await, 0);
-        assert!(!server.is_admitted(&known_key()).await);
-        // Full tracking is exercised via accept() in integration tests.
+        assert_eq!(server.peer_count(), 0);
+        server.insert_peer(key.clone()).await;
+        assert_eq!(server.peer_count(), 1);
+
+        server.insert_peer(key.clone()).await;
+        assert_eq!(server.peer_count(), 1);
+        assert!(server.is_admitted(&key).await);
+
+        server.remove_peer(&unknown_key()).await;
+        assert_eq!(server.peer_count(), 1);
+
+        server.remove_peer(&key).await;
+        assert_eq!(server.peer_count(), 1);
+        assert!(server.is_admitted(&key).await);
+
+        server.remove_peer(&key).await;
+        assert_eq!(server.peer_count(), 0);
+        assert!(!server.is_admitted(&key).await);
+
+        server.remove_peer(&key).await;
+        assert_eq!(server.peer_count(), 0);
     }
 
     #[tokio::test]
@@ -1549,7 +1593,7 @@ mod tests {
         session.shutdown.cancel();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if server_for_check.peer_count().await == 0 {
+                if server_for_check.peer_count() == 0 {
                     return;
                 }
                 tokio::task::yield_now().await;

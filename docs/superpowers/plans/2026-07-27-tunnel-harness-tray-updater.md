@@ -100,7 +100,9 @@ pub fn current_exe_suffix() -> &'static str {
 
 - [ ] **Step 4: Implement the stable launcher and migrate service targets**
 
-The launcher takes exactly one role after `--`: `server`, `client`, or `tray`. It reads `active.json`, checks that its own `LAUNCHER_ABI >= active.launcher_abi`, resolves a safe payload path, and `exec`s/starts `rqbit-tunnel` with the remaining role arguments. It never downloads, verifies, or parses private config.
+For ordinary `server` and `client` roles, the launcher reads `active.json`, checks that its own `LAUNCHER_ABI >= active.launcher_abi`, resolves a safe payload path, and `exec`s/starts `rqbit-tunnel` with the role plus remaining arguments. It never downloads, verifies, or parses private config. Task 5 adds the `tray` role together with its consuming payload command; Task 1 must reject it rather than forward an unimplemented command.
+
+On Windows, `launcher client service-host` is a special SCM entrypoint. It must itself call `service_dispatcher::start`, own the stop/control handler, resolve the active immutable payload, and supervise it as a non-SCM `client payload-host` worker. The worker receives the absolute protected system config path plus a launcher-private readiness/stop channel; it reports ready only after `ManagedClient::start`, calls and awaits `ManagedClient::shutdown()` on launcher stop, and never calls `service_dispatcher`. The launcher reports `Running` only after readiness, waits boundedly on stop, and terminates/reaps an unresponsive worker through a Job Object fallback. This is required because a child process cannot register the SCM dispatcher of the launcher process.
 
 ```rust
 let active = read_active_release(&install_root)?;
@@ -112,7 +114,7 @@ let status = Command::new(payload).args(role_args).status()?;
 std::process::exit(status.code().unwrap_or(1));
 ```
 
-Change the Linux unit and Windows `ServiceInstallSpec` to target `launcher client run --config …`, not the payload directly. Plan 2 tests must be updated to assert the launcher target.
+Change the Linux unit to target `launcher client run --config …`. Change the Windows `ServiceInstallSpec` to target `launcher client service-host`, not either versioned payload binary. Add the Windows launcher service-wrapper and payload-host source/tests to this task, and update Plan 2 tests to assert the launcher target.
 
 - [ ] **Step 5: Run version/launcher tests and commit**
 
@@ -519,7 +521,7 @@ pub fn color_for(state: TrayState) -> [u8; 4] {
 
 - [ ] **Step 4: Run the tray event agent in the user session**
 
-`rqbit-tunnel tray` polls read-only IPC every second and updates the icon/tooltip. A primary click spawns the stable launcher with `client tui`; a context menu contains only `Open control` and `Exit tray`. It never starts/stops the service directly and never executes inside the Windows service process.
+`rqbit-tunnel tray` polls read-only IPC every second and updates the icon/tooltip. In this task, add `tray` to the stable launcher role parser so it resolves the selected payload and forwards `tray` as the payload's top-level command. A primary click spawns the stable launcher with `client tui`; a context menu contains only `Open control` and `Exit tray`. It never starts/stops the service directly and never executes inside the Windows service process.
 
 On Linux, if the tray backend cannot connect to a supported StatusNotifier/AppIndicator environment, log `tray unavailable` and exit 0; do not claim an icon exists. On active-version change, the agent launches its successor through the stable launcher and exits after the successor has started.
 

@@ -860,7 +860,7 @@ impl ManagedServerInner {
             user_name: created.user.name,
             client_private_key: created.client_private_key.0,
             server_public_key: self.server_public_key.0,
-            server_addr: config.peer_listen,
+            server_addr: config.advertised_peer(),
             socks_listen: config.default_client_socks_listen,
             carriers: config.default_client_carriers,
         };
@@ -1503,6 +1503,7 @@ fn write_test_server_config(paths: &ServerPaths, peer_listen: std::net::SocketAd
     let config = ServerConfig {
         schema_version: crate::model::SERVER_CONFIG_SCHEMA_VERSION,
         peer_listen,
+        advertised_peer: None,
         egress: ServerEgressConfig {
             allow_private: false,
             allow_loopback: false,
@@ -1627,6 +1628,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_user_bundle_uses_the_configured_advertised_peer() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = test_paths(directory.path());
+        write_test_server_material(&paths).await;
+        let advertised_peer: SocketAddr = "8.8.8.8:4242".parse().unwrap();
+        let _start_gate = super::TEST_SERVER_START_GATE.lock().await;
+
+        let mut server = None;
+        for _ in 0..8 {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("allocate test tunnel port");
+            let peer_listen = listener
+                .local_addr()
+                .expect("read test tunnel listener address");
+            drop(listener);
+
+            let config = serde_json::json!({
+                "schema_version": SERVER_CONFIG_SCHEMA_VERSION,
+                "peer_listen": peer_listen,
+                "advertised_peer": advertised_peer,
+                "egress": {
+                    "allow_private": false,
+                    "allow_loopback": false,
+                    "allow_link_local": false,
+                    "allow_multicast": false
+                },
+                "default_client_socks_listen": "127.0.0.1:1080",
+                "default_client_carriers": 4
+            });
+            std::fs::write(paths.config_path(), serde_json::to_vec(&config).unwrap()).unwrap();
+
+            match ManagedServer::start(paths.clone()).await {
+                Ok(started) => {
+                    server = Some(started);
+                    break;
+                }
+                Err(ServerRuntimeError::SessionStart) => continue,
+                Err(error) => panic!("start test managed server: {error}"),
+            }
+        }
+        let server = server.expect("start test managed server after retrying released ports");
+
+        let export_path = directory.path().join("alice.bundle");
+        let response = request(
+            &paths,
+            ServerRequest::AddUser {
+                name: "alice".to_owned(),
+                export_path: export_path.clone(),
+            },
+        )
+        .await;
+        assert!(matches!(response, ServerResponse::User(_)));
+
+        let bundle: EnrollmentBundle =
+            serde_json::from_slice(&std::fs::read(export_path).unwrap()).unwrap();
+        assert_eq!(bundle.server_addr, advertised_peer);
+
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_rejects_an_advertised_peer_with_port_zero() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = test_paths(directory.path());
+        write_test_server_material(&paths).await;
+        let _start_gate = super::TEST_SERVER_START_GATE.lock().await;
+
+        for _ in 0..8 {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("allocate test tunnel port");
+            let peer_listen = listener
+                .local_addr()
+                .expect("read test tunnel listener address");
+            drop(listener);
+
+            let config = serde_json::json!({
+                "schema_version": SERVER_CONFIG_SCHEMA_VERSION,
+                "peer_listen": peer_listen,
+                "advertised_peer": "8.8.8.8:0",
+                "egress": {
+                    "allow_private": false,
+                    "allow_loopback": false,
+                    "allow_link_local": false,
+                    "allow_multicast": false
+                },
+                "default_client_socks_listen": "127.0.0.1:1080",
+                "default_client_carriers": 4
+            });
+            std::fs::write(paths.config_path(), serde_json::to_vec(&config).unwrap()).unwrap();
+
+            match ManagedServer::start(paths.clone()).await {
+                Err(ServerRuntimeError::Config(ConfigError::InvalidConfig(_))) => return,
+                Ok(started) => {
+                    started.shutdown().await.unwrap();
+                    panic!("a zero-port advertised peer must be rejected");
+                }
+                Err(ServerRuntimeError::SessionStart) => continue,
+                Err(error) => panic!("expected advertised-peer validation error, got {error}"),
+            }
+        }
+
+        panic!("could not start a test server to exercise advertised-peer validation");
+    }
+
+    #[tokio::test]
     async fn invalid_config_update_leaves_existing_config_file_unchanged() {
         let directory = tempfile::tempdir().unwrap();
         let paths = test_paths(directory.path());
@@ -1637,6 +1745,7 @@ mod tests {
         let invalid = ServerConfig {
             schema_version: SERVER_CONFIG_SCHEMA_VERSION,
             peer_listen: SocketAddr::from(([127, 0, 0, 1], 4242)),
+            advertised_peer: None,
             egress: ServerEgressConfig {
                 allow_private: false,
                 allow_loopback: false,
@@ -1663,6 +1772,7 @@ mod tests {
         let updated = ServerConfig {
             schema_version: SERVER_CONFIG_SCHEMA_VERSION,
             peer_listen: SocketAddr::from(([127, 0, 0, 1], 4242)),
+            advertised_peer: None,
             egress: ServerEgressConfig {
                 allow_private: true,
                 allow_loopback: false,
@@ -1894,6 +2004,7 @@ mod tests {
         let config_a = ServerConfig {
             schema_version: SERVER_CONFIG_SCHEMA_VERSION,
             peer_listen: SocketAddr::from(([127, 0, 0, 1], 4242)),
+            advertised_peer: None,
             egress: ServerEgressConfig {
                 allow_private: true,
                 allow_loopback: false,
@@ -1906,6 +2017,7 @@ mod tests {
         let config_b = ServerConfig {
             schema_version: SERVER_CONFIG_SCHEMA_VERSION,
             peer_listen: SocketAddr::from(([127, 0, 0, 1], 4343)),
+            advertised_peer: None,
             egress: ServerEgressConfig {
                 allow_private: false,
                 allow_loopback: true,
@@ -1959,6 +2071,7 @@ mod tests {
             ServerConfig {
                 schema_version: SERVER_CONFIG_SCHEMA_VERSION,
                 peer_listen: SocketAddr::from(([127, 0, 0, 1], 4343)),
+                advertised_peer: None,
                 egress: ServerEgressConfig {
                     allow_private: false,
                     allow_loopback: true,
@@ -2054,6 +2167,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("server.sock");
         let stale = UnixListener::bind(&socket).unwrap();
+        let anchor = directory.path().join("stale-anchor.sock");
+        std::fs::hard_link(&socket, &anchor).unwrap();
         drop(stale);
         let (pause, _pause_guard) = install_stale_socket_removal_pause();
 
@@ -2085,6 +2200,7 @@ mod tests {
 
         drop(replacement);
         std::fs::remove_file(socket).unwrap();
+        std::fs::remove_file(anchor).unwrap();
     }
 
     #[tokio::test]
@@ -2222,6 +2338,7 @@ mod tests {
         let updated = ServerConfig {
             schema_version: SERVER_CONFIG_SCHEMA_VERSION,
             peer_listen: SocketAddr::from(([127, 0, 0, 1], 4242)),
+            advertised_peer: None,
             egress: ServerEgressConfig {
                 allow_private: true,
                 allow_loopback: false,

@@ -195,8 +195,8 @@ impl TunnelOptions {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::Arc;
 
     use super::*;
 

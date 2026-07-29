@@ -1,6 +1,6 @@
 use std::{ffi::OsString, process::ExitCode};
 
-use rqbit_tunnel::cli::{Cli, execute};
+use rqbit_tunnel::cli::{Cli, execute_with_arguments};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -10,10 +10,14 @@ async fn main() -> ExitCode {
 async fn run<I, T>(arguments: I) -> ExitCode
 where
     I: IntoIterator<Item = T>,
-    T: Into<OsString> + Clone,
+    T: Into<OsString>,
 {
-    match Cli::try_parse_from(arguments) {
-        Ok(cli) => match execute(cli).await {
+    let arguments = arguments
+        .into_iter()
+        .map(|argument| argument.into())
+        .collect::<Vec<OsString>>();
+    match Cli::try_parse_from(arguments.iter().cloned()) {
+        Ok(cli) => match execute_with_arguments(cli, &arguments).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("rqbit-tunnel: {error}");

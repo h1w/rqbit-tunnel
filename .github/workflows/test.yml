@@ -60,3 +60,20 @@ jobs:
       - name: Run tests
         if: ${{ matrix.os == 'ubuntu-latest' }}
         run: cargo test
+
+  client-service-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: rustup toolchain install stable --profile minimal
+
+      - name: Run privileged client-service acceptance
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "CARGO_HOME=${RUNNER_TEMP}/client-service-e2e-cargo" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            "RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable}" \
+            "CARGO_TARGET_DIR=${RUNNER_TEMP}/client-service-e2e-target" \
+            cargo test -p rqbit-tunnel --test client_service_e2e -- --ignored

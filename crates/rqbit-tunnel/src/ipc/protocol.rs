@@ -1,14 +1,21 @@
-use std::{io, path::PathBuf};
+use std::io;
+
+#[cfg(unix)]
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+#[cfg(unix)]
 use uuid::Uuid;
 
+use crate::model::ClientSnapshot;
+#[cfg(unix)]
 use crate::model::{ServerConfig, ServerSnapshot, UserPage, UserSnapshot};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerRequest {
@@ -42,6 +49,7 @@ pub enum ServerRequest {
     Shutdown,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum ServerResponse {
@@ -57,11 +65,26 @@ pub enum ServerResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientRequest {
+    Snapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum ClientResponse {
+    Snapshot(ClientSnapshot),
+    Error(ClientError),
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerConfigResponse {
     pub config: ServerConfig,
     pub restart_required: bool,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerError {
     pub code: String,
@@ -69,7 +92,29 @@ pub struct ServerError {
     pub recovery: String,
 }
 
+#[cfg(unix)]
 impl ServerError {
+    pub(crate) fn new(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        recovery: impl Into<String>,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            recovery: recovery.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientError {
+    pub code: String,
+    pub message: String,
+    pub recovery: String,
+}
+
+impl ClientError {
     pub(crate) fn new(
         code: impl Into<String>,
         message: impl Into<String>,
@@ -100,6 +145,7 @@ pub enum ProtocolError {
 }
 
 impl ProtocolError {
+    #[cfg(unix)]
     pub(crate) fn response(&self) -> ServerError {
         match self {
             Self::InvalidFrameLength { .. } => ServerError::new(
@@ -124,8 +170,34 @@ impl ProtocolError {
             ),
         }
     }
+
+    pub(crate) fn client_response(&self) -> ClientError {
+        match self {
+            Self::InvalidFrameLength { .. } => ClientError::new(
+                "invalid_frame_length",
+                "The client control frame length must be between 1 and 65536 bytes.",
+                "Send a single bounded protocol version 1 frame.",
+            ),
+            Self::UnsupportedProtocolVersion { .. } => ClientError::new(
+                "unsupported_protocol_version",
+                "The client control protocol version is not supported.",
+                "Use a client control consumer compatible with protocol version 1.",
+            ),
+            Self::InvalidUtf8 | Self::InvalidJson(_) => ClientError::new(
+                "invalid_frame",
+                "The client control frame must contain valid UTF-8 JSON.",
+                "Send a protocol version 1 JSON envelope.",
+            ),
+            Self::Serialize(_) | Self::EncodedFrameTooLarge { .. } => ClientError::new(
+                "response_encoding_failed",
+                "The client control response could not be encoded safely.",
+                "Retry the read-only snapshot request.",
+            ),
+        }
+    }
 }
 
+#[cfg(unix)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RequestEnvelope {
@@ -133,12 +205,14 @@ struct RequestEnvelope {
     request: ServerRequest,
 }
 
+#[cfg(unix)]
 #[derive(Serialize)]
 struct ResponseEnvelope<'a> {
     protocol_version: u32,
     response: &'a ServerResponse,
 }
 
+#[cfg(unix)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IncomingResponseEnvelope {
@@ -146,6 +220,27 @@ struct IncomingResponseEnvelope {
     response: ServerResponse,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClientRequestEnvelope {
+    protocol_version: u32,
+    client_request: ClientRequest,
+}
+
+#[derive(Serialize)]
+struct ClientResponseEnvelope<'a> {
+    protocol_version: u32,
+    client_response: &'a ClientResponse,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IncomingClientResponseEnvelope {
+    protocol_version: u32,
+    client_response: ClientResponse,
+}
+
+#[cfg(unix)]
 pub(crate) fn encode_request(request: &ServerRequest) -> Result<Vec<u8>, ProtocolError> {
     encode_bounded(&RequestEnvelopeRef {
         protocol_version: PROTOCOL_VERSION,
@@ -153,6 +248,7 @@ pub(crate) fn encode_request(request: &ServerRequest) -> Result<Vec<u8>, Protoco
     })
 }
 
+#[cfg(unix)]
 pub(crate) fn decode_request(body: &[u8]) -> Result<ServerRequest, ProtocolError> {
     let text = std::str::from_utf8(body).map_err(|_| ProtocolError::InvalidUtf8)?;
     let envelope =
@@ -161,6 +257,7 @@ pub(crate) fn decode_request(body: &[u8]) -> Result<ServerRequest, ProtocolError
     Ok(envelope.request)
 }
 
+#[cfg(unix)]
 pub(crate) fn encode_response(response: &ServerResponse) -> Result<Vec<u8>, ProtocolError> {
     encode_bounded(&ResponseEnvelope {
         protocol_version: PROTOCOL_VERSION,
@@ -168,6 +265,7 @@ pub(crate) fn encode_response(response: &ServerResponse) -> Result<Vec<u8>, Prot
     })
 }
 
+#[cfg(unix)]
 pub(crate) fn decode_response(body: &[u8]) -> Result<ServerResponse, ProtocolError> {
     let text = std::str::from_utf8(body).map_err(|_| ProtocolError::InvalidUtf8)?;
     let envelope = serde_json::from_str::<IncomingResponseEnvelope>(text)
@@ -176,10 +274,47 @@ pub(crate) fn decode_response(body: &[u8]) -> Result<ServerResponse, ProtocolErr
     Ok(envelope.response)
 }
 
+pub(crate) fn encode_client_request(request: &ClientRequest) -> Result<Vec<u8>, ProtocolError> {
+    encode_bounded(&ClientRequestEnvelopeRef {
+        protocol_version: PROTOCOL_VERSION,
+        client_request: request,
+    })
+}
+
+pub(crate) fn decode_client_request(body: &[u8]) -> Result<ClientRequest, ProtocolError> {
+    let text = std::str::from_utf8(body).map_err(|_| ProtocolError::InvalidUtf8)?;
+    let envelope =
+        serde_json::from_str::<ClientRequestEnvelope>(text).map_err(ProtocolError::InvalidJson)?;
+    check_protocol_version(envelope.protocol_version)?;
+    Ok(envelope.client_request)
+}
+
+pub(crate) fn encode_client_response(response: &ClientResponse) -> Result<Vec<u8>, ProtocolError> {
+    encode_bounded(&ClientResponseEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        client_response: response,
+    })
+}
+
+pub(crate) fn decode_client_response(body: &[u8]) -> Result<ClientResponse, ProtocolError> {
+    let text = std::str::from_utf8(body).map_err(|_| ProtocolError::InvalidUtf8)?;
+    let envelope = serde_json::from_str::<IncomingClientResponseEnvelope>(text)
+        .map_err(ProtocolError::InvalidJson)?;
+    check_protocol_version(envelope.protocol_version)?;
+    Ok(envelope.client_response)
+}
+
+#[cfg(unix)]
 #[derive(Serialize)]
 struct RequestEnvelopeRef<'a> {
     protocol_version: u32,
     request: &'a ServerRequest,
+}
+
+#[derive(Serialize)]
+struct ClientRequestEnvelopeRef<'a> {
+    protocol_version: u32,
+    client_request: &'a ClientRequest,
 }
 
 fn check_protocol_version(version: u32) -> Result<(), ProtocolError> {
@@ -235,12 +370,76 @@ impl io::Write for BoundedWriter {
 
 #[cfg(test)]
 mod tests {
+    use crate::model::{ClientSnapshot, LocalServiceState, LocalTunnelState};
+
+    #[cfg(unix)]
     use super::{
         MAX_FRAME_BYTES, ProtocolError, ServerRequest, ServerResponse, decode_request,
         decode_response, encode_response,
     };
+    #[cfg(unix)]
     use crate::model::{TrafficTotals, UserSnapshot};
 
+    #[test]
+    fn client_snapshot_round_trips_without_secret_material() {
+        let snapshot = ClientSnapshot {
+            service: LocalServiceState::Running,
+            tunnel: LocalTunnelState::Reconnecting,
+            socks_listen: Some("127.0.0.1:1080".parse().unwrap()),
+            configured_carriers: 4,
+            live_carriers: 0,
+            version: "rqbit-tunnel test".to_owned(),
+            error: None,
+        };
+        let request = super::ClientRequest::Snapshot;
+        let encoded_request = super::encode_client_request(&request).unwrap();
+        let request_envelope: serde_json::Value = serde_json::from_slice(&encoded_request).unwrap();
+        assert!(request_envelope.get("client_request").is_some());
+        assert!(request_envelope.get("request").is_none());
+        assert_eq!(
+            super::decode_client_request(&encoded_request).unwrap(),
+            request
+        );
+
+        let response = super::ClientResponse::Snapshot(snapshot);
+        let encoded_response = super::encode_client_response(&response).unwrap();
+        let body = std::str::from_utf8(&encoded_response).unwrap();
+        let response_envelope: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(response_envelope.get("client_response").is_some());
+        assert!(response_envelope.get("response").is_none());
+        assert!(!body.contains("private_key"));
+        assert!(!body.contains("server_public_key"));
+        assert!(!body.contains("destination"));
+        assert!(!body.contains("payload_data"));
+        assert_eq!(
+            super::decode_client_response(&encoded_response).unwrap(),
+            response
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_and_server_envelopes_reject_each_other() {
+        let client_request = super::encode_client_request(&super::ClientRequest::Snapshot).unwrap();
+        assert!(decode_request(&client_request).is_err());
+        let server_request = super::encode_request(&ServerRequest::Snapshot).unwrap();
+        assert!(super::decode_client_request(&server_request).is_err());
+
+        let client_response = super::encode_client_response(&super::ClientResponse::Error(
+            super::ClientError::new("client_error", "client only", "retry snapshot"),
+        ))
+        .unwrap();
+        assert!(decode_response(&client_response).is_err());
+        let server_response = encode_response(&ServerResponse::Error(super::ServerError::new(
+            "server_error",
+            "server only",
+            "retry server command",
+        )))
+        .unwrap();
+        assert!(super::decode_client_response(&server_response).is_err());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn response_encoding_stops_at_the_frame_limit_without_materializing_the_payload() {
         let response = ServerResponse::User(UserSnapshot {
@@ -262,6 +461,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn legacy_v1_snapshot_and_user_list_payloads_remain_decodable() {
         assert!(matches!(

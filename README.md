@@ -111,11 +111,14 @@ RQBIT_KEYGEN_BIN=/srv/rqbit-release/rqbit \
 
 It discovers a public IPv4 address only as a best effort. If discovery is not
 available, set `SERVER_IP` to the VPS's reachable numeric public IPv4 address
-before running the same command. The generated `peer_listen` uses that concrete
-address, never a wildcard, because enrollment bundles carry the address.
+before running the same command. The generated server binds `peer_listen` to
+`0.0.0.0:PEER_PORT` and writes that public endpoint separately as
+`advertised_peer` for enrollment bundles; this also works when the VPS uses
+1:1 NAT.
 
 The installation creates root-owned `/etc/rqbit-tunnel`,
-`/var/lib/rqbit-tunnel`, and `/run/rqbit-tunnel`; `server.key` is mode `0600`.
+`/var/lib/rqbit-tunnel`, `/var/lib/rqbit-tunnel/enrollments`, and
+`/run/rqbit-tunnel`; `server.key` is mode `0600`.
 On refresh, the installer stops an active managed service and waits for its
 control socket to disappear before replacing files and starting it again; the
 protected configuration, key, and database stay intact. If the unit is inactive
@@ -152,13 +155,15 @@ ssh -t admin@your-vps 'sudo /opt/rqbit-tunnel/rqbit-tunnel server tui'
 
 The dashboard refreshes state every second; `F5` requests an immediate refresh.
 It adds users only through an explicit name/export-path flow and displays a
-confirmation before writing an enrollment bundle. The CLI supports the same
-operations for automation:
+confirmation before writing an enrollment bundle. The service sandbox can write
+only its managed paths, so choose a path below
+`/var/lib/rqbit-tunnel/enrollments`, not `/root` or `/home`. The CLI supports
+the same operations for automation:
 
 ```bash
 sudo /opt/rqbit-tunnel/rqbit-tunnel server users list --json
 sudo /opt/rqbit-tunnel/rqbit-tunnel server users add \
-  --name alice --export /root/alice.rqbt
+  --name alice --export /var/lib/rqbit-tunnel/enrollments/alice.rqbt
 sudo /opt/rqbit-tunnel/rqbit-tunnel server users disable USER_ID
 sudo /opt/rqbit-tunnel/rqbit-tunnel server users delete USER_ID
 sudo /opt/rqbit-tunnel/rqbit-tunnel server settings show --json
@@ -169,6 +174,47 @@ sessions; an explicit later enable restores that same user's access. Delete does
 the same and removes the record, so the old bundle stays revoked even if a later
 user is created.
 
+### Operate an enrolled client
+
+Transfer a server-issued enrollment bundle over an authenticated channel, then
+run the client as a managed service rather than a detached foreground process.
+The complete platform procedures are in
+[`scripts/tunnel/README.md`](scripts/tunnel/README.md).
+
+On Linux, extract the signed release bundle and run `sudo ./install-client.sh`.
+On Windows, run `.\install-client.ps1` from an Administrator PowerShell. Each
+bootstrap installs a stable launcher plus an immutable versioned payload; all
+service commands must go through that launcher:
+
+```bash
+sudo /opt/rqbit-tunnel/launcher client import --bundle /secure-transfer/alice.rqbt
+sudo /opt/rqbit-tunnel/launcher client config set --socks-listen 127.0.0.1:1080
+sudo /opt/rqbit-tunnel/launcher client service install
+sudo /opt/rqbit-tunnel/launcher client service start
+/opt/rqbit-tunnel/launcher client service status --json
+sudo /opt/rqbit-tunnel/launcher client service enable-autostart
+```
+
+Run `client service restart` after a configuration change.
+`client service disable-autostart` removes future boot activation only; use
+`client service stop` separately to terminate a live client. The delivered
+`client-run.sh`, `client-run.ps1`, and `client-run.bat` provide the same
+interactive flow.
+
+The dashboard's `u` action checks the pinned, signed GitHub Release manifest
+only after confirmation, then asks again before installing the displayed
+version. It has no background updater; a failed local health check restores the
+previous release. A release that requires a newer launcher ABI requires a
+matching manual bundle installation.
+
+Run the per-user tray through `launcher tray`, never from the service account.
+It opens the dashboard on click and reports gray (local IPC unavailable), red
+(service failed), yellow (reconnecting/no carrier), or green (live carrier).
+Linux exits successfully with `tray unavailable` if its desktop has no
+supported tray backend.
+The Linux service and CLI payload do not load desktop libraries; GTK/AppIndicator
+runtime dependencies apply only to the separate `rqbit-tunnel-tray` companion.
+
 ### Traffic counters
 
 `upload` means client → VPS → destination: TCP payload counts after a successful
@@ -178,9 +224,11 @@ write, while UDP counts once queued toward the client because it has no delivery
 acknowledgement. Totals exclude tunnel framing, cryptographic overhead, cover
 traffic, rejected requests, failed writes, and unsent queue contents.
 
-Counters refresh live in memory and flush to SQLite at least once per second
-(and synchronously during graceful shutdown). A power loss can omit no more than
-the last unflushed second; the totals are not per-byte crash-durable.
+Counters refresh live in memory and attempt a SQLite flush at least once per
+second (and synchronously during graceful shutdown). After successful flushes,
+a power loss can omit no more than the last unflushed second. If SQLite remains
+unwritable, pending deltas stay in memory and a power loss can lose every delta
+since the last successful flush; totals are not per-byte crash-durable.
 
 ### Security boundaries
 
@@ -188,9 +236,12 @@ the last unflushed second; the totals are not per-byte crash-durable.
   contains a client private key; any holder can use the tunnel until the user is
   disabled or deleted. Export only on an explicit TUI/CLI action to a protected
   path.
-- **Unauthenticated LAN SOCKS is a client-side concern handled in later client
-  setup.** The managed server has no SOCKS listener; a client must keep SOCKS on
-  loopback or supply its own authentication before exposing it to a LAN.
+- **Client SOCKS defaults to loopback.** The default server-issued bundle
+  configures `127.0.0.1:1080`. A non-loopback listener is rejected unless
+  the operator passes `--allow-unauthenticated-lan-socks true`; this creates
+  an unauthenticated open proxy for every reachable host. Use it only behind
+  a trusted network boundary. The client dashboard keeps a persistent critical
+  warning while that setting is enabled.
 
 ## Watching a directory for .torrents
 

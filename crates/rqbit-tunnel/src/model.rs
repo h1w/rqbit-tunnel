@@ -1,12 +1,15 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::PathBuf};
 
 use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::paths::ClientPaths;
+
 pub const BUNDLE_SCHEMA_VERSION: u32 = 1;
 pub const SERVER_CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const CLIENT_CONFIG_SCHEMA_VERSION: u32 = 1;
 /// Maximum UTF-8 byte length accepted for an administrative user name.
 ///
 /// Keeping names small bounds every control-plane snapshot without requiring a
@@ -21,6 +24,10 @@ pub const DEFAULT_USER_PAGE_SIZE: usize = MAX_USER_PAGE_SIZE;
 pub struct ServerConfig {
     pub schema_version: u32,
     pub peer_listen: SocketAddr,
+    /// Public tunnel endpoint written into new enrollment bundles. When absent,
+    /// pre-existing configurations keep advertising their bind address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advertised_peer: Option<SocketAddr>,
     pub egress: ServerEgressConfig,
     pub default_client_socks_listen: SocketAddr,
     pub default_client_carriers: usize,
@@ -40,6 +47,8 @@ pub enum ServerConfigError {
     UnsupportedSchemaVersion { actual: u32, expected: u32 },
     #[error("the tunnel peer listener port must not be zero")]
     ZeroPeerListenPort,
+    #[error("the advertised tunnel peer port must not be zero")]
+    ZeroAdvertisedPeerPort,
     #[error("default client carrier count {actual} must be in 1..=16")]
     InvalidDefaultClientCarriers { actual: usize },
 }
@@ -55,6 +64,12 @@ impl ServerConfig {
         if self.peer_listen.port() == 0 {
             return Err(ServerConfigError::ZeroPeerListenPort);
         }
+        if self
+            .advertised_peer
+            .is_some_and(|address| address.port() == 0)
+        {
+            return Err(ServerConfigError::ZeroAdvertisedPeerPort);
+        }
         if !(1..=16).contains(&self.default_client_carriers) {
             return Err(ServerConfigError::InvalidDefaultClientCarriers {
                 actual: self.default_client_carriers,
@@ -62,6 +77,10 @@ impl ServerConfig {
         }
 
         Ok(())
+    }
+
+    pub fn advertised_peer(&self) -> SocketAddr {
+        self.advertised_peer.unwrap_or(self.peer_listen)
     }
 }
 
@@ -82,6 +101,152 @@ pub struct EnrollmentBundle {
     pub server_addr: SocketAddr,
     pub socks_listen: SocketAddr,
     pub carriers: usize,
+}
+
+/// The desktop identity allowed to read the managed client's local status IPC.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "platform", rename_all = "snake_case")]
+pub enum ClientStatusOwner {
+    Unix { uid: u32 },
+    Windows { sid: String },
+}
+
+/// Non-secret client tunnel configuration persisted outside the service process.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientConfig {
+    pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_owner: Option<ClientStatusOwner>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_addr: Option<SocketAddr>,
+    #[serde(
+        serialize_with = "serialize_hex_key",
+        deserialize_with = "deserialize_hex_key"
+    )]
+    pub server_public_key: [u8; 32],
+    pub client_key_path: PathBuf,
+    pub socks_listen: SocketAddr,
+    pub carriers: usize,
+    pub carrier_root: PathBuf,
+    pub allow_unauthenticated_lan_socks: bool,
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum ClientConfigError {
+    #[error("client configuration schema version {actual} is unsupported (expected {expected})")]
+    UnsupportedSchemaVersion { actual: u32, expected: u32 },
+    #[error("enrollment bundle schema version {actual} is unsupported (expected {expected})")]
+    UnsupportedBundleSchemaVersion { actual: u32, expected: u32 },
+    #[error("the configured tunnel server port must not be zero")]
+    ZeroServerPort,
+    #[error("client carrier count {actual} must be in 1..=16")]
+    InvalidCarrierCount { actual: usize },
+    #[error("a non-loopback SOCKS listener requires explicit insecure LAN acknowledgement")]
+    InsecureLanSocksNotAcknowledged,
+    #[error("Windows client status owner SID must not be empty")]
+    EmptyWindowsStatusOwnerSid,
+}
+
+impl ClientConfig {
+    pub fn from_bundle(
+        paths: &ClientPaths,
+        bundle: &EnrollmentBundle,
+    ) -> Result<Self, ClientConfigError> {
+        if bundle.schema_version != BUNDLE_SCHEMA_VERSION {
+            return Err(ClientConfigError::UnsupportedBundleSchemaVersion {
+                actual: bundle.schema_version,
+                expected: BUNDLE_SCHEMA_VERSION,
+            });
+        }
+
+        let config = Self {
+            schema_version: CLIENT_CONFIG_SCHEMA_VERSION,
+            status_owner: None,
+            server_addr: Some(bundle.server_addr),
+            server_public_key: bundle.server_public_key,
+            client_key_path: paths.client_key_path(),
+            socks_listen: bundle.socks_listen,
+            carriers: bundle.carriers,
+            carrier_root: paths.carrier_root(),
+            allow_unauthenticated_lan_socks: false,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<(), ClientConfigError> {
+        if self.schema_version != CLIENT_CONFIG_SCHEMA_VERSION {
+            return Err(ClientConfigError::UnsupportedSchemaVersion {
+                actual: self.schema_version,
+                expected: CLIENT_CONFIG_SCHEMA_VERSION,
+            });
+        }
+        if self.server_addr.is_some_and(|address| address.port() == 0) {
+            return Err(ClientConfigError::ZeroServerPort);
+        }
+        if !(1..=16).contains(&self.carriers) {
+            return Err(ClientConfigError::InvalidCarrierCount {
+                actual: self.carriers,
+            });
+        }
+        if !self.socks_listen.ip().is_loopback() && !self.allow_unauthenticated_lan_socks {
+            return Err(ClientConfigError::InsecureLanSocksNotAcknowledged);
+        }
+        if matches!(
+            self.status_owner.as_ref(),
+            Some(ClientStatusOwner::Windows { sid }) if sid.trim().is_empty()
+        ) {
+            return Err(ClientConfigError::EmptyWindowsStatusOwnerSid);
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn for_test(socks_listen: SocketAddr) -> Self {
+        Self {
+            schema_version: CLIENT_CONFIG_SCHEMA_VERSION,
+            status_owner: None,
+            server_addr: Some("203.0.113.8:4242".parse().unwrap()),
+            server_public_key: [8; 32],
+            client_key_path: PathBuf::from("/tmp/rqbit-tunnel-client.key"),
+            socks_listen,
+            carriers: 4,
+            carrier_root: PathBuf::from("/tmp/rqbit-tunnel-client-carrier"),
+            allow_unauthenticated_lan_socks: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalServiceState {
+    #[serde(rename = "running", alias = "Running")]
+    Running,
+    #[serde(rename = "stopped", alias = "Stopped")]
+    Stopped,
+    #[serde(rename = "failed", alias = "Failed")]
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalTunnelState {
+    #[serde(rename = "connected", alias = "Connected")]
+    Connected,
+    #[serde(rename = "reconnecting", alias = "Reconnecting")]
+    Reconnecting,
+    #[serde(rename = "error", alias = "Error")]
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientSnapshot {
+    pub service: LocalServiceState,
+    pub tunnel: LocalTunnelState,
+    pub socks_listen: Option<SocketAddr>,
+    pub configured_carriers: usize,
+    pub live_carriers: usize,
+    pub version: String,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,9 +338,77 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        EnrollmentBundle, SERVER_CONFIG_SCHEMA_VERSION, ServerConfig, ServerConfigError,
+        ClientConfig, ClientConfigError, ClientStatusOwner, EnrollmentBundle, LocalServiceState,
+        LocalTunnelState, SERVER_CONFIG_SCHEMA_VERSION, ServerConfig, ServerConfigError,
         ServerEgressConfig,
     };
+
+    #[test]
+    fn local_status_states_serialize_as_lowercase_snake_case() {
+        for (state, expected) in [
+            (LocalServiceState::Running, "running"),
+            (LocalServiceState::Stopped, "stopped"),
+            (LocalServiceState::Failed, "failed"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&state).unwrap(),
+                format!(r#""{expected}""#)
+            );
+        }
+        for (state, expected) in [
+            (LocalTunnelState::Connected, "connected"),
+            (LocalTunnelState::Reconnecting, "reconnecting"),
+            (LocalTunnelState::Error, "error"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&state).unwrap(),
+                format!(r#""{expected}""#)
+            );
+        }
+    }
+
+    #[test]
+    fn non_loopback_listener_requires_explicit_insecure_acknowledgement() {
+        let config = ClientConfig::for_test("0.0.0.0:1080".parse().unwrap());
+
+        assert_eq!(
+            config.validate().unwrap_err(),
+            ClientConfigError::InsecureLanSocksNotAcknowledged
+        );
+    }
+
+    #[test]
+    fn empty_windows_status_owner_is_rejected_for_loopback_listener() {
+        let mut config = ClientConfig::for_test("127.0.0.1:1080".parse().unwrap());
+        config.status_owner = Some(ClientStatusOwner::Windows {
+            sid: "   ".to_owned(),
+        });
+
+        assert_eq!(
+            config.validate().unwrap_err(),
+            ClientConfigError::EmptyWindowsStatusOwnerSid
+        );
+    }
+
+    #[test]
+    fn loopback_client_config_accepts_valid_carrier_counts_only() {
+        let valid = ClientConfig::for_test("127.0.0.1:1080".parse().unwrap());
+        assert!(valid.validate().is_ok());
+
+        let mut invalid = valid.clone();
+        invalid.carriers = 0;
+        assert_eq!(
+            invalid.validate().unwrap_err(),
+            ClientConfigError::InvalidCarrierCount { actual: 0 }
+        );
+
+        let mut invalid = valid;
+        invalid.carriers = 17;
+        assert_eq!(
+            invalid.validate().unwrap_err(),
+            ClientConfigError::InvalidCarrierCount { actual: 17 }
+        );
+    }
 
     #[test]
     fn enrollment_bundle_round_trips_hex_keys_without_leaking_extra_fields() {
@@ -196,6 +429,7 @@ mod tests {
         let valid = ServerConfig {
             schema_version: SERVER_CONFIG_SCHEMA_VERSION,
             peer_listen: "127.0.0.1:4242".parse().unwrap(),
+            advertised_peer: None,
             egress: ServerEgressConfig {
                 allow_private: false,
                 allow_loopback: false,
@@ -222,10 +456,38 @@ mod tests {
         ));
 
         let mut invalid = valid.clone();
+        invalid.advertised_peer = Some("8.8.8.8:0".parse().unwrap());
+        assert!(matches!(
+            invalid.validate(),
+            Err(ServerConfigError::ZeroAdvertisedPeerPort)
+        ));
+
+        let mut invalid = valid.clone();
         invalid.default_client_carriers = 17;
         assert!(matches!(
             invalid.validate(),
             Err(ServerConfigError::InvalidDefaultClientCarriers { .. })
         ));
+    }
+
+    #[test]
+    fn legacy_server_config_without_an_advertised_peer_uses_its_bind_address() {
+        let config: ServerConfig = serde_json::from_str(
+            r#"{
+                "schema_version": 1,
+                "peer_listen": "127.0.0.1:4242",
+                "egress": {
+                    "allow_private": false,
+                    "allow_loopback": false,
+                    "allow_link_local": false,
+                    "allow_multicast": false
+                },
+                "default_client_socks_listen": "127.0.0.1:1080",
+                "default_client_carriers": 4
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.advertised_peer(), "127.0.0.1:4242".parse().unwrap());
     }
 }

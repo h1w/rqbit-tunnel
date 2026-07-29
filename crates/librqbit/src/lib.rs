@@ -115,6 +115,7 @@ pub use tunnel::options::{
     EgressPolicy, TunnelClientOptions, TunnelOptions, TunnelServerAuthorizer, TunnelServerOptions,
     TunnelServerSession, TunnelTrafficDirection,
 };
+pub use tunnel::service::TunnelServiceStatus;
 
 #[cfg(test)]
 mod tests;

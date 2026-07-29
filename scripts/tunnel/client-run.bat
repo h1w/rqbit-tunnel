@@ -1,7 +1,8 @@
 @echo off
-REM rqbit tunnel — Windows one-click client launcher.
-REM Double-click this file, or run:  client-run.bat <server-host:port>
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0client-run.ps1" %*
+REM rqbit tunnel managed-client control wrapper.
+REM Forward arguments to the PowerShell menu, then keep double-click windows open.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0client-run.ps1" %*
+set "EXITCODE=%ERRORLEVEL%"
 echo.
-echo Tunnel client stopped.
 pause
+exit /b %EXITCODE%

@@ -357,8 +357,8 @@ mod tests {
     use super::super::frame::{TunnelDestination, TunnelErrorCode};
     use super::*;
     use bytes::Bytes;
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::cell::Cell;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
     /// Linchpin: our public `tunnel_public_key` derivation MUST match the
     /// public key snow produced for the same private key, otherwise the client
@@ -468,7 +468,10 @@ mod tests {
             None::<()>
         });
 
-        assert!(matches!(result, Err(TunnelCryptoError::ClientNotAllowed(_))));
+        assert!(matches!(
+            result,
+            Err(TunnelCryptoError::ClientNotAllowed(_))
+        ));
         assert_eq!(calls.get(), 1);
     }
 

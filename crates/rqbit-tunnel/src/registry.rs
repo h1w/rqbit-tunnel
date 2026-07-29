@@ -781,12 +781,12 @@ mod tests {
     use rusqlite::{Connection, params};
 
     use super::{UserCounters, UserMeter, UserRegistry};
+    #[cfg(unix)]
     use crate::{
         ipc::protocol::{MAX_FRAME_BYTES, ServerResponse, encode_response},
-        model::{MAX_USER_NAME_BYTES, TrafficTotals, UserRecord},
-        paths::ServerPaths,
-        store::ServerStore,
+        model::{MAX_USER_NAME_BYTES, UserRecord},
     };
+    use crate::{model::TrafficTotals, paths::ServerPaths, store::ServerStore};
 
     struct TestRegistry {
         _directory: tempfile::TempDir,
@@ -1257,6 +1257,7 @@ mod tests {
             }
         );
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn legacy_overlong_name_reopens_and_lists_with_bounded_display_metadata() {
         let directory = tempfile::tempdir().unwrap();

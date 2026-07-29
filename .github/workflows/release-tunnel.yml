@@ -1,18 +1,10 @@
 name: Release rqbit-tunnel
 
-# Builds the single `rqbit` binary (it is both the tunnel server and client —
-# only the flags differ) and packages ready-to-run bundles:
-#   * Linux (amd64, arm64) — usable as server (VPS) or client, with quickstart
-#     + client launcher scripts.
-#   * Windows (amd64) — desktop client, with a double-click launcher.
-# Key generation is built into the binary (`rqbit tunnel keygen`), so the
-# bundles need no Python or other dependency.
-
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release tag (e.g. tunnel-v0.1.0)"
+        description: "Canonical release version (for example 1.2.3)"
         required: true
         type: string
       draft:
@@ -26,6 +18,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_VERSION: ${{ inputs.version }}
 
 jobs:
   build:
@@ -35,65 +28,197 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04
-            platform: linux-amd64
             target: x86_64-unknown-linux-gnu
+            tray_feature: tray-linux
           - os: ubuntu-24.04-arm
-            platform: linux-arm64
             target: aarch64-unknown-linux-gnu
+            tray_feature: tray-linux
           - os: windows-latest
-            platform: windows-amd64
             target: x86_64-pc-windows-msvc
+            tray_feature: tray-windows
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          semver_pattern='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+)(\.[0-9A-Za-z-]+)*)?(\+([0-9A-Za-z-]+)(\.[0-9A-Za-z-]+)*)?$'
+          if [[ ! "$RELEASE_VERSION" =~ $semver_pattern ]]; then
+            printf 'error: release version is not canonical semantic version text: %s\n' "$RELEASE_VERSION" >&2
+            exit 1
+          fi
+          prerelease="${RELEASE_VERSION#*-}"
+          if [[ "$prerelease" != "$RELEASE_VERSION" ]]; then
+            prerelease="${prerelease%%+*}"
+            IFS='.' read -r -a identifiers <<<"$prerelease"
+            for identifier in "${identifiers[@]}"; do
+              if [[ "$identifier" =~ ^[0-9]+$ && ${#identifier} -gt 1 && "$identifier" == 0* ]]; then
+                printf 'error: numeric prerelease identifiers must not have leading zeroes: %s\n' "$RELEASE_VERSION" >&2
+                exit 1
+              fi
+            done
+          fi
+          version_core="${RELEASE_VERSION%%+*}"
+          if [[ "$version_core" == *-* ]]; then
+            printf 'error: release version must not include a prerelease: %s\n' "$RELEASE_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Install Linux tray dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build rqbit
-        run: cargo build --release --target ${{ matrix.target }} -p rqbit
+      - name: Build Linux core tunnel runtime
+        if: runner.os == 'Linux'
+        run: |
+          CORE_TARGET_DIR="target/tunnel-core-${{ matrix.target }}"
+          cargo build --release --target ${{ matrix.target }} --target-dir "$CORE_TARGET_DIR" -p rqbit
+          cargo build --release --target ${{ matrix.target }} --target-dir "$CORE_TARGET_DIR" \
+            -p rqbit-tunnel \
+            --bin rqbit-tunnel \
+            --bin rqbit-tunnel-launcher \
+            --bin rqbit-tunnel-updater
+
+      - name: Build Linux tray companion
+        if: runner.os == 'Linux'
+        run: |
+          TRAY_TARGET_DIR="target/tunnel-tray-${{ matrix.target }}"
+          cargo build --release --target ${{ matrix.target }} --target-dir "$TRAY_TARGET_DIR" \
+            -p rqbit-tunnel \
+            --features tray-linux \
+            --bin rqbit-tunnel-tray
+
+      - name: Build Windows tunnel runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p rqbit
+          cargo build --release --target ${{ matrix.target }} -p rqbit-tunnel `
+            --features tray-windows `
+            --bin rqbit-tunnel `
+            --bin rqbit-tunnel-launcher `
+            --bin rqbit-tunnel-tray `
+            --bin rqbit-tunnel-updater
 
       - name: Package bundle (Linux)
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          BUNDLE="rqbit-tunnel-${{ matrix.platform }}"
-          mkdir -p "$BUNDLE"
-          cp "target/${{ matrix.target }}/release/rqbit" "$BUNDLE/rqbit"
-          cp scripts/tunnel/server-quickstart.sh \
-             scripts/tunnel/client-run.sh \
+          BUNDLE="rqbit-tunnel-${{ matrix.target }}"
+          CORE_RELEASE="target/tunnel-core-${{ matrix.target }}/${{ matrix.target }}/release"
+          TRAY_RELEASE="target/tunnel-tray-${{ matrix.target }}/${{ matrix.target }}/release"
+          mkdir -p "$BUNDLE/systemd" dist
+          cp "$CORE_RELEASE/rqbit" "$BUNDLE/rqbit"
+          cp "$CORE_RELEASE/rqbit-tunnel" "$BUNDLE/rqbit-tunnel"
+          cp "$CORE_RELEASE/rqbit-tunnel-launcher" "$BUNDLE/launcher"
+          cp "$CORE_RELEASE/rqbit-tunnel-updater" "$BUNDLE/rqbit-tunnel-updater"
+          cp "$TRAY_RELEASE/rqbit-tunnel-tray" "$BUNDLE/rqbit-tunnel-tray"
+          cp scripts/tunnel/client-run.sh \
              scripts/tunnel/client-run.ps1 \
              scripts/tunnel/client-run.bat \
+             scripts/tunnel/install-client.sh \
+             scripts/tunnel/install-client.ps1 \
+             scripts/tunnel/server-quickstart.sh \
              scripts/tunnel/README.md "$BUNDLE/"
-          chmod +x "$BUNDLE/rqbit" "$BUNDLE"/*.sh
-          mkdir -p dist
+          cp systemd/rqbit-tunnel-client.service \
+             systemd/rqbit-tunnel-server.service "$BUNDLE/systemd/"
+          printf '%s\n' "$RELEASE_VERSION" >"$BUNDLE/release-version.txt"
+          chmod 0755 "$BUNDLE/rqbit" "$BUNDLE/rqbit-tunnel" "$BUNDLE/launcher" \
+            "$BUNDLE/rqbit-tunnel-tray" "$BUNDLE/rqbit-tunnel-updater" "$BUNDLE"/*.sh
           tar -czf "dist/$BUNDLE.tar.gz" "$BUNDLE"
+          inspection=$(mktemp -d)
+          trap 'rm -rf -- "$inspection"' EXIT
+          tar -xzf "dist/$BUNDLE.tar.gz" -C "$inspection"
+          packaged="$inspection/$BUNDLE"
+          for file in rqbit rqbit-tunnel launcher rqbit-tunnel-updater rqbit-tunnel-tray install-client.sh; do
+            [[ -f "$packaged/$file" && ! -L "$packaged/$file" && -x "$packaged/$file" ]] ||
+              { printf 'error: packaged Linux file is missing or not executable: %s\n' "$file" >&2; exit 1; }
+          done
+          for file in client-run.ps1 client-run.bat install-client.ps1 server-quickstart.sh README.md release-version.txt \
+                      systemd/rqbit-tunnel-client.service systemd/rqbit-tunnel-server.service; do
+            [[ -f "$packaged/$file" && ! -L "$packaged/$file" ]] ||
+              { printf 'error: packaged Linux file is missing or unsafe: %s\n' "$file" >&2; exit 1; }
+          done
+          [[ "$(cat "$packaged/release-version.txt")" == "$RELEASE_VERSION" ]] ||
+            { printf 'error: packaged Linux release version differs from validated input\n' >&2; exit 1; }
+          [[ ! -e "$packaged/rqbit-tunnel-release-sign" ]] ||
+            { printf 'error: CI-only release signer was included in Linux bundle\n' >&2; exit 1; }
 
       - name: Package bundle (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $bundle = "rqbit-tunnel-${{ matrix.platform }}"
-          New-Item -ItemType Directory -Force -Path $bundle | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/rqbit.exe" "$bundle/rqbit.exe"
+          $bundle = "rqbit-tunnel-${{ matrix.target }}"
+          $targetDirectory = "target/${{ matrix.target }}/release"
+          New-Item -ItemType Directory -Force -Path $bundle, dist | Out-Null
+          Copy-Item "$targetDirectory/rqbit.exe" "$bundle/rqbit.exe"
+          Copy-Item "$targetDirectory/rqbit-tunnel.exe" "$bundle/rqbit-tunnel.exe"
+          Copy-Item "$targetDirectory/rqbit-tunnel-launcher.exe" "$bundle/launcher.exe"
+          Copy-Item "$targetDirectory/rqbit-tunnel-updater.exe" "$bundle/rqbit-tunnel-updater.exe"
+          Copy-Item "$targetDirectory/rqbit-tunnel-tray.exe" "$bundle/rqbit-tunnel-tray.exe"
           Copy-Item scripts/tunnel/client-run.ps1, `
                     scripts/tunnel/client-run.bat, `
+                    scripts/tunnel/install-client.ps1, `
                     scripts/tunnel/README.md $bundle
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path $bundle -DestinationPath "dist/$bundle.zip"
+          Set-Content -LiteralPath "$bundle/release-version.txt" -Value $env:RELEASE_VERSION -NoNewline
+          Compress-Archive -Path $bundle -DestinationPath "dist/$bundle.zip" -Force
+          $inspection = Join-Path $env:RUNNER_TEMP "$bundle-inspection"
+          Remove-Item -LiteralPath $inspection -Recurse -Force -ErrorAction SilentlyContinue
+          try {
+            Expand-Archive -LiteralPath "dist/$bundle.zip" -DestinationPath $inspection -Force
+            $packaged = Join-Path $inspection $bundle
+            foreach ($name in @(
+              'rqbit.exe',
+              'rqbit-tunnel.exe',
+              'launcher.exe',
+              'rqbit-tunnel-updater.exe',
+              'rqbit-tunnel-tray.exe',
+              'client-run.ps1',
+              'client-run.bat',
+              'install-client.ps1',
+              'README.md',
+              'release-version.txt'
+            )) {
+              $item = Get-Item -LiteralPath (Join-Path $packaged $name) -Force -ErrorAction Stop
+              if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw "packaged Windows file is not a regular file: $name"
+              }
+            }
+            if ([IO.File]::ReadAllText((Join-Path $packaged 'release-version.txt')) -ne $env:RELEASE_VERSION) {
+              throw 'packaged Windows release version differs from validated input'
+            }
+            if (Test-Path -LiteralPath (Join-Path $packaged 'rqbit-tunnel-release-sign.exe')) {
+              throw 'CI-only release signer was included in Windows bundle'
+            }
+          }
+          finally {
+            Remove-Item -LiteralPath $inspection -Recurse -Force -ErrorAction SilentlyContinue
+          }
 
-      - name: Upload artifact
+      - name: Upload bundle artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rqbit-tunnel-${{ matrix.platform }}
+          name: rqbit-tunnel-${{ matrix.target }}
           path: dist/*
 
   release:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Download all bundles
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download release bundles
         uses: actions/download-artifact@v4
         with:
           path: dist
@@ -102,14 +227,37 @@ jobs:
       - name: Generate checksums
         run: |
           cd dist
-          sha256sum * > SHA256SUMS
+          sha256sum rqbit-tunnel-* > SHA256SUMS
           cat SHA256SUMS
+
+      - name: Sign release manifest
+        env:
+          TUNNEL_RELEASE_SIGNING_KEY: ${{ secrets.TUNNEL_RELEASE_SIGNING_KEY }}
+        run: |
+          cargo run --release -p rqbit-tunnel --bin rqbit-tunnel-release-sign -- sign \
+            --version "$RELEASE_VERSION" \
+            --launcher-abi 1 \
+            --output dist \
+            --asset x86_64-unknown-linux-gnu=dist/rqbit-tunnel-x86_64-unknown-linux-gnu.tar.gz \
+            --asset aarch64-unknown-linux-gnu=dist/rqbit-tunnel-aarch64-unknown-linux-gnu.tar.gz \
+            --asset x86_64-pc-windows-msvc=dist/rqbit-tunnel-x86_64-pc-windows-msvc.zip
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ github.event.inputs.version }}
-          name: ${{ github.event.inputs.version }}
-          draft: ${{ github.event.inputs.draft }}
+          tag_name: tunnel-v${{ env.RELEASE_VERSION }}
+          name: tunnel-v${{ env.RELEASE_VERSION }}
+          draft: true
           generate_release_notes: true
-          files: dist/*
+          files: |
+            dist/rqbit-tunnel-*.tar.gz
+            dist/rqbit-tunnel-*.zip
+            dist/SHA256SUMS
+            dist/release-metadata/release-manifest.json
+            dist/release-metadata/release-manifest.sig
+
+      - name: Publish GitHub Release
+        if: ${{ !inputs.draft }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "tunnel-v${RELEASE_VERSION}" --draft=false
