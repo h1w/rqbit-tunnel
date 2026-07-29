@@ -241,6 +241,8 @@ wait_for_health() {
     done
 
     run_as_root systemctl --no-pager --full status "$SERVICE_NAME" >&2 || true
+    printf '\nRecent managed-server journal entries:\n' >&2
+    run_as_root journalctl --unit "$SERVICE_NAME" --no-pager -n 100 -o cat >&2 || true
     die 'managed server did not become active and return JSON health within 30 seconds'
 }
 

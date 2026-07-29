@@ -213,8 +213,8 @@ pub enum ServerRuntimeError {
     Store(#[from] StoreError),
     #[error("failed to operate the user registry: {0}")]
     Registry(#[from] RegistryError),
-    #[error("librqbit tunnel session startup failed")]
-    SessionStart,
+    #[error("librqbit tunnel session startup failed: {message}")]
+    SessionStart { message: String },
     #[error("failed to create or bind control socket {path}: {source}")]
     ControlSocket {
         path: PathBuf,
@@ -340,7 +340,7 @@ impl ServerRuntimeError {
                 "server_state_error",
                 "Inspect the managed server state and retry the command.",
             ),
-            Self::SessionStart
+            Self::SessionStart { .. }
             | Self::ControlSocket { .. }
             | Self::ActiveControlSocket { .. }
             | Self::UnsafeControlSocketPath { .. } => (
@@ -560,9 +560,11 @@ impl ManagedServer {
         .await
         {
             Ok(session) => session,
-            Err(_) => {
+            Err(source) => {
                 let _ = registry.shutdown().await;
-                return Err(ServerRuntimeError::SessionStart);
+                return Err(ServerRuntimeError::SessionStart {
+                    message: format!("{source:#}"),
+                });
             }
         };
 
@@ -1481,7 +1483,7 @@ async fn try_start_test_server(
     write_test_server_config(paths, peer_listen);
     match ManagedServer::start(paths.clone()).await {
         Ok(server) => Ok(Some(server)),
-        Err(error @ ServerRuntimeError::SessionStart) => {
+        Err(error @ ServerRuntimeError::SessionStart { .. }) => {
             *last_error = Some(error);
             Ok(None)
         }
@@ -1546,7 +1548,8 @@ mod tests {
         AtomicWriteError, AtomicWriteOutcome, ConfigError, ManagedServer, ServerRuntimeError,
         atomic_write_file, bind_control_socket, install_atomic_write_parent_open_hook,
         install_stale_socket_removal_pause, start_test_server,
-        start_test_server_with_peer_candidates, write_test_server_material,
+        start_test_server_with_peer_candidates, write_test_server_config,
+        write_test_server_material,
     };
 
     #[tokio::test]
@@ -1665,7 +1668,7 @@ mod tests {
                     server = Some(started);
                     break;
                 }
-                Err(ServerRuntimeError::SessionStart) => continue,
+                Err(ServerRuntimeError::SessionStart { .. }) => continue,
                 Err(error) => panic!("start test managed server: {error}"),
             }
         }
@@ -1726,7 +1729,7 @@ mod tests {
                     started.shutdown().await.unwrap();
                     panic!("a zero-port advertised peer must be rejected");
                 }
-                Err(ServerRuntimeError::SessionStart) => continue,
+                Err(ServerRuntimeError::SessionStart { .. }) => continue,
                 Err(error) => panic!("expected advertised-peer validation error, got {error}"),
             }
         }
@@ -1838,6 +1841,34 @@ mod tests {
                 ConfigError::InvalidKeyHex { .. }
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn startup_reports_the_underlying_tunnel_listener_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = test_paths(directory.path());
+        write_test_server_material(&paths).await;
+
+        let occupied_listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind occupied test tunnel port");
+        let occupied_address = occupied_listener
+            .local_addr()
+            .expect("read occupied test tunnel port");
+        write_test_server_config(&paths, occupied_address);
+
+        let error = match ManagedServer::start(paths).await {
+            Ok(server) => {
+                server.shutdown().await.unwrap();
+                panic!("server startup must fail while its tunnel port is occupied");
+            }
+            Err(error) => error,
+        };
+
+        assert!(
+            format!("{error:#}").contains("Address already in use"),
+            "server startup must retain the listener failure: {error:#}"
+        );
     }
 
     #[tokio::test]

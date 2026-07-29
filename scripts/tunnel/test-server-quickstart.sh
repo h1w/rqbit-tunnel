@@ -3,7 +3,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
-    printf 'usage: %s INSTALLER [initial|bundle-layout|rollback|protected-parent|lock|lock-sentinel|lock-path|keygen-privilege|all]\n' "${0##*/}" >&2
+    printf 'usage: %s INSTALLER [initial|bundle-layout|rollback|protected-parent|lock|lock-sentinel|lock-path|keygen-privilege|health-journal|all]\n' "${0##*/}" >&2
     exit 64
 fi
 
@@ -247,11 +247,21 @@ case " $* " in
 esac
 EOF
 
+    cat >"$CASE_DIR/fake-bin/journalctl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf 'synthetic server journal: bind: Address already in use\n'
+EOF
+
     cat >"$CASE_DIR/release/rqbit-tunnel" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
 if [[ "$*" == 'server users list --json' ]]; then
+    if [[ ${FAKE_HEALTH_FAIL:-} == 1 ]]; then
+        exit 1
+    fi
     printf '[]\n'
 fi
 EOF
@@ -404,6 +414,25 @@ test_key_generation_stays_outside_the_elevated_lock_holder() {
     REJECT_ROOT_KEYGEN=1 run_installer >/dev/null
 }
 
+test_failed_health_includes_service_journal() {
+    local output status
+
+    setup_case health-journal
+    sleep() {
+        SECONDS=$((SECONDS + ${1:-0}))
+    }
+    export -f sleep
+    set +e
+    output=$(FAKE_HEALTH_FAIL=1 run_installer 2>&1)
+    status=$?
+    set -e
+    unset -f sleep
+
+    (( status != 0 )) || fail 'a failed server health check must fail the installer'
+    [[ "$output" == *'synthetic server journal: bind: Address already in use'* ]] ||
+        fail 'a failed server health check must include the managed service journal'
+}
+
 case "$SELECTED_TEST" in
     initial)
         test_initial_config_uses_wildcard_bind_and_managed_export_directory
@@ -429,6 +458,9 @@ case "$SELECTED_TEST" in
     keygen-privilege)
         test_key_generation_stays_outside_the_elevated_lock_holder
         ;;
+    health-journal)
+        test_failed_health_includes_service_journal
+        ;;
     all)
         test_initial_config_uses_wildcard_bind_and_managed_export_directory
         test_failed_fresh_key_install_rolls_back_new_identity
@@ -438,6 +470,7 @@ case "$SELECTED_TEST" in
         test_release_bundle_uses_its_adjacent_systemd_template_and_binary
         test_installation_lock_uses_a_root_only_path
         test_key_generation_stays_outside_the_elevated_lock_holder
+        test_failed_health_includes_service_journal
         ;;
     *)
         fail "unknown test selection: $SELECTED_TEST"

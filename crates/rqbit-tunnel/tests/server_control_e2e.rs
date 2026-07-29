@@ -139,7 +139,7 @@ async fn start_server(directory: &TempDir) -> (ManagedServer, ServerPaths, Socke
 
         match ManagedServer::start(paths.clone()).await {
             Ok(server) => return (server, paths, peer_addr),
-            Err(ServerRuntimeError::SessionStart) => continue,
+            Err(ServerRuntimeError::SessionStart { .. }) => continue,
             Err(error) => panic!("managed server failed to start: {error}"),
         }
     }
