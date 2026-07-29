@@ -303,18 +303,19 @@ test_initial_config_uses_wildcard_bind_and_managed_export_directory() {
         fail 'quickstart must create the service-visible enrollment export directory'
 }
 
-test_release_bundle_uses_its_adjacent_systemd_template() {
+test_release_bundle_uses_its_adjacent_systemd_template_and_binary() {
     setup_case bundle-layout
     bundle="$CASE_DIR/bundle"
     mkdir -p "$bundle/systemd"
     cp "$INSTALLER" "$bundle/server-quickstart.sh"
+    cp "$CASE_DIR/release/rqbit-tunnel" "$bundle/rqbit-tunnel"
+    chmod 0755 "$bundle/rqbit-tunnel"
     cp "$(dirname "$INSTALLER")/../../systemd/rqbit-tunnel-server.service" "$bundle/systemd/"
     chmod 0755 "$bundle/server-quickstart.sh"
 
     env \
         PATH="$CASE_DIR/fake-bin:$ORIGINAL_PATH" \
         FAKE_ROOT="$FAKE_ROOT" \
-        RQBIT_TUNNEL_BIN="$CASE_DIR/release/rqbit-tunnel" \
         RQBIT_KEYGEN_BIN="$CASE_DIR/release/rqbit" \
         SERVER_IP=8.8.8.8 \
         TMPDIR="$CASE_DIR/tmp" \
@@ -411,7 +412,7 @@ case "$SELECTED_TEST" in
         test_failed_fresh_key_install_rolls_back_new_identity
         ;;
     bundle-layout)
-        test_release_bundle_uses_its_adjacent_systemd_template
+        test_release_bundle_uses_its_adjacent_systemd_template_and_binary
         ;;
     protected-parent)
         test_existing_regular_file_inspects_a_protected_parent_as_root
@@ -434,7 +435,7 @@ case "$SELECTED_TEST" in
         test_existing_regular_file_inspects_a_protected_parent_as_root
         test_concurrent_install_is_rejected_before_identity_preflight
         test_inherited_lock_sentinel_does_not_bypass_serialization
-        test_release_bundle_uses_its_adjacent_systemd_template
+        test_release_bundle_uses_its_adjacent_systemd_template_and_binary
         test_installation_lock_uses_a_root_only_path
         test_key_generation_stays_outside_the_elevated_lock_holder
         ;;

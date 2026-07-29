@@ -28,12 +28,12 @@ Install or repair the managed rqbit tunnel server service. The script only asks
 for root privileges while inspecting or changing protected installation state
 and managing systemd.
 
-When /opt/rqbit-tunnel/rqbit-tunnel is not already installed, set
-RQBIT_TUNNEL_BIN to the explicit rqbit-tunnel binary to install. The script
-never selects a binary from PATH. On a first key setup, set RQBIT_KEYGEN_BIN to
-the explicit bundled rqbit binary (unless a bundled ./rqbit is beside this
-script). Set SERVER_IP to the reachable public IPv4 address to avoid external
-discovery. RQBIT_TUNNEL_UNIT may override the service-template source.
+When a trusted release bundle's `./rqbit-tunnel` is beside this script, it is
+used automatically. Otherwise set RQBIT_TUNNEL_BIN to the explicit
+rqbit-tunnel binary to install. The script never selects a binary from PATH.
+On a first key setup it likewise uses bundled `./rqbit`, or accepts
+RQBIT_KEYGEN_BIN. Set SERVER_IP to the reachable public IPv4 address to avoid
+external discovery. RQBIT_TUNNEL_UNIT may override the service-template source.
 
 --skip-tui  Finish the installation without opening the interactive server TUI.
              This is the only noninteractive mode; it is intended for automation.
@@ -379,6 +379,10 @@ else
 fi
 
 binary_source=${RQBIT_TUNNEL_BIN:-}
+if [[ -z "$binary_source" && -x "$SCRIPT_DIR/rqbit-tunnel" ]]; then
+    # A sibling binary is part of the same release bundle, unlike PATH.
+    binary_source="$SCRIPT_DIR/rqbit-tunnel"
+fi
 if [[ -n "$binary_source" ]]; then
     binary_source=$(absolute_path "$binary_source")
     require_executable_file "$binary_source"

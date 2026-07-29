@@ -7,29 +7,21 @@ socket `/run/rqbit-tunnel/server.sock`, never a TCP management port.
 
 ## Install on the VPS
 
-Start with explicit paths from a trusted release bundle. The installer
-intentionally does **not** choose a binary from `PATH` or copy an unknown
-executable. On first setup it needs the bundled `rqbit` only to generate key
-material; it copies only the generated server private key into the managed
-configuration and deletes the temporary generated client material.
+Extract a trusted Linux release bundle and run its server bootstrap script. It
+automatically uses the bundled `./rqbit-tunnel` and `./rqbit`; it never chooses
+a binary from `PATH`. On first setup it generates key material with the bundled
+`rqbit`, copies only the server private key into managed configuration, and
+deletes the temporary generated client material.
 
 ```bash
-RQBIT_TUNNEL_BIN=/srv/rqbit-release/rqbit-tunnel \
-RQBIT_KEYGEN_BIN=/srv/rqbit-release/rqbit \
-./scripts/tunnel/server-quickstart.sh
+cd rqbit-tunnel-x86_64-unknown-linux-gnu
+# Set PUBLIC_SERVER_IPV4 to the VPS's real reachable public IPv4 address.
+SERVER_IP="$PUBLIC_SERVER_IPV4" ./server-quickstart.sh
 ```
 
-The script first tries to discover a public IPv4 address. If that cannot work,
-provide the reachable numeric address explicitly; it is written as
-`advertised_peer` into enrollment bundles while the service binds its
-`peer_listen` address on all local IPv4 interfaces.
-
-```bash
-SERVER_IP="$PUBLIC_SERVER_IPV4" \
-RQBIT_TUNNEL_BIN=/srv/rqbit-release/rqbit-tunnel \
-RQBIT_KEYGEN_BIN=/srv/rqbit-release/rqbit \
-./scripts/tunnel/server-quickstart.sh
-```
+When running a copied script outside a complete trusted bundle, set
+`RQBIT_TUNNEL_BIN` and, on first setup, `RQBIT_KEYGEN_BIN` to explicit trusted
+binary paths.
 
 Set `RQBIT_TUNNEL_UNIT=/path/to/rqbit-tunnel-server.service` when the template
 is not in the source-tree location relative to the script. The installer obtains
@@ -73,10 +65,7 @@ flag:
 
 ```bash
 # Set PUBLIC_SERVER_IPV4 to the VPS's real reachable public IPv4 address.
-SERVER_IP="$PUBLIC_SERVER_IPV4" \
-RQBIT_TUNNEL_BIN=/srv/rqbit-release/rqbit-tunnel \
-RQBIT_KEYGEN_BIN=/srv/rqbit-release/rqbit \
-./scripts/tunnel/server-quickstart.sh --skip-tui
+SERVER_IP="$PUBLIC_SERVER_IPV4" ./server-quickstart.sh --skip-tui
 ```
 
 No quickstart output contains a private key or an enrollment bundle.

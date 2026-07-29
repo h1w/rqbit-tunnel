@@ -100,21 +100,20 @@ The managed server relays authorized client traffic to destination hosts.
 
 ### Install the VPS server
 
-Use trusted, explicit release-bundle paths. The installer deliberately does not
-pick an executable from `PATH`:
+Extract a trusted Linux release bundle and run its bootstrap script from the
+bundle directory. It automatically uses the bundled `rqbit-tunnel` and `rqbit`,
+never an executable selected from `PATH`:
 
 ```bash
-RQBIT_TUNNEL_BIN=/srv/rqbit-release/rqbit-tunnel \
-RQBIT_KEYGEN_BIN=/srv/rqbit-release/rqbit \
-./scripts/tunnel/server-quickstart.sh
+cd rqbit-tunnel-x86_64-unknown-linux-gnu
+SERVER_IP="$PUBLIC_SERVER_IPV4" ./server-quickstart.sh
 ```
 
-It discovers a public IPv4 address only as a best effort. If discovery is not
-available, set `SERVER_IP` to the VPS's reachable numeric public IPv4 address
-before running the same command. The generated server binds `peer_listen` to
-`0.0.0.0:PEER_PORT` and writes that public endpoint separately as
-`advertised_peer` for enrollment bundles; this also works when the VPS uses
-1:1 NAT.
+It discovers a public IPv4 address only as a best effort. Set `SERVER_IP` to
+the VPS's reachable numeric public IPv4 address when known. The generated server
+binds `peer_listen` to `0.0.0.0:PEER_PORT` and writes that public endpoint
+separately as `advertised_peer` for enrollment bundles; this also works when the
+VPS uses 1:1 NAT.
 
 The installation creates root-owned `/etc/rqbit-tunnel`,
 `/var/lib/rqbit-tunnel`, `/var/lib/rqbit-tunnel/enrollments`, and
@@ -127,14 +126,11 @@ unknown server.
 
 It then runs `daemon-reload`, enables and starts the service, and requires both
 an active systemd unit and local `server users list --json` health before opening
-the TUI. Automation must opt out explicitly and supply the trusted bundle paths:
+the TUI. Automation must opt out explicitly:
 
 ```bash
 # Set PUBLIC_SERVER_IPV4 to the VPS's real reachable public IPv4 address.
-SERVER_IP="$PUBLIC_SERVER_IPV4" \
-RQBIT_TUNNEL_BIN=/srv/rqbit-release/rqbit-tunnel \
-RQBIT_KEYGEN_BIN=/srv/rqbit-release/rqbit \
-./scripts/tunnel/server-quickstart.sh --skip-tui
+SERVER_IP="$PUBLIC_SERVER_IPV4" ./server-quickstart.sh --skip-tui
 ```
 
 The service command is exactly:
