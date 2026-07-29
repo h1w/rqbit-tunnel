@@ -745,12 +745,12 @@ fn render_server(frame: &mut ratatui::Frame, state: &ServerTuiState) {
 }
 
 fn render_modal(frame: &mut ratatui::Frame, modal: &Modal) {
-    let height_percent = if matches!(modal, Modal::AddUser(_)) {
-        40
+    let (width_percent, height_percent) = if matches!(modal, Modal::AddUser(_)) {
+        (90, 40)
     } else {
-        30
+        (70, 30)
     };
-    let area = centered_rect(70, height_percent, frame.area());
+    let area = centered_rect(width_percent, height_percent, frame.area());
     let lines = match modal {
         Modal::ConfirmDelete(id) => vec![
             Line::from(format!("Delete user {id}?")),
@@ -774,12 +774,12 @@ fn render_modal(frame: &mut ratatui::Frame, modal: &Modal) {
         ],
     };
     frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::bordered().title("Confirm"))
-            .wrap(Wrap { trim: true }),
-        area,
-    );
+    let paragraph = Paragraph::new(lines).block(Block::bordered().title("Confirm"));
+    if matches!(modal, Modal::AddUser(_)) {
+        frame.render_widget(paragraph, area);
+    } else {
+        frame.render_widget(paragraph.wrap(Wrap { trim: true }), area);
+    }
 }
 
 fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
@@ -906,8 +906,8 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let modal = Modal::AddUser(AddUserForm {
-            name: "alice".to_owned(),
-            export_path: "alice.rqbt".to_owned(),
+            name: "alice-".repeat(20),
+            export_path: "enrollment-".repeat(20),
             field: AddUserField::Name,
         });
 
