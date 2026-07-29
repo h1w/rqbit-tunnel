@@ -2638,10 +2638,12 @@ fn normalize_staging_directory(staging_dir: &Path) -> Result<PathBuf, UpdateErro
             })?
             .join(staging_dir)
     };
+    #[cfg(unix)]
+    let final_component_index = absolute.components().count().saturating_sub(1);
     let mut normalized = PathBuf::new();
 
     // Rebuild components so a trailing separator cannot make metadata follow a final symlink.
-    for component in absolute.components() {
+    for (_component_index, component) in absolute.components().enumerate() {
         match component {
             Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
             Component::RootDir => normalized.push(component.as_os_str()),
@@ -2659,7 +2661,30 @@ fn normalize_staging_directory(staging_dir: &Path) -> Result<PathBuf, UpdateErro
                         source,
                     }
                 })?;
-                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                if metadata.file_type().is_symlink() {
+                    #[cfg(unix)]
+                    if _component_index != final_component_index {
+                        // macOS exposes its physical temporary directory through /var. Resolve
+                        // only an ancestor, then retain a physical path for the pinned root.
+                        normalized = fs::canonicalize(&normalized).map_err(|source| {
+                            UpdateError::InspectStagingDirectory {
+                                path: normalized.clone(),
+                                source,
+                            }
+                        })?;
+                        let target_metadata = fs::metadata(&normalized).map_err(|source| {
+                            UpdateError::InspectStagingDirectory {
+                                path: normalized.clone(),
+                                source,
+                            }
+                        })?;
+                        if target_metadata.is_dir() {
+                            continue;
+                        }
+                    }
+                    return Err(UpdateError::UnsafeStagingDirectory { path: normalized });
+                }
+                if !metadata.is_dir() {
                     return Err(UpdateError::UnsafeStagingDirectory { path: normalized });
                 }
             }
@@ -2976,6 +3001,37 @@ mod contract_tests {
                 .count(),
             1,
             "staging must contain only the returned bundle directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_extraction_allows_a_symlinked_staging_ancestor() {
+        let sandbox = tempdir().expect("sandbox directory should be created");
+        let archive_path = sandbox.path().join("bundle.tar.gz");
+        write_tar_gz(&archive_path, |archive| {
+            append_directory(archive, "bundle");
+            append_regular_file(archive, "bundle/rqbit-tunnel", b"payload");
+        });
+
+        let physical_parent = sandbox.path().join("physical-parent");
+        fs::create_dir(&physical_parent).expect("physical parent directory should be created");
+        let symlinked_parent = sandbox.path().join("symlinked-parent");
+        std::os::unix::fs::symlink(&physical_parent, &symlinked_parent)
+            .expect("staging parent symlink should be created");
+
+        let staging_dir = symlinked_parent.join("staging");
+        fs::create_dir(physical_parent.join("staging"))
+            .expect("staging directory should be created through its physical path");
+
+        let bundle = extract_verified_archive(&archive_path, &staging_dir, ArchiveKind::TarGz)
+            .expect("a staging directory below a symlinked ancestor should be usable");
+
+        assert_eq!(bundle.relative_directory(), Path::new("bundle"));
+        assert_eq!(
+            fs::read(physical_parent.join("staging/bundle/rqbit-tunnel"))
+                .expect("payload should be created below the physical staging directory"),
+            b"payload"
         );
     }
 

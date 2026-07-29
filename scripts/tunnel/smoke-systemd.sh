@@ -48,7 +48,8 @@ done
 (( EUID == 0 )) || die 'this smoke test must run as root in its disposable container'
 command -v systemctl >/dev/null 2>&1 || die 'systemd is unavailable'
 
-work=$(mktemp -d "${TMPDIR:-/tmp}/rqbit-tunnel-systemd-smoke.XXXXXX")
+# systemd-tmpfiles clears /tmp during PID 1 startup, which races this smoke test.
+work=$(mktemp -d /var/tmp/rqbit-tunnel-systemd-smoke.XXXXXX)
 for protected_path in "$INSTALL_ROOT" "$CONFIG_DIR" "$DATA_DIR" "$RUN_DIR" "/etc/systemd/system/$SERVICE_NAME"; do
     [[ ! -e "$protected_path" && ! -L "$protected_path" ]] ||
         die "refusing to overwrite existing managed path: $protected_path"

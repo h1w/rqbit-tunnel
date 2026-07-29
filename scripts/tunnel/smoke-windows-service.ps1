@@ -29,6 +29,19 @@ function Wait-ServiceState([string]$Expected) {
     throw "service did not reach $Expected state: $(& sc.exe query $serviceName 2>&1)"
 }
 
+function Describe-DirectorySecurity([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        return 'missing'
+    }
+    try {
+        $acl = Get-Acl -LiteralPath $Path
+        return "owner=$($acl.Owner); protected=$($acl.AreAccessRulesProtected); sddl=$($acl.Sddl)"
+    }
+    catch {
+        return "unavailable: $($_.Exception.Message)"
+    }
+}
+
 if ($Help) {
     Show-Usage
     exit 0
@@ -93,11 +106,10 @@ try {
     } | ConvertTo-Json -Compress
     $enrollmentPath = Join-Path $workspace 'smoke-client.rqbt'
     [IO.File]::WriteAllText($enrollmentPath, $enrollment, [Text.UTF8Encoding]::new($false))
-
-    $launcher = Join-Path $installRoot 'launcher.exe'
     & $launcher client import --bundle $enrollmentPath
     if ($LASTEXITCODE -ne 0) {
-        throw "client enrollment import exited with $LASTEXITCODE"
+        $dataRootSecurity = Describe-DirectorySecurity $dataRoot
+        throw "client enrollment import exited with $LASTEXITCODE; data root security: $dataRootSecurity"
     }
     & $launcher client service install
     if ($LASTEXITCODE -ne 0) {
