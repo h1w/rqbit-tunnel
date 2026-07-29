@@ -67,6 +67,17 @@ jobs:
             -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
             -v "$PWD:/workspace:ro" \
             rqbit-tunnel-systemd-smoke
+          # PID 1 can start before its system bus accepts service-manager commands.
+          for _ in $(seq 1 30); do
+            if docker exec "$container" systemctl show --property=Version --value >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          if ! docker exec "$container" systemctl show --property=Version --value >/dev/null; then
+            docker logs "$container"
+            exit 1
+          fi
           docker exec "$container" bash -lc '
             set -euo pipefail
             bash /workspace/scripts/tunnel/smoke-systemd.sh \
