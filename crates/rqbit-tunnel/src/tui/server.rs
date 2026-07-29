@@ -745,7 +745,12 @@ fn render_server(frame: &mut ratatui::Frame, state: &ServerTuiState) {
 }
 
 fn render_modal(frame: &mut ratatui::Frame, modal: &Modal) {
-    let area = centered_rect(70, 30, frame.area());
+    let height_percent = if matches!(modal, Modal::AddUser(_)) {
+        40
+    } else {
+        30
+    };
+    let area = centered_rect(70, height_percent, frame.area());
     let lines = match modal {
         Modal::ConfirmDelete(id) => vec![
             Line::from(format!("Delete user {id}?")),
@@ -824,12 +829,15 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use ratatui::{Terminal, backend::TestBackend};
+
     use crate::model::{ServerSnapshot, TrafficTotals, UserSnapshot};
 
     use super::{
-        Modal, ServerTuiState, TrafficRate, TuiAction, TuiError, apply_pending_reset_rates,
-        derive_rates, enqueue_terminal_event, footer_height, key_code_for_event,
-        rates_for_snapshot, require_terminal_io, terminal_event_channel,
+        AddUserField, AddUserForm, Modal, ServerTuiState, TrafficRate, TuiAction, TuiError,
+        apply_pending_reset_rates, derive_rates, enqueue_terminal_event, footer_height,
+        key_code_for_event, rates_for_snapshot, render_modal, require_terminal_io,
+        terminal_event_channel,
     };
 
     #[cfg(unix)]
@@ -891,6 +899,29 @@ mod tests {
         state.set_error("control socket unavailable");
 
         assert_eq!(footer_height(&state), 4);
+    }
+
+    #[test]
+    fn add_user_modal_keeps_export_guidance_and_controls_visible_on_standard_terminal() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let modal = Modal::AddUser(AddUserForm {
+            name: "alice".to_owned(),
+            export_path: "alice.rqbt".to_owned(),
+            field: AddUserField::Name,
+        });
+
+        let frame = terminal.draw(|frame| render_modal(frame, &modal)).unwrap();
+        let rendered = frame
+            .buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("A bare filename is stored"));
+        assert!(rendered.contains("enrollments."));
+        assert!(rendered.contains("Esc cancels."));
     }
 
     #[test]
