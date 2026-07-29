@@ -758,7 +758,8 @@ fn render_modal(frame: &mut ratatui::Frame, modal: &Modal) {
         Modal::AddUser(form) => vec![
             Line::from("Add user and create an enrollment bundle"),
             Line::from(format!("Name: {}", form.name)),
-            Line::from(format!("Export path: {}", form.export_path)),
+            Line::from(format!("Export file: {}", form.export_path)),
+            Line::from("A bare filename is stored in /var/lib/rqbit-tunnel/enrollments."),
             Line::from("Tab changes field; Enter reviews the unencrypted export; Esc cancels."),
         ],
         Modal::ConfirmExport(form) => vec![

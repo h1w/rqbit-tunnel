@@ -331,7 +331,7 @@ impl ServerRuntimeError {
             ),
             Self::EnrollmentExport { .. } | Self::EnrollmentRollback { .. } => (
                 "bundle_export_failed",
-                "Choose a writable regular-file destination and retry the user creation.",
+                "Use a regular file visible to the service; the installed server can write enrollment bundles below /var/lib/rqbit-tunnel/enrollments.",
             ),
             Self::Config(_) => (
                 "configuration_error",
@@ -861,6 +861,7 @@ impl ManagedServerInner {
         name: String,
         export_path: PathBuf,
     ) -> Result<ServerResponse, ServerRuntimeError> {
+        let export_path = resolve_enrollment_export_path(&self.paths, export_path);
         let created = self.registry.create_user(name).await?;
         let user_id = created.user.id;
         let snapshot = self.registry.snapshot(user_id).await?;
@@ -1081,6 +1082,18 @@ async fn persist_server_config(
             source,
         })??;
     Ok(outcome)
+}
+
+fn resolve_enrollment_export_path(paths: &ServerPaths, export_path: PathBuf) -> PathBuf {
+    if export_path.is_relative()
+        && export_path
+            .parent()
+            .is_some_and(|parent| parent.as_os_str().is_empty())
+    {
+        paths.enrollment_dir().join(export_path)
+    } else {
+        export_path
+    }
 }
 
 async fn write_enrollment_bundle(
@@ -1536,7 +1549,7 @@ mod tests {
     use std::{
         net::SocketAddr,
         os::unix::fs::{FileTypeExt, OpenOptionsExt},
-        path::Path,
+        path::{Path, PathBuf},
         process::Command,
         sync::Arc,
         time::Duration,
@@ -1639,6 +1652,33 @@ mod tests {
         assert!(!paths.control_socket_path().exists());
     }
 
+    #[tokio::test]
+    async fn add_user_writes_a_bare_bundle_filename_to_managed_enrollments() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = test_paths(directory.path());
+        write_test_server_material(&paths).await;
+        let enrollment_dir = paths.enrollment_dir();
+        std::fs::create_dir_all(&enrollment_dir).unwrap();
+        let server = start_test_server(paths.clone()).await.unwrap();
+        let export_path = PathBuf::from("alice.rqbt");
+
+        let response = request(
+            &paths,
+            ServerRequest::AddUser {
+                name: "alice".to_owned(),
+                export_path,
+            },
+        )
+        .await;
+
+        assert!(matches!(response, ServerResponse::User(_)));
+        let bundle: EnrollmentBundle =
+            serde_json::from_slice(&std::fs::read(enrollment_dir.join("alice.rqbt")).unwrap())
+                .unwrap();
+        assert_eq!(bundle.user_name, "alice");
+
+        server.shutdown().await.unwrap();
+    }
     #[tokio::test]
     async fn add_user_bundle_uses_the_configured_advertised_peer() {
         let directory = tempfile::tempdir().unwrap();

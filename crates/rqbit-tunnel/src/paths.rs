@@ -58,6 +58,9 @@ impl ServerPaths {
     pub fn carrier_root(&self) -> PathBuf {
         self.data_dir.join("carrier")
     }
+    pub fn enrollment_dir(&self) -> PathBuf {
+        self.data_dir.join("enrollments")
+    }
 
     pub fn dht_state_path(&self) -> PathBuf {
         self.data_dir.join("dht.json")
@@ -255,6 +258,10 @@ mod tests {
         assert_eq!(
             paths.carrier_root(),
             root.join("var/lib/rqbit-tunnel/carrier")
+        );
+        assert_eq!(
+            paths.enrollment_dir(),
+            root.join("var/lib/rqbit-tunnel/enrollments")
         );
         assert_eq!(
             paths.dht_state_path(),
