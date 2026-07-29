@@ -320,12 +320,13 @@ mod tests {
 
     #[test]
     fn tray_invocation_selects_the_dedicated_tray_payload() {
-        assert_eq!(
-            tray_payload_path(Path::new(
-                "/opt/rqbit-tunnel/releases/1.2.3/payload/rqbit-tunnel"
-            )),
-            Path::new("/opt/rqbit-tunnel/releases/1.2.3/payload/rqbit-tunnel-tray")
-        );
+        let payload = Path::new("/opt/rqbit-tunnel/releases/1.2.3/payload/rqbit-tunnel");
+        let expected = payload.with_file_name(format!(
+            "rqbit-tunnel-tray{}",
+            rqbit_tunnel::version::current_exe_suffix()
+        ));
+
+        assert_eq!(tray_payload_path(payload), expected);
     }
 
     #[test]
