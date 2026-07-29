@@ -67,6 +67,13 @@ jobs:
             -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
             -v "$PWD:/workspace:ro" \
             rqbit-tunnel-systemd-smoke
+          dump_systemd_state() {
+            docker inspect "$container" --format 'status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}' || true
+            docker exec "$container" cat /proc/1/cgroup || true
+            docker exec "$container" systemctl --no-pager --full status || true
+            docker exec "$container" journalctl --no-pager --no-hostname -b || true
+            docker logs "$container" || true
+          }
           # PID 1 can start before its system bus accepts service-manager commands.
           for _ in $(seq 1 30); do
             if docker exec "$container" systemctl show --property=Version --value >/dev/null 2>&1; then
@@ -75,7 +82,7 @@ jobs:
             sleep 1
           done
           if ! docker exec "$container" systemctl show --property=Version --value >/dev/null; then
-            docker logs "$container"
+            dump_systemd_state
             exit 1
           fi
           docker exec "$container" bash -lc '
@@ -83,7 +90,7 @@ jobs:
             bash /workspace/scripts/tunnel/smoke-systemd.sh \
               --bundle /workspace/rqbit-tunnel-x86_64-unknown-linux-gnu.tar.gz
           ' || {
-            docker logs "$container"
+            dump_systemd_state
             exit 1
           }
 
