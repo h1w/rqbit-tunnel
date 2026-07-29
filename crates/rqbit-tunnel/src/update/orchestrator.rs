@@ -1336,15 +1336,18 @@ mod tests {
             .await
             .expect_err("archive without the updater must not activate");
 
-        assert!(matches!(
-            error,
-            UpdateError::MissingClientPayloadComponent { component }
-                if component
-                    == format!(
-                        "rqbit-tunnel-updater{}",
-                        crate::version::current_exe_suffix()
-                    )
-        ));
+        assert!(
+            matches!(
+                error,
+                UpdateError::MissingClientPayloadComponent { ref component }
+                    if component.as_str()
+                        == format!(
+                            "rqbit-tunnel-updater{}",
+                            crate::version::current_exe_suffix()
+                        ).as_str()
+            ),
+            "expected an updater-missing error, received {error:?}"
+        );
         assert!(service.calls.lock().is_empty());
         assert_eq!(
             read_active_release(root.path()).unwrap().version(),
@@ -1365,15 +1368,18 @@ mod tests {
             .await
             .expect_err("archive without the tray companion must not activate");
 
-        assert!(matches!(
-            error,
-            UpdateError::MissingClientPayloadComponent { component }
-                if component
-                    == format!(
-                        "rqbit-tunnel-tray{}",
-                        crate::version::current_exe_suffix()
-                    )
-        ));
+        assert!(
+            matches!(
+                error,
+                UpdateError::MissingClientPayloadComponent { ref component }
+                    if component.as_str()
+                        == format!(
+                            "rqbit-tunnel-tray{}",
+                            crate::version::current_exe_suffix()
+                        ).as_str()
+            ),
+            "expected a tray-missing error, received {error:?}"
+        );
         assert!(service.calls.lock().is_empty());
         assert_eq!(
             read_active_release(root.path()).unwrap().version(),
