@@ -94,30 +94,31 @@ cat >"$CONFIG_DIR/client.json" <<'EOF'
 EOF
 chmod 0644 "$CONFIG_DIR/client.json"
 
+command -v setpriv >/dev/null 2>&1 || die 'setpriv is required to exercise desktop status access'
+status_json=''
+desktop_status_json=''
+client_ready=false
 systemctl daemon-reload
 systemctl enable --now "$SERVICE_NAME"
 for _ in $(seq 1 30); do
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         status_json=$("$INSTALL_ROOT/launcher" client service status --json 2>/dev/null || true)
         if [[ "$status_json" == *'"service":"running"'* ]]; then
-            break
+            desktop_status_json=$(setpriv --reuid=1000 --regid=1000 --clear-groups \
+                "$INSTALL_ROOT/launcher" client service status --json 2>/dev/null || true)
+            if [[ "$desktop_status_json" == *'"service":"running"'* ]]; then
+                client_ready=true
+                break
+            fi
         fi
     fi
     sleep 1
 done
 
-systemctl is-active --quiet "$SERVICE_NAME" || {
+if [[ "$client_ready" != true ]]; then
     systemctl --no-pager --full status "$SERVICE_NAME" >&2 || true
-    die 'client service did not become active'
-}
-status_json=$("$INSTALL_ROOT/launcher" client service status --json)
-[[ "$status_json" == *'"service":"running"'* ]] || die "client status was not running: $status_json"
-
-command -v setpriv >/dev/null 2>&1 || die 'setpriv is required to exercise desktop status access'
-desktop_status_json=$(setpriv --reuid=1000 --regid=1000 --clear-groups \
-    "$INSTALL_ROOT/launcher" client service status --json)
-[[ "$desktop_status_json" == *'"service":"running"'* ]] ||
-    die "desktop client status was not running: $desktop_status_json"
+    die "client service did not report a running local status: root=$status_json desktop=$desktop_status_json"
+fi
 
 first_main_pid=$(systemctl show --property=MainPID --value "$SERVICE_NAME")
 [[ "$first_main_pid" =~ ^[1-9][0-9]*$ ]] || die "client service has no main PID: $first_main_pid"
