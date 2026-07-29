@@ -2558,7 +2558,7 @@ fn create_new_windows_output_file(path: &Path) -> Result<File, UpdateError> {
 fn open_windows_output_file_for_read(path: &Path) -> Result<File, UpdateError> {
     use windows::{
         Win32::{
-            Foundation::{GENERIC_READ, HANDLE},
+            Foundation::{GENERIC_READ, GetLastError, HANDLE},
             Storage::FileSystem::{
                 BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
                 FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
@@ -2581,9 +2581,12 @@ fn open_windows_output_file_for_read(path: &Path) -> Result<File, UpdateError> {
             None,
         )
     }
-    .map_err(|source| UpdateError::InspectExtractionPath {
-        path: path.to_path_buf(),
-        source: io::Error::other(source),
+    .map_err(|_| {
+        let error = unsafe { GetLastError() };
+        UpdateError::InspectExtractionPath {
+            path: path.to_path_buf(),
+            source: io::Error::from_raw_os_error(error.0 as i32),
+        }
     })?;
     let file = own_windows_file(handle);
     let mut information = BY_HANDLE_FILE_INFORMATION::default();
