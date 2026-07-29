@@ -90,7 +90,7 @@ try {
     }
     $firstVersion = [IO.File]::ReadAllText($firstVersionPath) -replace '\r?\n$', ''
 
-    & $installer -SkipService
+    & $installer
     if (-not $?) {
         throw 'client bootstrap failed'
     }
