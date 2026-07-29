@@ -106,6 +106,7 @@ try {
     } | ConvertTo-Json -Compress
     $enrollmentPath = Join-Path $workspace 'smoke-client.rqbt'
     [IO.File]::WriteAllText($enrollmentPath, $enrollment, [Text.UTF8Encoding]::new($false))
+    $launcher = Join-Path $installRoot 'launcher.exe'
     & $launcher client import --bundle $enrollmentPath
     if ($LASTEXITCODE -ne 0) {
         $dataRootSecurity = Describe-DirectorySecurity $dataRoot
