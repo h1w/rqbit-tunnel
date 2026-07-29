@@ -227,7 +227,7 @@ where
 fn client_pipe_sddl(owner_sid: &str) -> Result<String, WindowsClientControlError> {
     validate_sid_text(owner_sid)?;
     Ok(format!(
-        "O:{owner_sid}D:P(A;;GRGW;;;SY)(A;;GRGW;;;BA)(A;;GRGW;;;{owner_sid})"
+        "O:SYD:P(A;;GRGW;;;SY)(A;;GRGW;;;BA)(A;;GRGW;;;{owner_sid})"
     ))
 }
 
@@ -433,10 +433,10 @@ mod tests {
     }
 
     #[test]
-    fn client_pipe_security_grants_read_write_only_to_system_administrators_and_owner() {
+    fn client_pipe_security_is_system_owned_and_grants_read_write_only_to_authorized_sids() {
         let descriptor = client_pipe_sddl(OWNER_SID).unwrap();
 
-        assert!(descriptor.starts_with(&format!("O:{OWNER_SID}D:P")));
+        assert!(descriptor.starts_with("O:SYD:P"));
         assert!(descriptor.contains("(A;;GRGW;;;SY)"));
         assert!(descriptor.contains("(A;;GRGW;;;BA)"));
         assert!(descriptor.contains(&format!("(A;;GRGW;;;{OWNER_SID})")));

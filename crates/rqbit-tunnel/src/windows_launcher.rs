@@ -26,11 +26,9 @@ pub(crate) fn client_payload_host_arguments(
 mod service_host {
     use std::{
         ffi::{OsStr, OsString},
-        fs,
-        io::{self, Write},
-        iter,
+        io, iter,
         os::windows::{ffi::OsStrExt, io::AsRawHandle},
-        path::{Path, PathBuf},
+        path::PathBuf,
         process::{Child, Command, ExitStatus},
         time::{Duration, Instant},
     };
@@ -173,25 +171,7 @@ mod service_host {
     fn client_service_main(_arguments: Vec<OsString>) {
         if let Err(error) = run_client_service() {
             tracing::error!(error = %error, "managed Windows client service stopped with an error");
-            append_service_diagnostic(&error);
         }
-    }
-
-    fn service_diagnostic_path() -> PathBuf {
-        ClientPaths::system()
-            .data_dir
-            .join("service-host-diagnostic.log")
-    }
-
-    fn append_service_diagnostic(error: &WindowsClientServiceLauncherError) {
-        let result = (|| {
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(service_diagnostic_path())?;
-            writeln!(file, "{error}")
-        })();
-        let _ = result;
     }
 
     fn run_client_service() -> Result<(), WindowsClientServiceLauncherError> {
@@ -230,13 +210,12 @@ mod service_host {
                 WindowsClientServiceLauncherError::RelativeSystemConfigPath { path: config_path },
             );
         }
-        let diagnostics = service_diagnostic_path();
         let arguments = super::client_payload_host_arguments(
             &config_path,
             &events.ready_name,
             &events.stop_name,
         );
-        let mut worker = WorkerProcess::spawn(payload, arguments, &diagnostics)?;
+        let mut worker = WorkerProcess::spawn(payload, arguments)?;
 
         match wait_for_worker_start(events, &mut worker, start_pending)? {
             WorkerStartup::Ready => {
@@ -477,7 +456,6 @@ mod service_host {
         fn spawn(
             payload: PathBuf,
             arguments: Vec<OsString>,
-            diagnostics: &Path,
         ) -> Result<Self, WindowsClientServiceLauncherError> {
             let job = JobObject::create()?;
             let working_directory = payload.parent().map(PathBuf::from).ok_or_else(|| {
@@ -485,23 +463,14 @@ mod service_host {
                     payload: payload.clone(),
                 }
             })?;
-            let diagnostic_output = fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(diagnostics)
-                .ok();
-            let mut command = Command::new(&payload);
-            command.args(arguments).current_dir(working_directory);
-            if let Some(diagnostic_output) = diagnostic_output {
-                command.stderr(diagnostic_output);
-            }
-            let child = command.spawn().map_err(|source| {
-                WindowsClientServiceLauncherError::SpawnWorker {
+            let child = Command::new(&payload)
+                .args(arguments)
+                .current_dir(working_directory)
+                .spawn()
+                .map_err(|source| WindowsClientServiceLauncherError::SpawnWorker {
                     payload: payload.clone(),
                     source,
-                }
-            })?;
+                })?;
             let worker = Self {
                 child,
                 job,

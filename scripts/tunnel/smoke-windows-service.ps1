@@ -42,14 +42,6 @@ function Describe-DirectorySecurity([string]$Path) {
     }
 }
 
-function Read-ServiceDiagnostic {
-    $diagnostic = Join-Path $dataRoot 'service-host-diagnostic.log'
-    if (Test-RegularFile $diagnostic) {
-        return [IO.File]::ReadAllText($diagnostic)
-    }
-    return 'unavailable'
-}
-
 if ($Help) {
     Show-Usage
     exit 0
@@ -134,7 +126,7 @@ try {
     }
     & $launcher client service start
     if ($LASTEXITCODE -ne 0) {
-        throw "client service start exited with $LASTEXITCODE; diagnostic: $(Read-ServiceDiagnostic)"
+        throw "client service start exited with $LASTEXITCODE"
     }
 
     Wait-ServiceState 'RUNNING'
