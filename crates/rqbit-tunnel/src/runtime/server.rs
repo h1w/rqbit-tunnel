@@ -20,8 +20,9 @@ use std::{
 };
 
 use librqbit::{
-    EgressPolicy, Session, SessionOptions, TunnelOptions, TunnelPrivateKey, TunnelPublicKey,
-    TunnelServerAuthorizer, TunnelServerOptions, tunnel_public_key,
+    DhtSessionConfig, EgressPolicy, Session, SessionOptions, TunnelOptions, TunnelPrivateKey,
+    TunnelPublicKey, TunnelServerAuthorizer, TunnelServerOptions, dht::DhtPersistenceConfig,
+    tunnel_public_key,
 };
 use thiserror::Error;
 #[cfg(test)]
@@ -547,6 +548,13 @@ impl ManagedServer {
         let session = match Session::new_with_opts(
             paths.data_dir.clone(),
             SessionOptions {
+                dht: Some(DhtSessionConfig {
+                    persistence: Some(DhtPersistenceConfig {
+                        config_filename: Some(paths.dht_state_path()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
                 disable_trackers: true,
                 persistence: None,
                 listen: None,
@@ -1529,6 +1537,7 @@ mod tests {
         net::SocketAddr,
         os::unix::fs::{FileTypeExt, OpenOptionsExt},
         path::Path,
+        process::Command,
         sync::Arc,
         time::Duration,
     };
@@ -1868,6 +1877,38 @@ mod tests {
         assert!(
             format!("{error:#}").contains("Address already in use"),
             "server startup must retain the listener failure: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_server_keeps_dht_persistence_under_its_state_root() {
+        const CHILD_ENV: &str = "RQBIT_TUNNEL_TEST_MANAGED_DHT_CHILD";
+        const TEST_NAME: &str =
+            "runtime::server::tests::managed_server_keeps_dht_persistence_under_its_state_root";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let directory = tempfile::tempdir().unwrap();
+            let paths = test_paths(directory.path());
+            write_test_server_material(&paths).await;
+            let server = start_test_server(paths)
+                .await
+                .expect("managed server must not use the OS DHT cache");
+            server.shutdown().await.unwrap();
+            return;
+        }
+
+        let output = Command::new(std::env::current_exe().expect("locate current test binary"))
+            .args(["--exact", TEST_NAME])
+            .env(CHILD_ENV, "1")
+            .env("XDG_CACHE_HOME", "/dev/null")
+            .output()
+            .expect("run managed DHT child test");
+
+        assert!(
+            output.status.success(),
+            "managed server must start despite an unusable OS DHT cache:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
     }
 
