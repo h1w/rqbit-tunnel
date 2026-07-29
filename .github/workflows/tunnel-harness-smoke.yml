@@ -74,14 +74,20 @@ jobs:
             docker exec "$container" journalctl --no-pager --no-hostname -b || true
             docker logs "$container" || true
           }
-          # PID 1 can start before its system bus accepts service-manager commands.
+          # PID 1 exposes a system bus before its service manager is reliably reachable.
+          ready_probes=0
           for _ in $(seq 1 30); do
             if docker exec "$container" systemctl show --property=Version --value >/dev/null 2>&1; then
-              break
+              ((ready_probes += 1))
+              if (( ready_probes == 3 )); then
+                break
+              fi
+            else
+              ready_probes=0
             fi
             sleep 1
           done
-          if ! docker exec "$container" systemctl show --property=Version --value >/dev/null; then
+          if (( ready_probes < 3 )); then
             dump_systemd_state
             exit 1
           fi
