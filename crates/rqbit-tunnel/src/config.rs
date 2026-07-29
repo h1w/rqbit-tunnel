@@ -691,7 +691,7 @@ fn create_or_verify_windows_directory(path: &Path) -> Result<(), ConfigError> {
     }
 
     fn security_descriptor(path: &Path) -> Result<PSECURITY_DESCRIPTOR, ConfigError> {
-        let text = "O:BAD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
+        let text = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
         let wide: Vec<u16> = text.encode_utf16().chain(iter::once(0)).collect();
         unsafe {
             let mut descriptor = PSECURITY_DESCRIPTOR::default();
