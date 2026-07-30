@@ -655,8 +655,9 @@ No Rust production source changes are needed. `crates/rqbit-tunnel/src/tray/agen
 
   When importing an enrollment bundle, press Enter at the path prompt if the
   extracted bundle folder contains exactly one regular `*.rqbt` file. The menu
-  names and imports that file automatically. With no bundle or multiple bundles,
-  it prints the discovered state and requires an explicit path; it never guesses.
+  names and imports that file automatically, then installs the client service,
+  enables its autostart, and starts it. With no bundle or multiple bundles, it
+  prints the discovered state and requires an explicit path; it never guesses.
   ```
 
 - [ ] **Step 2: Run local PowerShell contract coverage.**
