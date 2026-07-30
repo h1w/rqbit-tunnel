@@ -209,8 +209,10 @@ Closing it ends that elevated session, so the next launch asks once again.
 
 When importing an enrollment bundle, press Enter at the path prompt if the
 extracted bundle folder contains exactly one regular `*.rqbt` file. The menu
-names and imports that file automatically. With no bundle or multiple bundles,
-it prints the discovered state and requires an explicit path; it never guesses.
+names and imports that file automatically. After a successful import, it installs
+the service definition, enables autostart, and starts the service. With no bundle
+or multiple bundles, it prints the discovered state and requires an explicit path;
+it never guesses.
 
 ### Tray status (Linux and Windows)
 
