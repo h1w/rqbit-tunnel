@@ -1,61 +1,69 @@
 # Interactive control menu for the managed rqbit tunnel client.
 param(
     [switch]$SelfTest,
-    [switch]$OpenDashboard
+    [switch]$OpenDashboard,
+    [switch]$ElevatedMenu,
+    [string]$StatusOwnerSid
 )
 
 $ErrorActionPreference = "Stop"
 
-function New-ElevatedClientEncodedCommand {
+function New-ElevatedMenuEncodedCommand {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Executable,
+        [string]$ScriptPath,
         [Parameter(Mandatory = $true)]
-        [string[]]$ClientArguments,
-        [Parameter(Mandatory = $true)]
-        [string]$StatusOwnerSid
+        [string]$StatusOwnerSid,
+        [switch]$OpenDashboard
     )
 
     $payload = [pscustomobject]@{
-        executable = [string]$Executable
-        arguments = [string[]]$ClientArguments
+        script_path = [string]$ScriptPath
         status_owner_sid = [string]$StatusOwnerSid
+        open_dashboard = [bool]$OpenDashboard
     }
     $payloadJson = ConvertTo-Json -InputObject $payload -Compress
     $payloadBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payloadJson))
     $decoder = [string]::Join(
         [Environment]::NewLine,
         @(
-            '$payloadJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(''__RQBIT_CLIENT_PAYLOAD__''))',
+            '$payloadJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(''__RQBIT_MENU_PAYLOAD__''))',
             '$payload = $payloadJson | ConvertFrom-Json',
+            'if ([string]::IsNullOrWhiteSpace([string]$payload.script_path)) { throw ''missing client control script path'' }',
             'if ([string]::IsNullOrWhiteSpace([string]$payload.status_owner_sid)) { throw ''missing desktop status owner SID'' }',
-            '$env:RQBIT_TUNNEL_STATUS_OWNER_SID = [string]$payload.status_owner_sid',
-            '& $payload.executable @([string[]]$payload.arguments)',
+            '$scriptArguments = @{',
+            '    ElevatedMenu = $true',
+            '    StatusOwnerSid = [string]$payload.status_owner_sid',
+            '}',
+            'if ([bool]$payload.open_dashboard) {',
+            '    $scriptArguments.OpenDashboard = $true',
+            '}',
+            '& ([string]$payload.script_path) @scriptArguments',
             'exit $LASTEXITCODE'
         )
-    ).Replace('__RQBIT_CLIENT_PAYLOAD__', $payloadBase64)
+    ).Replace('__RQBIT_MENU_PAYLOAD__', $payloadBase64)
     return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($decoder))
 }
 
-function New-ElevatedClientStartProcessArguments {
+function New-ElevatedMenuStartProcessArguments {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Executable,
+        [string]$ScriptPath,
         [Parameter(Mandatory = $true)]
-        [string[]]$ClientArguments,
-        [Parameter(Mandatory = $true)]
-        [string]$StatusOwnerSid
+        [string]$StatusOwnerSid,
+        [switch]$OpenDashboard
     )
 
     return @(
         '-NoProfile',
-        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
         '-EncodedCommand',
-        (New-ElevatedClientEncodedCommand -Executable $Executable -ClientArguments $ClientArguments -StatusOwnerSid $StatusOwnerSid)
+        (New-ElevatedMenuEncodedCommand -ScriptPath $ScriptPath -StatusOwnerSid $StatusOwnerSid -OpenDashboard:$OpenDashboard)
     )
 }
 
-function Read-ElevatedClientEncodedPayload {
+function Read-ElevatedMenuEncodedPayload {
     param(
         [Parameter(Mandatory = $true)]
         [string]$EncodedCommand
@@ -64,66 +72,61 @@ function Read-ElevatedClientEncodedPayload {
     $decoder = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($EncodedCommand))
     $match = [regex]::Match($decoder, "FromBase64String\('(?<payload>[A-Za-z0-9+/=]+)'\)")
     if (-not $match.Success) {
-        throw "encoded elevation command does not contain a base64 JSON payload"
+        throw "encoded menu elevation command does not contain a base64 JSON payload"
     }
     $payloadJson = [Text.Encoding]::UTF8.GetString(
         [Convert]::FromBase64String($match.Groups['payload'].Value)
     )
     return $payloadJson | ConvertFrom-Json
 }
-function New-ElevatedInstallerEncodedCommand {
+
+function Get-ClientMenuLaunchMode {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Installer
+        [bool]$Administrator,
+        [Parameter(Mandatory = $true)]
+        [bool]$ElevatedMenu
     )
 
-    $payload = [pscustomobject]@{
-        executable = [string]$Installer
-        arguments = [string[]]@()
+    if ($ElevatedMenu -and -not $Administrator) {
+        return 'reject'
     }
-    $payloadJson = ConvertTo-Json -InputObject $payload -Compress
-    $payloadBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payloadJson))
-    $decoder = [string]::Join(
-        [Environment]::NewLine,
-        @(
-            '$payloadJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(''__RQBIT_INSTALLER_PAYLOAD__''))',
-            '$payload = $payloadJson | ConvertFrom-Json',
-            '& $payload.executable @([string[]]$payload.arguments)',
-            'exit $LASTEXITCODE'
-        )
-    ).Replace('__RQBIT_INSTALLER_PAYLOAD__', $payloadBase64)
-    return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($decoder))
+    if ($Administrator) {
+        return 'run'
+    }
+    return 'elevate'
 }
 
-function New-ElevatedInstallerStartProcessArguments {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Installer
-    )
-
-    return @(
-        '-NoProfile',
-        '-NonInteractive',
-        '-EncodedCommand',
-        (New-ElevatedInstallerEncodedCommand -Installer $Installer)
-    )
+function Get-CurrentUserSid {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $sid = $identity.User
+    }
+    catch {
+        throw "could not determine the current user SID: $($_.Exception.Message)"
+    }
+    if ($null -eq $sid -or [string]::IsNullOrWhiteSpace($sid.Value)) {
+        throw 'could not determine the current user SID'
+    }
+    return $sid.Value
 }
 
-function Read-ElevatedInstallerEncodedPayload {
+function ConvertTo-StatusOwnerSid {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$EncodedCommand
+        [string]$Value
     )
 
-    $decoder = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($EncodedCommand))
-    $match = [regex]::Match($decoder, "FromBase64String\('(?<payload>[A-Za-z0-9+/=]+)'\)")
-    if (-not $match.Success) {
-        throw "encoded installer elevation command does not contain a base64 JSON payload"
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        throw 'status owner SID must not be empty'
     }
-    $payloadJson = [Text.Encoding]::UTF8.GetString(
-        [Convert]::FromBase64String($match.Groups['payload'].Value)
-    )
-    return $payloadJson | ConvertFrom-Json
+    try {
+        $sid = [Security.Principal.SecurityIdentifier]::new($Value)
+    }
+    catch {
+        throw "invalid status owner SID '$Value': $($_.Exception.Message)"
+    }
+    return $sid.Value
 }
 
 function Get-ElevatedPowerShellHost {
@@ -134,17 +137,21 @@ function Get-ElevatedPowerShellHost {
     return $hostPath
 }
 
+function Test-Administrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 function Get-ClientTuiMenuAction {
     return [pscustomobject]@{
         ClientArguments = @("client", "tui")
-        Protected = $true
     }
 }
 
 function Get-ClientConfigShowMenuAction {
     return [pscustomobject]@{
         ClientArguments = @("client", "config", "show")
-        Protected = $true
     }
 }
 
@@ -250,11 +257,45 @@ param(
     }
     exit 0
 }
-function Test-Administrator {
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
-    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+$scriptPath = $MyInvocation.MyCommand.Path
+if ([string]::IsNullOrWhiteSpace($scriptPath)) {
+    throw 'could not resolve the client control script path'
 }
+
+$launchMode = Get-ClientMenuLaunchMode `
+    -Administrator:(Test-Administrator) `
+    -ElevatedMenu:$ElevatedMenu
+if ($launchMode -eq 'reject') {
+    throw 'client control received -ElevatedMenu without administrator privileges'
+}
+if ($launchMode -eq 'elevate') {
+    $desktopSid = Get-CurrentUserSid
+    $arguments = New-ElevatedMenuStartProcessArguments `
+        -ScriptPath $scriptPath `
+        -StatusOwnerSid $desktopSid `
+        -OpenDashboard:$OpenDashboard
+    try {
+        $process = Start-Process `
+            -FilePath (Get-ElevatedPowerShellHost) `
+            -Verb RunAs `
+            -ArgumentList $arguments `
+            -Wait `
+            -PassThru
+    }
+    catch {
+        throw "could not open the elevated client control console: $($_.Exception.Message)"
+    }
+    if ($process.ExitCode -ne 0) {
+        throw "elevated client control console exited with $($process.ExitCode)"
+    }
+    exit 0
+}
+
+if ([string]::IsNullOrWhiteSpace($StatusOwnerSid)) {
+    $StatusOwnerSid = Get-CurrentUserSid
+}
+$env:RQBIT_TUNNEL_STATUS_OWNER_SID = ConvertTo-StatusOwnerSid -Value $StatusOwnerSid
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $managedRoot = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'rqbit-tunnel'
@@ -268,18 +309,9 @@ else {
     $releaseVersion = Join-Path $here 'release-version.txt'
     if ((Test-Path -LiteralPath $installer -PathType Leaf) -and (Test-Path -LiteralPath $releaseVersion -PathType Leaf)) {
         Write-Host 'Installing the managed client release from this bundle...'
-        if (Test-Administrator) {
-            & $installer
-            if (-not $?) {
-                throw 'client bootstrap failed'
-            }
-        }
-        else {
-            $elevatedHost = Get-ElevatedPowerShellHost
-            $process = Start-Process -FilePath $elevatedHost -Verb RunAs -ArgumentList (New-ElevatedInstallerStartProcessArguments -Installer $installer) -Wait -PassThru
-            if ($process.ExitCode -ne 0) {
-                throw "elevated client bootstrap exited with $($process.ExitCode)"
-            }
+        & $installer
+        if (-not $?) {
+            throw 'client bootstrap failed'
         }
         if (-not (Test-Path -LiteralPath $managedLauncher -PathType Leaf)) {
             throw "client bootstrap did not install $managedLauncher"
@@ -301,24 +333,8 @@ else {
 function Invoke-ClientCommand {
     param(
         [Parameter(Mandatory = $true)]
-        [string[]]$ClientArguments,
-        [switch]$Protected
+        [string[]]$ClientArguments
     )
-
-    if ($Protected -and -not (Test-Administrator)) {
-        $desktopSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
-        if ($null -eq $desktopSid -or [string]::IsNullOrWhiteSpace($desktopSid.Value)) {
-            throw "could not determine the desktop status owner SID before elevation"
-        }
-        $elevationArguments = New-ElevatedClientStartProcessArguments -Executable $bin -ClientArguments $ClientArguments -StatusOwnerSid $desktopSid.Value
-        $elevatedHost = Get-ElevatedPowerShellHost
-        # The only Start-Process arguments are fixed flags and one base64 token.
-        $process = Start-Process -FilePath $elevatedHost -Verb RunAs -ArgumentList $elevationArguments -Wait -PassThru
-        if ($process.ExitCode -ne 0) {
-            throw "Elevated rqbit-tunnel command exited with $($process.ExitCode)"
-        }
-        return
-    }
 
     & $bin @ClientArguments
     if ($LASTEXITCODE -ne 0) {
@@ -328,7 +344,7 @@ function Invoke-ClientCommand {
 
 if ($OpenDashboard) {
     $tuiAction = Get-ClientTuiMenuAction
-    Invoke-ClientCommand -ClientArguments $tuiAction.ClientArguments -Protected:$tuiAction.Protected
+    Invoke-ClientCommand -ClientArguments $tuiAction.ClientArguments
     exit 0
 }
 
@@ -336,12 +352,11 @@ function Invoke-MenuCommand {
     param(
         [Parameter(Mandatory = $true)]
         [string[]]$ClientArguments,
-        [switch]$Protected,
         [switch]$PassThru
     )
 
     try {
-        Invoke-ClientCommand -ClientArguments $ClientArguments -Protected:$Protected
+        Invoke-ClientCommand -ClientArguments $ClientArguments
         if ($PassThru) {
             return $true
         }
@@ -382,7 +397,7 @@ function Set-ClientConfiguration {
         Write-Host "No configuration changes selected"
         return
     }
-    Invoke-MenuCommand -ClientArguments $configArguments -Protected
+    Invoke-MenuCommand -ClientArguments $configArguments
 }
 
 function Invoke-ServiceMenu {
@@ -395,12 +410,12 @@ function Invoke-ServiceMenu {
     Write-Host "  6) disable autostart"
     $selection = Read-Host "Select service action"
     switch ($selection) {
-        "1" { Invoke-MenuCommand -ClientArguments @("client", "service", "install") -Protected }
-        "2" { Invoke-MenuCommand -ClientArguments @("client", "service", "start") -Protected }
-        "3" { Invoke-MenuCommand -ClientArguments @("client", "service", "stop") -Protected }
-        "4" { Invoke-MenuCommand -ClientArguments @("client", "service", "restart") -Protected }
-        "5" { Invoke-MenuCommand -ClientArguments @("client", "service", "enable-autostart") -Protected }
-        "6" { Invoke-MenuCommand -ClientArguments @("client", "service", "disable-autostart") -Protected }
+        "1" { Invoke-MenuCommand -ClientArguments @("client", "service", "install") }
+        "2" { Invoke-MenuCommand -ClientArguments @("client", "service", "start") }
+        "3" { Invoke-MenuCommand -ClientArguments @("client", "service", "stop") }
+        "4" { Invoke-MenuCommand -ClientArguments @("client", "service", "restart") }
+        "5" { Invoke-MenuCommand -ClientArguments @("client", "service", "enable-autostart") }
+        "6" { Invoke-MenuCommand -ClientArguments @("client", "service", "disable-autostart") }
         default { Write-Host "Unknown service action" -ForegroundColor Red }
     }
 }
@@ -420,22 +435,22 @@ while ($true) {
     switch ($selection) {
         "1" {
             $tuiAction = Get-ClientTuiMenuAction
-            Invoke-MenuCommand -ClientArguments $tuiAction.ClientArguments -Protected:$tuiAction.Protected
+            Invoke-MenuCommand -ClientArguments $tuiAction.ClientArguments
         }
         "2" {
             $bundle = Read-Host "Enrollment bundle path"
             if (-not [string]::IsNullOrWhiteSpace($bundle) -and
-                (Invoke-MenuCommand -ClientArguments @("client", "import", "--bundle", $bundle) -Protected -PassThru)) {
-                if (Invoke-MenuCommand -ClientArguments @("client", "service", "install") -Protected -PassThru) {
-                    if (Invoke-MenuCommand -ClientArguments @("client", "service", "enable-autostart") -Protected -PassThru) {
-                        Invoke-MenuCommand -ClientArguments @("client", "service", "start") -Protected | Out-Null
+                (Invoke-MenuCommand -ClientArguments @("client", "import", "--bundle", $bundle) -PassThru)) {
+                if (Invoke-MenuCommand -ClientArguments @("client", "service", "install") -PassThru) {
+                    if (Invoke-MenuCommand -ClientArguments @("client", "service", "enable-autostart") -PassThru) {
+                        Invoke-MenuCommand -ClientArguments @("client", "service", "start") | Out-Null
                     }
                 }
             }
         }
         "3" {
             $configShowAction = Get-ClientConfigShowMenuAction
-            Invoke-MenuCommand -ClientArguments $configShowAction.ClientArguments -Protected:$configShowAction.Protected
+            Invoke-MenuCommand -ClientArguments $configShowAction.ClientArguments
         }
         "4" { Set-ClientConfiguration }
         "5" { Invoke-ServiceMenu }
