@@ -293,10 +293,11 @@ function Invoke-MenuCommand {
     )
 
     try {
-        Invoke-ClientCommand -ClientArguments $ClientArguments
         if ($PassThru) {
+            Invoke-ClientCommand -ClientArguments $ClientArguments | Out-Host
             return $true
         }
+        Invoke-ClientCommand -ClientArguments $ClientArguments
     }
     catch {
         Write-Host "error: $($_.Exception.Message)" -ForegroundColor Red
@@ -680,7 +681,7 @@ while ($true) {
                 (Invoke-MenuCommand -ClientArguments @('client', 'import', '--bundle', $bundle) -PassThru)) {
                 if (Invoke-MenuCommand -ClientArguments @('client', 'service', 'install') -PassThru) {
                     if (Invoke-MenuCommand -ClientArguments @('client', 'service', 'enable-autostart') -PassThru) {
-                        Invoke-MenuCommand -ClientArguments @('client', 'service', 'start') | Out-Null
+                        Invoke-MenuCommand -ClientArguments @('client', 'service', 'start')
                     }
                 }
             }
