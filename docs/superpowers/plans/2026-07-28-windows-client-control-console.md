@@ -580,10 +580,16 @@ No Rust production source changes are needed. `crates/rqbit-tunnel/src/tray/agen
   if (-not (Test-Path -LiteralPath $clientRunBatchSource -PathType Leaf)) {
       throw "batch client control wrapper is absent: $clientRunBatchSource"
   }
-  Copy-Item -LiteralPath $clientRunBatchSource -Destination (Join-Path $bundle 'client-run.bat')
+  $clientRunBatch = Join-Path $bundle 'client-run.bat'
+  Copy-Item -LiteralPath $clientRunBatchSource -Destination $clientRunBatch
+  $clientRunBatchItem = Get-Item -LiteralPath $clientRunBatch -Force
+  if ($clientRunBatchItem.PSIsContainer -or
+      ($clientRunBatchItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+      throw "batch client control wrapper is not a regular staged file: $clientRunBatch"
+  }
   ```
 
-  Add `(Join-Path $bundle 'client-run.bat')` to the expected regular-file list. This makes the bootstrap fixture represent both wrappers delivered in the Windows release.
+  The batch wrapper remains in the extracted release bundle; `install-client.ps1` intentionally installs only `client-run.ps1` as the stable managed wrapper. Do not add the batch file to the managed install-root assertion.
 
 - [ ] **Step 2: Update the Windows smoke bundle assembly.**
 
