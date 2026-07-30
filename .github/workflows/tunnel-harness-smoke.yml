@@ -128,6 +128,7 @@ jobs:
           Copy-Item target/release/rqbit-tunnel-tray.exe "$bundle/rqbit-tunnel-tray.exe"
           Copy-Item scripts/tunnel/install-client.ps1 "$bundle/install-client.ps1"
           Copy-Item scripts/tunnel/client-run.ps1 "$bundle/client-run.ps1"
+          Copy-Item scripts/tunnel/client-run.bat "$bundle/client-run.bat"
           Set-Content -LiteralPath "$bundle/release-version.txt" -Value '9.0.0-rc.0' -NoNewline
           Compress-Archive -Path $bundle -DestinationPath "$bundle.zip" -Force
           pwsh -NoProfile -File scripts/tunnel/test-client-bootstrap.ps1 `

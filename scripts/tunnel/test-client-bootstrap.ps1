@@ -19,6 +19,11 @@ try {
         throw "client control wrapper is absent: $clientRunSource"
     }
     Copy-Item -LiteralPath $clientRunSource -Destination (Join-Path $bundle 'client-run.ps1')
+    $clientRunBatchSource = Join-Path (Split-Path -Parent $Installer) 'client-run.bat'
+    if (-not (Test-Path -LiteralPath $clientRunBatchSource -PathType Leaf)) {
+        throw "batch client control wrapper is absent: $clientRunBatchSource"
+    }
+    Copy-Item -LiteralPath $clientRunBatchSource -Destination (Join-Path $bundle 'client-run.bat')
     $clientRun = Join-Path $bundle 'client-run.ps1'
     & (Get-Process -Id $PID).Path -NoProfile -NonInteractive -File $clientRun -SelfTest
     if ($LASTEXITCODE -ne 0) {
@@ -37,6 +42,7 @@ try {
     foreach ($path in @(
         (Join-Path $root 'launcher.exe'),
         (Join-Path $root 'client-run.ps1'),
+        (Join-Path $root 'client-run.bat'),
         (Join-Path $root 'releases\1.2.3\payload\rqbit-tunnel.exe'),
         (Join-Path $root 'releases\1.2.3\payload\rqbit-tunnel-updater.exe'),
         (Join-Path $root 'releases\1.2.3\payload\rqbit-tunnel-tray.exe')
