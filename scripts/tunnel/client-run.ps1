@@ -31,6 +31,7 @@ function New-ElevatedMenuEncodedCommand {
             '$payload = $payloadJson | ConvertFrom-Json',
             'if ([string]::IsNullOrWhiteSpace([string]$payload.script_path)) { throw ''missing client control script path'' }',
             'if ([string]::IsNullOrWhiteSpace([string]$payload.status_owner_sid)) { throw ''missing desktop status owner SID'' }',
+            '$ErrorActionPreference = ''Stop''',
             '$scriptArguments = @{',
             '    ElevatedMenu = $true',
             '    StatusOwnerSid = [string]$payload.status_owner_sid',
@@ -38,7 +39,13 @@ function New-ElevatedMenuEncodedCommand {
             'if ([bool]$payload.open_dashboard) {',
             '    $scriptArguments.OpenDashboard = $true',
             '}',
-            '& ([string]$payload.script_path) @scriptArguments',
+            'try {',
+            '    & ([string]$payload.script_path) @scriptArguments',
+            '}',
+            'catch {',
+            '    [Console]::Error.WriteLine("could not launch elevated client control script: $($_.Exception.Message)")',
+            '    exit 1',
+            '}',
             'exit $LASTEXITCODE'
         )
     ).Replace('__RQBIT_MENU_PAYLOAD__', $payloadBase64)
@@ -233,6 +240,14 @@ param(
                 throw 'elevated menu payload did not bind its internal menu parameters exactly'
             }
             Remove-Item -LiteralPath $captureResultPath -Force
+        }
+        $missingScriptPath = Join-Path $captureDirectory 'missing menu target.ps1'
+        $missingArguments = New-ElevatedMenuStartProcessArguments `
+            -ScriptPath $missingScriptPath `
+            -StatusOwnerSid $expectedStatusOwnerSid
+        $missingProcess = Start-Process -FilePath $actualElevatedHost -ArgumentList $missingArguments -Wait -PassThru
+        if ($missingProcess.ExitCode -eq 0) {
+            throw 'elevated menu payload must fail when its target script is missing'
         }
     }
     finally {
