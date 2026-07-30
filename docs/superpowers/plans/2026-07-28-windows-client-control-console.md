@@ -168,14 +168,22 @@ No Rust production source changes are needed. `crates/rqbit-tunnel/src/tray/agen
           [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $payload -Compress))
       )
       $decoder = [string]::Join([Environment]::NewLine, @(
+          '$ErrorActionPreference = ''Stop''',
           '$payloadJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(''__RQBIT_MENU_PAYLOAD__''))',
           '$payload = $payloadJson | ConvertFrom-Json',
           'if ([string]::IsNullOrWhiteSpace([string]$payload.script_path)) { throw ''missing client control script path'' }',
           'if ([string]::IsNullOrWhiteSpace([string]$payload.status_owner_sid)) { throw ''missing desktop status owner SID'' }',
           '$scriptArguments = @{ ElevatedMenu = $true; StatusOwnerSid = [string]$payload.status_owner_sid }',
           'if ([bool]$payload.open_dashboard) { $scriptArguments.OpenDashboard = $true }',
-          '& ([string]$payload.script_path) @scriptArguments',
-          'exit $LASTEXITCODE'
+          'try {',
+          '    & ([string]$payload.script_path) @scriptArguments',
+          '    if ($null -eq $LASTEXITCODE) { exit 0 }',
+          '    exit $LASTEXITCODE',
+          '}',
+          'catch {',
+          '    [Console]::Error.WriteLine($_.Exception.Message)',
+          '    exit 1',
+          '}'
       )).Replace('__RQBIT_MENU_PAYLOAD__', $payloadBase64)
       return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($decoder))
   }
@@ -237,6 +245,25 @@ No Rust production source changes are needed. `crates/rqbit-tunnel/src/tray/agen
       }
   }
   ```
+
+  Before implementing the decoder catch path, add a red SelfTest assertion that a nonexistent script path produces a nonzero process exit. Reuse the temporary capture directory and status SID from the binding fixture:
+
+  ```powershell
+  $missingScriptPath = Join-Path $captureDirectory 'missing elevated control.ps1'
+  $failureArguments = New-ElevatedMenuStartProcessArguments `
+      -ScriptPath $missingScriptPath `
+      -StatusOwnerSid $expectedStatusOwnerSid
+  $failureProcess = Start-Process `
+      -FilePath $actualElevatedHost `
+      -ArgumentList $failureArguments `
+      -Wait `
+      -PassThru
+  if ($failureProcess.ExitCode -eq 0) {
+      throw 'encoded menu payload must fail when its target script cannot be invoked'
+  }
+  ```
+
+  The current decoder fails this assertion because it calls `exit $LASTEXITCODE` after a PowerShell script-resolution failure. The `try`/`catch` in the replacement above is the minimal green change; it emits the original error message and exits `1` instead of reporting a false success.
 
   Keep `Get-ElevatedPowerShellHost` and `Test-Administrator`; move `Test-Administrator` above the startup branch if needed so both runtime control flow and `-SelfTest` can call it.
 
