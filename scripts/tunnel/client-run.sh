@@ -1,61 +1,124 @@
 #!/usr/bin/env bash
-# ── rqbit tunnel — client launcher (Linux) ──────────────────────────────────
-#
-#   ./client-run.sh [server-host:port]
-#
-# The server address is OPTIONAL. Given (arg / TUNNEL_SERVER / prompt) it is used
-# as a fast, reliable path. Left EMPTY, the client finds the server purely via
-# the DHT (using the pinned server key) — handy when the server's IP changes,
-# but it needs the server publicly reachable on its tunnel port and can take up
-# to ~1 minute to discover.
-#
-# Expects client.key and server.pub next to this script (as printed by the
-# server quickstart). Then point your browser/app SOCKS5 proxy at 127.0.0.1:1080.
-#
-# Overridable via env: RQBIT_BIN, TUNNEL_KEYS (dir with keys), SOCKS_LISTEN.
-
+# Interactive control menu for the managed rqbit tunnel client.
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="${RQBIT_BIN:-$HERE/rqbit}"
-[ -x "$BIN" ] || BIN="$(command -v rqbit || true)"
-[ -x "$BIN" ] || {
-    echo "error: rqbit binary not found (put it next to this script or on PATH, or set RQBIT_BIN)" >&2
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+MANAGED_LAUNCHER='/opt/rqbit-tunnel/launcher'
+BIN="${RQBIT_TUNNEL_BIN:-}"
+
+if [[ -z "$BIN" && -x "$MANAGED_LAUNCHER" ]]; then
+    BIN=$MANAGED_LAUNCHER
+elif [[ -z "$BIN" && -x "$HERE/install-client.sh" && -f "$HERE/release-version.txt" ]]; then
+    printf 'Installing the managed client release from this bundle...\n'
+    sudo -- "$HERE/install-client.sh"
+    BIN=$MANAGED_LAUNCHER
+elif [[ -z "$BIN" && -x "$HERE/rqbit-tunnel" ]]; then
+    BIN="$HERE/rqbit-tunnel"
+elif [[ -z "$BIN" ]]; then
+    BIN="$(command -v rqbit-tunnel || true)"
+fi
+
+if [[ -z "$BIN" || ! -x "$BIN" ]]; then
+    echo "error: rqbit-tunnel was not found; use a complete release bundle or set RQBIT_TUNNEL_BIN" >&2
     exit 1
+fi
+
+run_client() {
+    if "$BIN" "$@"; then
+        return 0
+    fi
+    echo "operation failed" >&2
+    return 1
 }
 
-SERVER="${1:-${TUNNEL_SERVER:-}}"
-[ -n "$SERVER" ] || read -rp "Server address host:port (or press Enter to find it via DHT): " SERVER
+run_protected_client() {
+    # Keep the exact executable and argument vector intact for sudo.
+    if sudo -- "$BIN" "$@"; then
+        return 0
+    fi
+    echo "protected operation failed" >&2
+    return 1
+}
 
-KEYS="${TUNNEL_KEYS:-$HERE}"
-SOCKS="${SOCKS_LISTEN:-127.0.0.1:1080}"
-DATA="${RQBIT_TUNNEL_DIR:-$HOME/.rqbit-tunnel}/client-data"
-mkdir -p "$DATA"
+configure_client() {
+    local endpoint socks carriers allow_lan
+    local -a args=(client config set)
 
-for f in client.key server.pub; do
-    [ -f "$KEYS/$f" ] || {
-        echo "error: $KEYS/$f not found — copy it from the server quickstart output" >&2
-        exit 1
-    }
+    read -r -p "Server endpoint HOST:PORT (blank keeps current): " endpoint
+    read -r -p "SOCKS bind HOST:PORT (blank keeps current): " socks
+    read -r -p "Carrier count (blank keeps current): " carriers
+    read -r -p "Allow unauthenticated LAN SOCKS [true/false, blank keeps current]: " allow_lan
+
+    [[ -z "$endpoint" ]] || args+=(--server-addr "$endpoint")
+    [[ -z "$socks" ]] || args+=(--socks-listen "$socks")
+    [[ -z "$carriers" ]] || args+=(--carriers "$carriers")
+    case "$allow_lan" in
+        "") ;;
+        true|false) args+=(--allow-unauthenticated-lan-socks "$allow_lan") ;;
+        *)
+            echo "allow unauthenticated LAN SOCKS must be true, false, or blank" >&2
+            return
+            ;;
+    esac
+
+    if ((${#args[@]} == 3)); then
+        echo "no configuration changes selected"
+        return
+    fi
+    run_protected_client "${args[@]}"
+}
+
+service_menu() {
+    local action
+    cat <<'EOF'
+Service actions:
+  1) install/reload service definition
+  2) start
+  3) stop
+  4) restart
+  5) enable autostart
+  6) disable autostart
+EOF
+    read -r -p "Select service action: " action
+    case "$action" in
+        1) run_protected_client client service install ;;
+        2) run_protected_client client service start ;;
+        3) run_protected_client client service stop ;;
+        4) run_protected_client client service restart ;;
+        5) run_protected_client client service enable-autostart ;;
+        6) run_protected_client client service disable-autostart ;;
+        *) echo "unknown service action" >&2 ;;
+    esac
+}
+
+while true; do
+    cat <<'EOF'
+
+rqbit tunnel client
+  1) open client dashboard
+  2) import enrollment bundle
+  3) show configuration
+  4) configure client
+  5) manage service
+  6) show service status
+  q) quit
+EOF
+    read -r -p "Select action: " selection
+    case "$selection" in
+        1) run_client client tui ;;
+        2)
+            read -r -p "Enrollment bundle path: " bundle
+            if [[ -n "$bundle" ]] && run_protected_client client import --bundle "$bundle"; then
+                run_protected_client client service install &&
+                    run_protected_client client service enable-autostart &&
+                    run_protected_client client service start
+            fi
+            ;;
+        3) run_protected_client client config show ;;
+        4) configure_client ;;
+        5) service_menu ;;
+        6) run_client client service status ;;
+        q|Q) exit 0 ;;
+        *) echo "unknown action" >&2 ;;
+    esac
 done
-
-# DHT is left ENABLED: it lets the client find the server by its carrier hash
-# (dynamic-IP friendly) and blends with real BitTorrent DHT traffic.
-HTTP_API="${RQBIT_HTTP_API:-127.0.0.1:3030}"
-ARGS=(
-    --disable-tcp-listen --disable-upnp-port-forward
-    --http-api-listen-addr "$HTTP_API"
-    server start --disable-persistence "$DATA"
-    --tunnel-mode client
-    --tunnel-socks-listen "$SOCKS"
-    --tunnel-client-key "$KEYS/client.key"
-    --tunnel-server-key "$KEYS/server.pub"
-)
-if [ -n "$SERVER" ]; then
-    ARGS+=(--tunnel-server-addr "$SERVER")
-    echo "Tunnel client -> $SERVER (with DHT)"
-else
-    echo "Tunnel client -> discovering the server via DHT (can take up to ~1 min)"
-fi
-echo "Point your browser/app SOCKS5 proxy at $SOCKS"
-exec "$BIN" "${ARGS[@]}"

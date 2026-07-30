@@ -1,0 +1,53 @@
+[package]
+name = "rqbit-tunnel"
+version.workspace = true
+edition = "2024"
+
+[features]
+default = ["default-tls"]
+default-tls = ["librqbit/default-tls"]
+rust-tls = ["librqbit/rust-tls"]
+tray-linux = ["dep:ksni"]
+tray-windows = ["dep:tray-icon"]
+
+
+[dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "sync", "time"] }
+base64.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+rand_core.workspace = true
+tokio-util.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+semver.workspace = true
+uuid = { workspace = true, features = ["v4", "serde"] }
+rusqlite.workspace = true
+clap.workspace = true
+reqwest = { workspace = true, features = ["rustls-tls"] }
+thiserror.workspace = true
+tracing.workspace = true
+hex.workspace = true
+sha2.workspace = true
+libc.workspace = true
+directories.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+arc-swap.workspace = true
+url.workspace = true
+librqbit = { workspace = true, default-features = false, features = ["tracing-subscriber-utils"] }
+flate2.workspace = true
+tar.workspace = true
+zip.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_RemoteDesktop", "Win32_System_Services", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-service = "0.8.1"
+tray-icon = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+parking_lot.workspace = true

@@ -1,0 +1,14 @@
+[Unit]
+Description=rqbit tunnel managed client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/rqbit-tunnel/launcher client run --config /etc/rqbit-tunnel/client.json
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

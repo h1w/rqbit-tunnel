@@ -5,6 +5,7 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -37,6 +38,7 @@ jobs:
 
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
@@ -60,3 +62,23 @@ jobs:
       - name: Run tests
         if: ${{ matrix.os == 'ubuntu-latest' }}
         run: cargo test
+
+  client-service-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run server bootstrap script tests
+        run: bash scripts/tunnel/test-server-quickstart.sh scripts/tunnel/server-quickstart.sh all
+
+      - run: rustup toolchain install stable --profile minimal
+
+      - name: Run privileged client-service acceptance
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "CARGO_HOME=${RUNNER_TEMP}/client-service-e2e-cargo" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            "RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable}" \
+            "CARGO_TARGET_DIR=${RUNNER_TEMP}/client-service-e2e-target" \
+            cargo test -p rqbit-tunnel --test client_service_e2e -- --ignored

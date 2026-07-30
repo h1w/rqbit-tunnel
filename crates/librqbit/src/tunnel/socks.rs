@@ -1,6 +1,6 @@
 // ── Local SOCKS5 ingress for client tunnel mode ──────────────────────────────
 //
-// `SocksIngress` binds a loopback TCP listener and accepts SOCKS5 clients.
+// `SocksIngress` binds the configured TCP listener and accepts SOCKS5 clients.
 // It never resolves DNS — domain destinations are forwarded as-is through the
 // tunnel (the server resolves).  `TCPBind` is rejected with
 // `CommandNotSupported`.
@@ -92,6 +92,13 @@ fn target_to_destination(addr: &TargetAddr) -> TunnelDestination {
     }
 }
 
+/// Use the accepted SOCKS listener's address while allowing the OS to select a
+/// UDP association port.
+fn udp_bind_addr(mut accepted_listener: SocketAddr) -> SocketAddr {
+    accepted_listener.set_port(0);
+    accepted_listener
+}
+
 // ── SocksIngress ────────────────────────────────────────────────────────────
 
 /// Local SOCKS5 ingress that translates SOCKS5 requests into tunnel frames.
@@ -122,6 +129,17 @@ impl SocksIngress {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, addr)) => {
+                            let accepted_listener = match stream.local_addr() {
+                                Ok(address) => address,
+                                Err(error) => {
+                                    tracing::debug!(
+                                        client_addr = %addr,
+                                        %error,
+                                        "could not determine SOCKS5 listener address"
+                                    );
+                                    continue;
+                                }
+                            };
                             let mux = match pool.pick() {
                                 Some(mux) => mux,
                                 None => {
@@ -133,7 +151,7 @@ impl SocksIngress {
                                 }
                             };
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, mux).await {
+                                if let Err(e) = handle_connection(stream, mux, accepted_listener).await {
                                     tracing::debug!(
                                         client_addr = %addr, error = %e,
                                         "SOCKS5 connection closed"
@@ -159,6 +177,7 @@ impl SocksIngress {
 async fn handle_connection(
     stream: TcpStream,
     mux: Arc<ClientMux>,
+    accepted_listener: SocketAddr,
 ) -> Result<(), SocksIngressError> {
     let mut cfg: Config<DenyAuthentication> = Config::default();
     cfg.set_request_timeout(30);
@@ -203,7 +222,7 @@ async fn handle_connection(
         // Wait for the server's admission verdict for this stream.
         match tokio::time::timeout(OPEN_TIMEOUT, inbound.recv()).await {
             Ok(Some(InboundTcp::Opened(_bind))) => {
-                let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+                let bind_addr = udp_bind_addr(accepted_listener);
                 inner.write_all(&reply_success(bind_addr)).await?;
                 inner.flush().await?;
                 pump_tcp(inner, mux, stream_id, inbound, send_credit).await;
@@ -228,7 +247,7 @@ async fn handle_connection(
             }
         }
     } else if is_udp_associate {
-        let udp_socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let udp_socket = UdpSocket::bind(udp_bind_addr(accepted_listener)).await?;
         let local_addr = udp_socket.local_addr()?;
 
         let (assoc_id, inbound) = match mux.open_udp().await {
@@ -402,6 +421,27 @@ mod tests {
         assert_eq!(reply[3], 0x01); // ATYP = IPv4
         assert_eq!(&reply[4..8], &[127, 0, 0, 1]); // BND.ADDR
         assert_eq!(&reply[8..10], &1080u16.to_be_bytes()); // BND.PORT
+    }
+
+    #[test]
+    fn udp_bind_addr_preserves_non_loopback_listener_ip() {
+        let accepted_listener = SocketAddr::from(([192, 0, 2, 42], 1080));
+
+        assert_eq!(
+            udp_bind_addr(accepted_listener),
+            SocketAddr::from(([192, 0, 2, 42], 0))
+        );
+    }
+
+    #[test]
+    fn udp_bind_addr_preserves_scoped_ipv6_listener_address() {
+        let ip = std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let accepted_listener = SocketAddr::V6(std::net::SocketAddrV6::new(ip, 1080, 42, 7));
+
+        assert_eq!(
+            udp_bind_addr(accepted_listener),
+            SocketAddr::V6(std::net::SocketAddrV6::new(ip, 0, 42, 7))
+        );
     }
 
     #[test]

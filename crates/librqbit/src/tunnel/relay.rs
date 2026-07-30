@@ -21,11 +21,12 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use parking_lot::Mutex as ParkingMutex;
 use peer_binary_protocol::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use super::carrier_peer::CoverMessage;
@@ -40,6 +41,7 @@ use super::flow::{
     record_ping_sent,
 };
 use super::frame::{TunnelDestination, TunnelErrorCode, TunnelFrame};
+use super::options::{TunnelServerSession, TunnelTrafficDirection};
 use super::server::AdmittedPeer;
 
 // ── Shared wire helpers ─────────────────────────────────────────────────────
@@ -145,6 +147,36 @@ pub(crate) async fn next_tunnel_frame(
 ///
 /// See [`FrameSink::is_data`] for the exact per-variant routing and why
 /// `TcpFin`/`TcpReset` ride the ordered data lane rather than preempting.
+struct DataLaneLiveness {
+    receiver_open: bool,
+}
+
+/// Owns the writer-side data receiver and synchronously marks it unavailable
+/// before that receiver can be dropped, including when the writer task aborts.
+struct DataLaneReceiver {
+    receiver: mpsc::Receiver<TunnelFrame>,
+    liveness: Arc<ParkingMutex<DataLaneLiveness>>,
+}
+
+impl DataLaneReceiver {
+    fn new(
+        receiver: mpsc::Receiver<TunnelFrame>,
+        liveness: Arc<ParkingMutex<DataLaneLiveness>>,
+    ) -> Self {
+        Self { receiver, liveness }
+    }
+
+    async fn recv(&mut self) -> Option<TunnelFrame> {
+        self.receiver.recv().await
+    }
+}
+
+impl Drop for DataLaneReceiver {
+    fn drop(&mut self) {
+        self.liveness.lock().receiver_open = false;
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct FrameSink {
     /// Priority lane: `Ping`/`Pong`/`Credit` + lifecycle frames. Never paced.
@@ -152,6 +184,20 @@ pub(crate) struct FrameSink {
     /// Ordered lane: `TcpData` (paced) + `TcpFin`/`TcpReset`/`UdpDatagram`
     /// (unpaced). FIFO so a stream's close never overtakes its own data.
     data_tx: mpsc::Sender<TunnelFrame>,
+    /// Serializes accepted TCP publication with writer data-receiver teardown.
+    data_liveness: Arc<ParkingMutex<DataLaneLiveness>>,
+}
+
+enum LossySendOutcome {
+    Queued,
+    Dropped,
+    Closed,
+}
+
+impl LossySendOutcome {
+    fn is_alive(&self) -> bool {
+        !matches!(self, Self::Closed)
+    }
 }
 
 impl FrameSink {
@@ -221,6 +267,34 @@ impl FrameSink {
         tx.send(frame).await.is_ok()
     }
 
+    /// Reserve data-lane capacity before taking a stream-specific accounting
+    /// gate, so writer backpressure cannot stall relay frame processing.
+    async fn reserve_data(&self) -> Option<mpsc::Permit<'_, TunnelFrame>> {
+        self.data_tx.reserve().await.ok()
+    }
+
+    /// Publish a reserved TCP frame only while the writer still owns its data
+    /// receiver. Both the liveness check and permit send are one synchronous
+    /// critical section, so a reserved permit cannot become dropped payload.
+    async fn publish_reserved_tcp_data<'a>(
+        &'a self,
+        permit: mpsc::Permit<'a, TunnelFrame>,
+        stream_id: u64,
+        bytes: Bytes,
+        pending: &AtomicU64,
+        download_gate: &Mutex<()>,
+    ) -> bool {
+        let _download_gate = download_gate.lock().await;
+        let liveness = self.data_liveness.lock();
+        if !liveness.receiver_open {
+            return false;
+        }
+        let len = bytes.len();
+        permit.send(TunnelFrame::TcpData { stream_id, bytes });
+        pending.fetch_add(len as u64, Ordering::Release);
+        true
+    }
+
     /// Best-effort enqueue for lossy traffic (UDP datagrams). Drops the frame
     /// if the destination lane is full instead of blocking the caller — which
     /// would head-of-line-block every other stream on this connection. Routes by
@@ -228,6 +302,10 @@ impl FrameSink {
     /// never flood the control priority lane). Returns `false` only if the peer
     /// connection is gone.
     pub(crate) fn try_send_lossy(&self, frame: TunnelFrame) -> bool {
+        self.try_send_lossy_outcome(frame).is_alive()
+    }
+
+    fn try_send_lossy_outcome(&self, frame: TunnelFrame) -> LossySendOutcome {
         use mpsc::error::TrySendError;
         let tx = if Self::is_data(&frame) {
             &self.data_tx
@@ -235,10 +313,22 @@ impl FrameSink {
             &self.control_tx
         };
         match tx.try_send(frame) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) => true, // dropped; connection still alive
-            Err(TrySendError::Closed(_)) => false,
+            Ok(()) => LossySendOutcome::Queued,
+            Err(TrySendError::Full(_)) => LossySendOutcome::Dropped,
+            Err(TrySendError::Closed(_)) => LossySendOutcome::Closed,
         }
+    }
+}
+
+async fn send_frame_until_cancelled(
+    sink: &FrameSink,
+    frame: TunnelFrame,
+    token: &CancellationToken,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => false,
+        sent = sink.send(frame) => sent,
     }
 }
 
@@ -293,7 +383,11 @@ pub(crate) fn spawn_frame_writer(
     // priority lane the writer's `biased` select always drains first, so
     // `Ping`/`Pong`/`Credit` never wait behind a paced `TcpData` frame.
     let (control_tx, mut control_rx) = mpsc::channel::<TunnelFrame>(OUTBOUND_QUEUE);
-    let (data_tx, mut data_rx) = mpsc::channel::<TunnelFrame>(OUTBOUND_QUEUE);
+    let (data_tx, data_rx) = mpsc::channel::<TunnelFrame>(OUTBOUND_QUEUE);
+    let data_liveness = Arc::new(ParkingMutex::new(DataLaneLiveness {
+        receiver_open: true,
+    }));
+    let mut data_rx = DataLaneReceiver::new(data_rx, data_liveness.clone());
     let handle = tokio::spawn(async move {
         // Base instant for the pure `TokenBucket`'s injected clock — it never
         // calls `Instant::now()` itself, so it stays deterministically
@@ -312,6 +406,7 @@ pub(crate) fn spawn_frame_writer(
             write_half: &mut super::carrier_wire::CarrierWriteHalf,
             transport: &Mutex<NoiseTransport>,
             frame: &TunnelFrame,
+            shutdown: &CancellationToken,
         ) -> bool {
             let blob = {
                 let mut t = transport.lock().await;
@@ -326,7 +421,12 @@ pub(crate) fn spawn_frame_writer(
             // The Noise ciphertext is chunked across one or more `rq_tunnel`
             // extended messages; a write failure on any chunk breaks the writer.
             for chunk in super::carrier_chunk::chunk_ciphertext(&blob) {
-                if write_half.send_tunnel(&chunk).await.is_err() {
+                let result = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => return false,
+                    result = write_half.send_tunnel(&chunk) => result,
+                };
+                if result.is_err() {
                     return false;
                 }
             }
@@ -388,7 +488,7 @@ pub(crate) fn spawn_frame_writer(
                 // Control priority lane — never paced, always first.
                 ctrl = control_rx.recv(), if control_open => match ctrl {
                     Some(ctrl) => {
-                        if !write_frame(&mut write_half, &transport, &ctrl).await {
+                        if !write_frame(&mut write_half, &transport, &ctrl, &shutdown).await {
                             break;
                         }
                     }
@@ -403,7 +503,7 @@ pub(crate) fn spawn_frame_writer(
                 _ = async { tokio::time::sleep_until(deadline.unwrap()).await }, if pending.is_some() => {
                     let frame = pending.take().unwrap();
                     deadline = None;
-                    if !write_frame(&mut write_half, &transport, &frame).await {
+                    if !write_frame(&mut write_half, &transport, &frame, &shutdown).await {
                         break;
                     }
                 }
@@ -438,7 +538,7 @@ pub(crate) fn spawn_frame_writer(
                             let now_nanos = base.elapsed().as_nanos() as u64;
                             let delay_nanos = bucket.take(now_nanos, pace_len);
                             if delay_nanos == 0 {
-                                if !write_frame(&mut write_half, &transport, &data).await {
+                                if !write_frame(&mut write_half, &transport, &data, &shutdown).await {
                                     break;
                                 }
                             } else {
@@ -453,7 +553,7 @@ pub(crate) fn spawn_frame_writer(
                             }
                         }
                         None => {
-                            if !write_frame(&mut write_half, &transport, &data).await {
+                            if !write_frame(&mut write_half, &transport, &data, &shutdown).await {
                                 break;
                             }
                         }
@@ -467,13 +567,21 @@ pub(crate) fn spawn_frame_writer(
                 // an oversized Piece a malicious peer tried to request) must NOT
                 // kill the tunnel — skip it. Only a real write/IO failure breaks.
                 cover = cover_rx.recv(), if cover_open => match cover {
-                    Some(m) => match write_half.send_message(&m.to_message()).await {
-                        Ok(()) => {}
-                        Err(super::carrier_wire::CarrierWireError::Serialize(_)) => {
-                            tracing::debug!("skipping unserializable cover message");
+                    Some(m) => {
+                        let message = m.to_message();
+                        let result = tokio::select! {
+                            biased;
+                            _ = shutdown.cancelled() => break,
+                            result = write_half.send_message(&message) => result,
+                        };
+                        match result {
+                            Ok(()) => {}
+                            Err(super::carrier_wire::CarrierWireError::Serialize(_)) => {
+                                tracing::debug!("skipping unserializable cover message");
+                            }
+                            Err(_) => break,
                         }
-                        Err(_) => break,
-                    },
+                    }
                     None => cover_open = false,
                 },
 
@@ -486,7 +594,12 @@ pub(crate) fn spawn_frame_writer(
                 // a dropped keepalive desyncs nothing. If the connection is truly
                 // dead, the next control/data write breaks the writer instead.
                 _ = keepalive.tick() => {
-                    if let Err(e) = write_half.send_message(&Message::KeepAlive).await {
+                    let result = tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => break,
+                        result = write_half.send_message(&Message::KeepAlive) => result,
+                    };
+                    if let Err(e) = result {
                         tracing::debug!(error = %e, "skipping keepalive");
                     }
                 }
@@ -497,6 +610,7 @@ pub(crate) fn spawn_frame_writer(
         FrameSink {
             control_tx,
             data_tx,
+            data_liveness,
         },
         handle,
     )
@@ -524,6 +638,12 @@ struct TcpEntry {
     /// Credit the server may use to send dest→peer data (granted by the client
     /// via `Credit` frames as it drains its local socket).
     send_credit: SendCredit,
+    /// Payload accepted by the peer but not yet acknowledged with `Credit`.
+    download_uncredited: Arc<AtomicU64>,
+    /// Serializes TCP payload publication with incoming `Credit` processing.
+    download_gate: Arc<Mutex<()>>,
+    /// Set after the destination egress half stops producing payload.
+    download_finished: Arc<AtomicBool>,
     /// Bidirectional idle watchdog, poked on activity in either direction.
     idle: IdleGuard,
     shutdown: CancellationToken,
@@ -541,8 +661,142 @@ type UdpMap = Arc<Mutex<HashMap<u64, UdpEntry>>>;
 /// for. Mirrors the client mux's identical bookkeeping.
 type PingInflight = Arc<StdMutex<HashMap<u64, Instant>>>;
 
+fn take_acknowledged(pending: &AtomicU64, requested: u32) -> usize {
+    let mut observed = pending.load(Ordering::Acquire);
+    loop {
+        let accepted = observed.min(u64::from(requested));
+        match pending.compare_exchange_weak(
+            observed,
+            observed - accepted,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return accepted as usize,
+            Err(next) => observed = next,
+        }
+    }
+}
+
+fn apply_acknowledged_credit(
+    send_credit: &SendCredit,
+    pending: &AtomicU64,
+    requested: u32,
+    session: &dyn TunnelServerSession,
+) -> usize {
+    let accepted = take_acknowledged(pending, requested);
+    if accepted != 0 {
+        send_credit.grant(accepted);
+        session.record_payload(TunnelTrafficDirection::Download, accepted);
+    }
+    accepted
+}
+
+async fn enqueue_tcp_data(
+    sink: &FrameSink,
+    stream_id: u64,
+    bytes: Bytes,
+    pending: &AtomicU64,
+    download_gate: &Mutex<()>,
+) -> bool {
+    let Some(permit) = sink.reserve_data().await else {
+        return false;
+    };
+    sink.publish_reserved_tcp_data(permit, stream_id, bytes, pending, download_gate)
+        .await
+}
+
+/// Apply one peer `Credit` after serializing with destination payload
+/// publication for this stream.
+async fn acknowledge_tcp_credit(
+    tcp: &TcpMap,
+    stream_id: u64,
+    requested: u32,
+    session: &dyn TunnelServerSession,
+    token: &CancellationToken,
+) {
+    let entry = tokio::select! {
+        biased;
+        _ = token.cancelled() => return,
+        entry = async {
+            let map = tcp.lock().await;
+            map.get(&stream_id).map(|entry| {
+                (
+                    entry.send_credit.clone(),
+                    entry.download_uncredited.clone(),
+                    entry.download_finished.clone(),
+                    entry.download_gate.clone(),
+                )
+            })
+        } => entry,
+    };
+    if let Some((send_credit, download_uncredited, download_finished, download_gate)) = entry {
+        let _download_gate = tokio::select! {
+            biased;
+            _ = token.cancelled() => return,
+            guard = download_gate.lock() => guard,
+        };
+        if token.is_cancelled() {
+            return;
+        }
+        apply_acknowledged_credit(&send_credit, &download_uncredited, requested, session);
+        let _ = retire_finished_tcp_entry(tcp, stream_id, &download_uncredited, &download_finished)
+            .await;
+    }
+}
+
+/// Mark the egress half closed while retaining its entry until every accepted
+/// destination payload has been acknowledged.
+async fn finish_tcp_download(
+    tcp: &TcpMap,
+    stream_id: u64,
+    download_uncredited: &Arc<AtomicU64>,
+    download_finished: &Arc<AtomicBool>,
+    download_gate: &Arc<Mutex<()>>,
+) {
+    let _download_gate = download_gate.lock().await;
+    download_finished.store(true, Ordering::Release);
+    let _ = retire_finished_tcp_entry(tcp, stream_id, download_uncredited, download_finished).await;
+}
+
+/// Remove a completed TCP entry only after its final valid acknowledgement.
+///
+/// Callers hold the entry's `download_gate`, so no accepted `TcpData` can be
+/// published or acknowledged while this checks the outstanding count.
+async fn retire_finished_tcp_entry(
+    tcp: &TcpMap,
+    stream_id: u64,
+    download_uncredited: &Arc<AtomicU64>,
+    download_finished: &Arc<AtomicBool>,
+) -> bool {
+    let entry = {
+        let mut map = tcp.lock().await;
+        let should_remove = match map.get(&stream_id) {
+            Some(entry) => {
+                Arc::ptr_eq(&entry.download_uncredited, download_uncredited)
+                    && Arc::ptr_eq(&entry.download_finished, download_finished)
+                    && entry.download_finished.load(Ordering::Acquire)
+                    && entry.download_uncredited.load(Ordering::Acquire) == 0
+            }
+            None => false,
+        };
+        if should_remove {
+            map.remove(&stream_id)
+        } else {
+            None
+        }
+    };
+    let removed = entry.is_some();
+    if let Some(entry) = entry {
+        entry.send_credit.close();
+        entry.shutdown.cancel();
+        entry.idle.shutdown().await;
+    }
+    removed
+}
+
 /// Run the full egress relay for one admitted peer until the peer disconnects
-/// or `shutdown` fires.
+/// or `shutdown` fires, then cancel and join every relay descendant before
+/// returning.
 pub(crate) async fn run_server_relay(
     peer: AdmittedPeer,
     egress: Arc<EgressPolicy>,
@@ -550,11 +804,14 @@ pub(crate) async fn run_server_relay(
 ) {
     let AdmittedPeer {
         client_key,
+        session,
         transport,
         mut read_half,
         write_half,
         carrier_peer,
+        ..
     } = peer;
+    let relay_shutdown = shutdown.child_token();
 
     let transport = Arc::new(Mutex::new(transport));
     // Cover lane: `next_tunnel_frame` funnels piece Request→Piece cover here and
@@ -572,7 +829,7 @@ pub(crate) async fn run_server_relay(
         transport.clone(),
         write_half,
         cover_rx,
-        shutdown.clone(),
+        relay_shutdown.clone(),
         pacing_rate.clone(),
         paced.clone(),
     );
@@ -591,15 +848,16 @@ pub(crate) async fn run_server_relay(
     // window, is the in-flight control.
     let controller = Arc::new(StdMutex::new(WindowController::new()));
     let ping_inflight: PingInflight = Arc::new(StdMutex::new(HashMap::new()));
-    tokio::spawn(server_control_task(
+    let control_handle = tokio::spawn(server_control_task(
         sink.clone(),
         ping_inflight.clone(),
         rtt.clone(),
         controller.clone(),
         paced.clone(),
         pacing_rate.clone(),
-        shutdown.clone(),
+        relay_shutdown.clone(),
     ));
+    let mut descendants = JoinSet::new();
 
     // Carrier read state: the defragmenter reassembles chunked Noise ciphertext,
     // `pending` buffers multiple blobs a single `push` can yield, and
@@ -611,8 +869,15 @@ pub(crate) async fn run_server_relay(
     let mut carrier_peer = carrier_peer;
 
     loop {
+        while let Some(result) = descendants.try_join_next() {
+            if let Err(error) = result {
+                tracing::debug!(%error, "tunnel relay descendant stopped unexpectedly");
+            }
+        }
+
         let frame = tokio::select! {
-            _ = shutdown.cancelled() => break,
+            biased;
+            _ = relay_shutdown.cancelled() => break,
             f = next_tunnel_frame(
                 &mut read_half,
                 &mut defrag,
@@ -643,15 +908,19 @@ pub(crate) async fn run_server_relay(
                 if map.len() >= egress.max_tcp_streams_per_client {
                     drop(map);
                     tracing::debug!(stream_id, "tcp stream limit reached; refusing");
-                    sink.send(TunnelFrame::TcpReset {
-                        stream_id,
-                        code: TunnelErrorCode::ConnectionRefused,
-                    })
+                    let _ = send_frame_until_cancelled(
+                        &sink,
+                        TunnelFrame::TcpReset {
+                            stream_id,
+                            code: TunnelErrorCode::ConnectionRefused,
+                        },
+                        &relay_shutdown,
+                    )
                     .await;
                     continue;
                 }
                 let (to_dest_tx, to_dest_rx) = mpsc::channel::<PeerToDest>(PER_STREAM_QUEUE);
-                let stream_token = shutdown.child_token();
+                let stream_token = relay_shutdown.child_token();
                 // Open the dest→peer send window at the fixed generous
                 // `OPEN_WINDOW`: a backstop that never binds (aggregate in-flight
                 // is bounded by pacing at `target / rtt`, not this window), while
@@ -659,27 +928,37 @@ pub(crate) async fn run_server_relay(
                 // is guaranteed to hold a full window — so a stalled destination
                 // can never head-of-line-block the shared reader.
                 let send_credit = SendCredit::with_window(OPEN_WINDOW);
+                let download_uncredited = Arc::new(AtomicU64::new(0));
+                let download_gate = Arc::new(Mutex::new(()));
+                let download_finished = Arc::new(AtomicBool::new(false));
                 let idle = IdleGuard::spawn(egress.idle_timeout, stream_token.clone());
                 map.insert(
                     stream_id,
                     TcpEntry {
                         to_dest: to_dest_tx,
                         send_credit: send_credit.clone(),
+                        download_uncredited: download_uncredited.clone(),
+                        download_gate: download_gate.clone(),
+                        download_finished: download_finished.clone(),
                         idle: idle.clone(),
                         shutdown: stream_token.clone(),
                     },
                 );
                 drop(map);
 
-                tokio::spawn(handle_tcp_stream(
+                let _ = descendants.spawn(handle_tcp_stream(
                     stream_id,
                     host,
                     port,
                     egress.clone(),
+                    session.clone(),
                     sink.clone(),
                     tcp.clone(),
                     to_dest_rx,
                     send_credit,
+                    download_uncredited,
+                    download_finished,
+                    download_gate,
                     idle,
                     stream_token,
                 ));
@@ -694,7 +973,11 @@ pub(crate) async fn run_server_relay(
                     idle.poke();
                     // Credit flow control keeps this queue below its bound, so
                     // the send never blocks long enough to stall other streams.
-                    let _ = to_dest.send(PeerToDest::Data(bytes)).await;
+                    let _ = tokio::select! {
+                        biased;
+                        _ = relay_shutdown.cancelled() => break,
+                        result = to_dest.send(PeerToDest::Data(bytes)) => result,
+                    };
                 }
             }
             TunnelFrame::TcpFin { stream_id } => {
@@ -703,25 +986,30 @@ pub(crate) async fn run_server_relay(
                     map.get(&stream_id).map(|e| e.to_dest.clone())
                 };
                 if let Some(to_dest) = to_dest {
-                    let _ = to_dest.send(PeerToDest::Fin).await;
+                    let _ = tokio::select! {
+                        biased;
+                        _ = relay_shutdown.cancelled() => break,
+                        result = to_dest.send(PeerToDest::Fin) => result,
+                    };
                 }
             }
             TunnelFrame::Credit { stream_id, bytes } => {
-                // The client drained `bytes` of dest→peer data; replenish the
-                // server's send credit for this stream.
-                let map = tcp.lock().await;
-                if let Some(entry) = map.get(&stream_id) {
-                    entry.send_credit.grant(bytes as usize);
-                }
+                // Acknowledge only payload the peer actually accepted from the
+                // destination, so peer credit and download accounting cannot
+                // exceed successful relay delivery.
+                acknowledge_tcp_credit(&tcp, stream_id, bytes, session.as_ref(), &relay_shutdown)
+                    .await;
             }
             TunnelFrame::TcpReset { stream_id, .. } => {
-                if let Some(entry) = tcp.lock().await.remove(&stream_id) {
+                let entry = { tcp.lock().await.remove(&stream_id) };
+                if let Some(entry) = entry {
                     entry.send_credit.close();
                     entry.shutdown.cancel();
+                    entry.idle.shutdown().await;
                 }
             }
             TunnelFrame::OpenUdp { association_id } => {
-                let mut map = udp.lock().await;
+                let map = udp.lock().await;
                 if map.contains_key(&association_id) {
                     continue;
                 }
@@ -730,17 +1018,23 @@ pub(crate) async fn run_server_relay(
                     tracing::debug!(association_id, "udp association limit reached; ignoring");
                     continue;
                 }
-                let socket = match UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await {
-                    Ok(s) => Arc::new(s),
-                    Err(e) => {
-                        drop(map);
-                        tracing::debug!(error = %e, "failed to bind egress udp socket");
+                drop(map);
+
+                let socket = tokio::select! {
+                    biased;
+                    _ = relay_shutdown.cancelled() => break,
+                    result = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))) => result,
+                };
+                let socket = match socket {
+                    Ok(socket) => Arc::new(socket),
+                    Err(error) => {
+                        tracing::debug!(error = %error, "failed to bind egress udp socket");
                         continue;
                     }
                 };
-                let token = shutdown.child_token();
+                let token = relay_shutdown.child_token();
                 let idle = IdleGuard::spawn(egress.idle_timeout, token.clone());
-                map.insert(
+                udp.lock().await.insert(
                     association_id,
                     UdpEntry {
                         socket: socket.clone(),
@@ -748,11 +1042,11 @@ pub(crate) async fn run_server_relay(
                         shutdown: token.clone(),
                     },
                 );
-                drop(map);
-                tokio::spawn(udp_recv_loop(
+                let _ = descendants.spawn(udp_recv_loop(
                     association_id,
                     socket,
                     sink.clone(),
+                    session.clone(),
                     idle,
                     token,
                 ));
@@ -769,9 +1063,21 @@ pub(crate) async fn run_server_relay(
                 };
                 if let Some((socket, idle)) = entry {
                     idle.poke();
-                    match egress.authorize(&destination, EgressTransport::Udp).await {
+                    let resolved = tokio::select! {
+                        biased;
+                        _ = relay_shutdown.cancelled() => break,
+                        result = egress.authorize(&destination, EgressTransport::Udp) => result,
+                    };
+                    match resolved {
                         Ok(resolved) => {
-                            let _ = socket.send_to(&bytes, resolved.selected).await;
+                            let _ = send_udp_payload(
+                                socket.as_ref(),
+                                resolved.selected,
+                                &bytes,
+                                session.as_ref(),
+                                &relay_shutdown,
+                            )
+                            .await;
                         }
                         Err(e) => {
                             tracing::debug!(association_id, error = %e, "udp egress denied");
@@ -780,12 +1086,16 @@ pub(crate) async fn run_server_relay(
                 }
             }
             TunnelFrame::CloseUdp { association_id } => {
-                if let Some(entry) = udp.lock().await.remove(&association_id) {
+                let entry = { udp.lock().await.remove(&association_id) };
+                if let Some(entry) = entry {
                     entry.shutdown.cancel();
+                    entry.idle.shutdown().await;
                 }
             }
             TunnelFrame::Ping { nonce } => {
-                sink.send(TunnelFrame::Pong { nonce }).await;
+                let _ =
+                    send_frame_until_cancelled(&sink, TunnelFrame::Pong { nonce }, &relay_shutdown)
+                        .await;
             }
             TunnelFrame::Pong { nonce } => {
                 let sent_at = ping_inflight.lock().unwrap().remove(&nonce);
@@ -798,15 +1108,27 @@ pub(crate) async fn run_server_relay(
         }
     }
 
-    // Peer gone: tear everything down.
-    for (_, entry) in tcp.lock().await.drain() {
+    // Peer gone or cancellation fired: cancel every descendant before joining
+    // it, so no relay task can account payload after this function returns.
+    relay_shutdown.cancel();
+    let tcp_entries: Vec<_> = tcp.lock().await.drain().map(|(_, entry)| entry).collect();
+    for entry in tcp_entries {
         entry.send_credit.close();
         entry.shutdown.cancel();
+        entry.idle.shutdown().await;
     }
-    for (_, entry) in udp.lock().await.drain() {
+    let udp_entries: Vec<_> = udp.lock().await.drain().map(|(_, entry)| entry).collect();
+    for entry in udp_entries {
         entry.shutdown.cancel();
+        entry.idle.shutdown().await;
     }
-    writer_handle.abort();
+    while let Some(result) = descendants.join_next().await {
+        if let Err(error) = result {
+            tracing::debug!(%error, "tunnel relay descendant stopped unexpectedly");
+        }
+    }
+    let _ = control_handle.await;
+    let _ = writer_handle.await;
     tracing::debug!(?client_key, "tunnel server relay: peer session ended");
 }
 
@@ -817,9 +1139,8 @@ pub(crate) async fn run_server_relay(
 /// is how the client measures the upload direction; the `Pong` arm records our
 /// own probes' samples into `rtt`.
 ///
-/// Stops on shutdown, or once the sink is gone — which happens shortly after
-/// `run_server_relay` aborts the writer task on peer disconnect, since that
-/// closes the channel `sink.send` writes to.
+/// Stops on shutdown, or once the sink is gone. The relay cancels and joins
+/// the writer before it returns, so this task cannot outlive relay shutdown.
 async fn server_control_task(
     sink: FrameSink,
     inflight: PingInflight,
@@ -833,6 +1154,7 @@ async fn server_control_task(
     let mut next_nonce: u64 = 0;
     loop {
         tokio::select! {
+            biased;
             _ = shutdown.cancelled() => break,
             _ = interval.tick() => {}
         }
@@ -842,7 +1164,7 @@ async fn server_control_task(
             let mut map = inflight.lock().unwrap();
             record_ping_sent(&mut map, nonce, Instant::now(), PING_NONCE_MAP_CAP);
         }
-        if !sink.send(TunnelFrame::Ping { nonce }).await {
+        if !send_frame_until_cancelled(&sink, TunnelFrame::Ping { nonce }, &shutdown).await {
             break;
         }
         // Step the controller from the freshest RTT estimate (fed by prior
@@ -861,10 +1183,14 @@ async fn handle_tcp_stream(
     host: String,
     port: u16,
     egress: Arc<EgressPolicy>,
+    session: Arc<dyn TunnelServerSession>,
     sink: FrameSink,
     tcp: TcpMap,
     to_dest_rx: mpsc::Receiver<PeerToDest>,
     send_credit: SendCredit,
+    download_uncredited: Arc<AtomicU64>,
+    download_finished: Arc<AtomicBool>,
+    download_gate: Arc<Mutex<()>>,
     idle: IdleGuard,
     token: CancellationToken,
 ) {
@@ -874,27 +1200,88 @@ async fn handle_tcp_stream(
         port,
         &egress,
         &sink,
+        session,
         to_dest_rx,
         &send_credit,
         &idle,
+        download_uncredited.clone(),
+        download_gate.clone(),
         &token,
     )
     .await;
 
     if let Err(code) = result {
-        sink.send(TunnelFrame::TcpReset { stream_id, code }).await;
+        let _ =
+            send_frame_until_cancelled(&sink, TunnelFrame::TcpReset { stream_id, code }, &token)
+                .await;
     }
 
-    // Deregister the stream (unless it was already replaced).
-    if let Some(entry) = tcp.lock().await.remove(&stream_id) {
-        entry.send_credit.close();
-        entry.shutdown.cancel();
+    finish_tcp_download(
+        &tcp,
+        stream_id,
+        &download_uncredited,
+        &download_finished,
+        &download_gate,
+    )
+    .await;
+}
+
+async fn pump_peer_to_destination(
+    stream_id: u64,
+    mut dest_write: tokio::net::tcp::OwnedWriteHalf,
+    mut to_dest_rx: mpsc::Receiver<PeerToDest>,
+    session: Arc<dyn TunnelServerSession>,
+    sink: FrameSink,
+    idle: IdleGuard,
+    token: CancellationToken,
+) {
+    loop {
+        let message = tokio::select! {
+            biased;
+            _ = token.cancelled() => break,
+            message = to_dest_rx.recv() => message,
+        };
+        match message {
+            Some(PeerToDest::Data(bytes)) => {
+                let bytes_written = bytes.len();
+                let write_result = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    result = dest_write.write_all(&bytes) => result,
+                };
+                if write_result.is_err() || token.is_cancelled() {
+                    break;
+                }
+                session.record_payload(TunnelTrafficDirection::Upload, bytes_written);
+                idle.poke();
+                let sent_credit = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => false,
+                    sent = sink.send(TunnelFrame::Credit {
+                        stream_id,
+                        bytes: bytes_written as u32,
+                    }) => sent,
+                };
+                if !sent_credit {
+                    break;
+                }
+            }
+            Some(PeerToDest::Fin) | None => {
+                let _ = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => Ok(()),
+                    result = dest_write.shutdown() => result,
+                };
+                break;
+            }
+        }
     }
 }
 
 /// Authorize + connect the destination, then pump both directions until the
 /// stream ends. On any pre-connect failure returns `Err(code)` so the caller
-/// sends a single `TcpReset`.
+/// sends a single `TcpReset`. The nested peer→destination writer is joined
+/// before this function returns.
 #[allow(clippy::too_many_arguments)]
 async fn open_and_pump(
     stream_id: u64,
@@ -902,20 +1289,29 @@ async fn open_and_pump(
     port: u16,
     egress: &EgressPolicy,
     sink: &FrameSink,
-    mut to_dest_rx: mpsc::Receiver<PeerToDest>,
+    session: Arc<dyn TunnelServerSession>,
+    to_dest_rx: mpsc::Receiver<PeerToDest>,
     send_credit: &SendCredit,
     idle: &IdleGuard,
+    download_uncredited: Arc<AtomicU64>,
+    download_gate: Arc<Mutex<()>>,
     token: &CancellationToken,
 ) -> Result<(), TunnelErrorCode> {
     let destination = parse_destination(&host, port);
-    let resolved = egress
-        .authorize(&destination, EgressTransport::Tcp)
-        .await
-        .map_err(|e| e.to_error_code())?;
+    let resolved = tokio::select! {
+        biased;
+        _ = token.cancelled() => return Ok(()),
+        result = egress.authorize(&destination, EgressTransport::Tcp) => {
+            result.map_err(|error| error.to_error_code())?
+        }
+    };
 
-    let dest = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(resolved.selected))
-        .await
-    {
+    let connect = tokio::select! {
+        biased;
+        _ = token.cancelled() => return Ok(()),
+        result = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(resolved.selected)) => result,
+    };
+    let dest = match connect {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             tracing::debug!(stream_id, error = %e, dest = %resolved.selected, "egress connect failed");
@@ -931,53 +1327,32 @@ async fn open_and_pump(
         .local_addr()
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
 
-    if !sink
-        .send(TunnelFrame::TcpOpened {
+    if !send_frame_until_cancelled(
+        sink,
+        TunnelFrame::TcpOpened {
             stream_id,
             bind_addr,
-        })
-        .await
+        },
+        token,
+    )
+    .await
     {
         return Ok(());
     }
 
-    let (mut dest_read, mut dest_write) = dest.into_split();
+    let (mut dest_read, dest_write) = dest.into_split();
 
     // peer → destination: write received data, then grant the peer credit for
     // exactly what we drained so it may send that much more.
-    let pd_token = token.clone();
-    let pd_sink = sink.clone();
-    let pd_idle = idle.clone();
-    let peer_to_dest: JoinHandle<()> = tokio::spawn(async move {
-        loop {
-            let msg = tokio::select! {
-                _ = pd_token.cancelled() => break,
-                m = to_dest_rx.recv() => m,
-            };
-            match msg {
-                Some(PeerToDest::Data(bytes)) => {
-                    let n = bytes.len();
-                    if dest_write.write_all(&bytes).await.is_err() {
-                        break;
-                    }
-                    pd_idle.poke();
-                    if !pd_sink
-                        .send(TunnelFrame::Credit {
-                            stream_id,
-                            bytes: n as u32,
-                        })
-                        .await
-                    {
-                        break;
-                    }
-                }
-                Some(PeerToDest::Fin) | None => {
-                    let _ = dest_write.shutdown().await;
-                    break;
-                }
-            }
-        }
-    });
+    let peer_to_dest = tokio::spawn(pump_peer_to_destination(
+        stream_id,
+        dest_write,
+        to_dest_rx,
+        session,
+        sink.clone(),
+        idle.clone(),
+        token.clone(),
+    ));
 
     // destination → peer (runs in this task). Reserve send credit before each
     // chunk so we never overrun the peer's receive window.
@@ -985,17 +1360,20 @@ async fn open_and_pump(
     let mut result_code: Option<TunnelErrorCode> = None;
     loop {
         let read = tokio::select! {
+            biased;
             _ = token.cancelled() => { break; }
             r = dest_read.read(&mut buf) => r,
         };
         match read {
             Ok(0) => {
                 // Destination closed: half-close toward the peer.
-                sink.send(TunnelFrame::TcpFin { stream_id }).await;
+                let _ = send_frame_until_cancelled(sink, TunnelFrame::TcpFin { stream_id }, token)
+                    .await;
                 break;
             }
             Ok(n) => {
                 let reserved = tokio::select! {
+                    biased;
                     _ = token.cancelled() => false,
                     ok = send_credit.reserve(n) => ok,
                 };
@@ -1003,13 +1381,18 @@ async fn open_and_pump(
                     break;
                 }
                 idle.poke();
-                if !sink
-                    .send(TunnelFrame::TcpData {
+                let queued = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => false,
+                    queued = enqueue_tcp_data(
+                        sink,
                         stream_id,
-                        bytes: Bytes::copy_from_slice(&buf[..n]),
-                    })
-                    .await
-                {
+                        Bytes::copy_from_slice(&buf[..n]),
+                        &download_uncredited,
+                        download_gate.as_ref(),
+                    ) => queued,
+                };
+                if !queued {
                     break;
                 }
             }
@@ -1021,32 +1404,85 @@ async fn open_and_pump(
         }
     }
 
-    token.cancel();
-    peer_to_dest.abort();
-
-    match result_code {
+    if let Some(code) = result_code {
         // TcpOpened was already sent, so surface late errors as a reset here
         // rather than via the caller's Err path (which would double-signal).
-        Some(code) => {
-            sink.send(TunnelFrame::TcpReset { stream_id, code }).await;
-            Ok(())
+        // Keep the stream token live until the ordered reset is queued; its
+        // parent still cancels it immediately if relay/session shutdown wins.
+        if !token.is_cancelled() {
+            let _ =
+                send_frame_until_cancelled(sink, TunnelFrame::TcpReset { stream_id, code }, token)
+                    .await;
         }
-        None => Ok(()),
     }
+
+    token.cancel();
+    let _ = peer_to_dest.await;
+    Ok(())
 }
 
 // ── Per-UDP-association egress ──────────────────────────────────────────────
+
+async fn send_udp_payload(
+    socket: &UdpSocket,
+    destination: SocketAddr,
+    bytes: &[u8],
+    session: &dyn TunnelServerSession,
+    token: &CancellationToken,
+) -> std::io::Result<usize> {
+    let sent = tokio::select! {
+        biased;
+        _ = token.cancelled() => return Ok(0),
+        result = socket.send_to(bytes, destination) => result?,
+    };
+    if token.is_cancelled() {
+        return Ok(0);
+    }
+    session.record_payload(TunnelTrafficDirection::Upload, sent);
+    Ok(sent)
+}
+
+fn queue_udp_response(
+    sink: &FrameSink,
+    association_id: u64,
+    source: SocketAddr,
+    bytes: Bytes,
+    session: &dyn TunnelServerSession,
+    token: &CancellationToken,
+) -> bool {
+    if token.is_cancelled() {
+        return false;
+    }
+    let len = bytes.len();
+    match sink.try_send_lossy_outcome(TunnelFrame::UdpDatagram {
+        association_id,
+        destination: TunnelDestination::Ip(source),
+        bytes,
+    }) {
+        LossySendOutcome::Queued => {
+            if token.is_cancelled() {
+                return false;
+            }
+            session.record_payload(TunnelTrafficDirection::Download, len);
+            true
+        }
+        LossySendOutcome::Dropped => true,
+        LossySendOutcome::Closed => false,
+    }
+}
 
 async fn udp_recv_loop(
     association_id: u64,
     socket: Arc<UdpSocket>,
     sink: FrameSink,
+    session: Arc<dyn TunnelServerSession>,
     idle: IdleGuard,
     token: CancellationToken,
 ) {
     let mut buf = vec![0u8; UDP_READ_BUF];
     loop {
         let recv = tokio::select! {
+            biased;
             _ = token.cancelled() => break,
             r = socket.recv_from(&mut buf) => r,
         };
@@ -1054,11 +1490,14 @@ async fn udp_recv_loop(
             Ok((n, src)) => {
                 idle.poke();
                 // Lossy: drop under congestion rather than stall other streams.
-                let alive = sink.try_send_lossy(TunnelFrame::UdpDatagram {
+                let alive = queue_udp_response(
+                    &sink,
                     association_id,
-                    destination: TunnelDestination::Ip(src),
-                    bytes: Bytes::copy_from_slice(&buf[..n]),
-                });
+                    src,
+                    Bytes::copy_from_slice(&buf[..n]),
+                    session.as_ref(),
+                    &token,
+                );
                 if !alive {
                     break;
                 }
@@ -1073,10 +1512,48 @@ async fn udp_recv_loop(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use parking_lot::Mutex as ParkingMutex;
+    use std::collections::{HashMap, HashSet};
+    use std::net::Ipv6Addr;
+
+    use super::super::options::{TunnelServerSession, TunnelTrafficDirection};
+
+    struct RecordingSession {
+        payloads: ParkingMutex<Vec<(TunnelTrafficDirection, usize)>>,
+        shutdown: CancellationToken,
+    }
+
+    impl RecordingSession {
+        fn new() -> Self {
+            Self {
+                payloads: ParkingMutex::new(Vec::new()),
+                shutdown: CancellationToken::new(),
+            }
+        }
+
+        fn recorded(&self) -> Vec<(TunnelTrafficDirection, usize)> {
+            self.payloads.lock().clone()
+        }
+    }
+
+    impl TunnelServerSession for RecordingSession {
+        fn record_payload(&self, direction: TunnelTrafficDirection, bytes: usize) {
+            self.payloads.lock().push((direction, bytes));
+        }
+
+        fn cancellation_token(&self) -> CancellationToken {
+            self.shutdown.clone()
+        }
+
+        fn connected(&self) {}
+
+        fn disconnected(&self) {}
+    }
 
     use super::super::carrier::{TunnelCarrierConfig, TunnelCarrierStore};
-    use super::super::carrier_chunk::{CarrierDefragmenter, MAX_CARRIER_CIPHERTEXT};
+    use super::super::carrier_chunk::{
+        CarrierDefragmenter, MAX_CARRIER_CIPHERTEXT, chunk_ciphertext, recv_one_ciphertext,
+    };
     use super::super::carrier_peer::TunnelCarrierPeer;
     use super::super::carrier_wire::{CarrierReadHalf, CarrierWire, CarrierWriteHalf};
     use super::super::config::PACING_DEFAULT_RATE;
@@ -1520,5 +1997,508 @@ mod tests {
         );
 
         shutdown.cancel();
+    }
+    #[tokio::test]
+    async fn credit_is_bounded_by_forwarded_bytes() {
+        let pending = AtomicU64::new(1024);
+        assert_eq!(take_acknowledged(&pending, 4096), 1024);
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+
+        let stream_id = 7;
+        let download_uncredited = Arc::new(AtomicU64::new(1024));
+        let download_finished = Arc::new(AtomicBool::new(false));
+        let download_gate = Arc::new(Mutex::new(()));
+        let shutdown = CancellationToken::new();
+        let idle = IdleGuard::spawn(Duration::from_secs(60), shutdown.clone());
+        let (to_dest, _to_dest_rx) = mpsc::channel(1);
+        let send_credit = SendCredit::with_window(0);
+        let tcp: TcpMap = Arc::new(Mutex::new(HashMap::new()));
+        tcp.lock().await.insert(
+            stream_id,
+            TcpEntry {
+                to_dest,
+                send_credit: send_credit.clone(),
+                download_uncredited: download_uncredited.clone(),
+                download_gate,
+                download_finished,
+                idle,
+                shutdown: shutdown.clone(),
+            },
+        );
+        let session = RecordingSession::new();
+
+        acknowledge_tcp_credit(&tcp, stream_id, 4096, &session, &shutdown).await;
+        assert_eq!(download_uncredited.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            session.recorded(),
+            vec![(TunnelTrafficDirection::Download, 1024)]
+        );
+        assert!(send_credit.reserve(1024).await);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), send_credit.reserve(1))
+                .await
+                .is_err(),
+            "the credit grant must not exceed successfully forwarded bytes"
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn failed_udp_send_to_records_no_upload_payload() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let session = RecordingSession::new();
+
+        assert!(
+            send_udp_payload(
+                &socket,
+                SocketAddr::from((Ipv6Addr::LOCALHOST, 9)),
+                b"payload",
+                &session,
+                &session.shutdown,
+            )
+            .await
+            .is_err()
+        );
+        assert!(session.recorded().is_empty());
+    }
+
+    #[test]
+    fn accepted_udp_response_queues_its_datagram_and_records_download() {
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        let (data_tx, mut data_rx) = mpsc::channel(1);
+        let sink = FrameSink {
+            control_tx,
+            data_tx,
+            data_liveness: Arc::new(ParkingMutex::new(DataLaneLiveness {
+                receiver_open: true,
+            })),
+        };
+        let session = RecordingSession::new();
+        let payload = Bytes::from_static(b"response");
+
+        assert!(queue_udp_response(
+            &sink,
+            7,
+            SocketAddr::from(([127, 0, 0, 1], 9000)),
+            payload.clone(),
+            &session,
+            &session.shutdown,
+        ));
+        match data_rx.try_recv().unwrap() {
+            TunnelFrame::UdpDatagram {
+                association_id,
+                bytes,
+                ..
+            } => {
+                assert_eq!(association_id, 7);
+                assert_eq!(bytes, payload);
+            }
+            frame => panic!("expected queued UDP response, got {frame:?}"),
+        }
+        assert_eq!(
+            session.recorded(),
+            vec![(TunnelTrafficDirection::Download, payload.len())]
+        );
+    }
+
+    #[test]
+    fn dropped_udp_response_records_no_download_payload() {
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        let (data_tx, _data_rx) = mpsc::channel(1);
+        data_tx
+            .try_send(TunnelFrame::UdpDatagram {
+                association_id: 1,
+                destination: TunnelDestination::Ip(SocketAddr::from(([127, 0, 0, 1], 9000))),
+                bytes: Bytes::new(),
+            })
+            .unwrap();
+        let sink = FrameSink {
+            control_tx,
+            data_tx,
+            data_liveness: Arc::new(ParkingMutex::new(DataLaneLiveness {
+                receiver_open: true,
+            })),
+        };
+        let session = RecordingSession::new();
+
+        assert!(queue_udp_response(
+            &sink,
+            7,
+            SocketAddr::from(([127, 0, 0, 1], 9000)),
+            Bytes::from_static(b"response"),
+            &session,
+            &session.shutdown,
+        ));
+        assert!(session.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_tcp_stream_keeps_download_accounting_until_credit_arrives() {
+        let stream_id = 7;
+        let download_uncredited = Arc::new(AtomicU64::new(1024));
+        let download_finished = Arc::new(AtomicBool::new(false));
+        let download_gate = Arc::new(Mutex::new(()));
+        let shutdown = CancellationToken::new();
+        let idle = IdleGuard::spawn(Duration::from_secs(60), shutdown.clone());
+        let (to_dest, _to_dest_rx) = mpsc::channel(1);
+        let tcp: TcpMap = Arc::new(Mutex::new(HashMap::new()));
+        tcp.lock().await.insert(
+            stream_id,
+            TcpEntry {
+                to_dest,
+                send_credit: SendCredit::with_window(0),
+                download_uncredited: download_uncredited.clone(),
+                download_finished: download_finished.clone(),
+                download_gate: download_gate.clone(),
+                idle,
+                shutdown: shutdown.clone(),
+            },
+        );
+        let session = RecordingSession::new();
+
+        finish_tcp_download(
+            &tcp,
+            stream_id,
+            &download_uncredited,
+            &download_finished,
+            &download_gate,
+        )
+        .await;
+        assert!(tcp.lock().await.contains_key(&stream_id));
+
+        acknowledge_tcp_credit(&tcp, stream_id, 4096, &session, &shutdown).await;
+        assert!(!tcp.lock().await.contains_key(&stream_id));
+        assert_eq!(
+            session.recorded(),
+            vec![(TunnelTrafficDirection::Download, 1024)]
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_data_waits_for_queue_capacity_before_taking_credit_gate() {
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        let (data_tx, mut data_rx) = mpsc::channel(1);
+        data_tx
+            .try_send(TunnelFrame::UdpDatagram {
+                association_id: 1,
+                destination: TunnelDestination::Ip(SocketAddr::from(([127, 0, 0, 1], 9000))),
+                bytes: Bytes::new(),
+            })
+            .unwrap();
+        let sink = FrameSink {
+            control_tx,
+            data_tx,
+            data_liveness: Arc::new(ParkingMutex::new(DataLaneLiveness {
+                receiver_open: true,
+            })),
+        };
+        let download_uncredited = Arc::new(AtomicU64::new(0));
+        let download_gate = Arc::new(Mutex::new(()));
+        let send = tokio::spawn({
+            let sink = sink.clone();
+            let download_uncredited = download_uncredited.clone();
+            let download_gate = download_gate.clone();
+            async move {
+                enqueue_tcp_data(
+                    &sink,
+                    7,
+                    Bytes::from_static(b"response"),
+                    &download_uncredited,
+                    &download_gate,
+                )
+                .await
+            }
+        });
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            download_gate.try_lock().is_ok(),
+            "waiting for data-lane capacity must not block the relay reader on this stream"
+        );
+
+        data_rx.try_recv().unwrap();
+        assert!(send.await.unwrap());
+        assert_eq!(
+            download_uncredited.load(Ordering::Relaxed),
+            b"response".len() as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_writer_data_lane_rejects_reserved_tcp_publication() {
+        let data_liveness = Arc::new(ParkingMutex::new(DataLaneLiveness {
+            receiver_open: true,
+        }));
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        let (data_tx, data_rx) = mpsc::channel(1);
+        let sink = FrameSink {
+            control_tx,
+            data_tx,
+            data_liveness: data_liveness.clone(),
+        };
+        let permit = sink.reserve_data().await.unwrap();
+        drop(DataLaneReceiver::new(data_rx, data_liveness));
+
+        let download_uncredited = AtomicU64::new(0);
+        let download_gate = Mutex::new(());
+        assert!(
+            !sink
+                .publish_reserved_tcp_data(
+                    permit,
+                    7,
+                    Bytes::from_static(b"response"),
+                    &download_uncredited,
+                    &download_gate,
+                )
+                .await
+        );
+        assert_eq!(download_uncredited.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_peer_destination_writer_does_not_record_payload() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind destination listener");
+        let destination_addr = listener.local_addr().expect("destination listener address");
+        let client = TcpStream::connect(destination_addr)
+            .await
+            .expect("connect destination writer");
+        let (_destination, _) = listener.accept().await.expect("accept destination writer");
+
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        let (data_tx, _data_rx) = mpsc::channel(1);
+        let sink = FrameSink {
+            control_tx,
+            data_tx,
+            data_liveness: Arc::new(ParkingMutex::new(DataLaneLiveness {
+                receiver_open: true,
+            })),
+        };
+        let (to_dest_tx, to_dest_rx) = mpsc::channel(1);
+        to_dest_tx
+            .send(PeerToDest::Data(Bytes::from_static(
+                b"must not be accounted",
+            )))
+            .await
+            .expect("queue peer payload");
+
+        let session = Arc::new(RecordingSession::new());
+        let writer_session: Arc<dyn TunnelServerSession> = session.clone();
+        let token = CancellationToken::new();
+        token.cancel();
+        let idle = IdleGuard::spawn(Duration::from_secs(60), token.clone());
+
+        pump_peer_to_destination(
+            7,
+            client.into_split().1,
+            to_dest_rx,
+            writer_session,
+            sink,
+            idle,
+            token,
+        )
+        .await;
+
+        tokio::task::yield_now().await;
+        assert!(
+            session.recorded().is_empty(),
+            "a cancelled destination writer must not record payload after its parent has stopped"
+        );
+    }
+    #[tokio::test]
+    async fn destination_read_error_after_tcp_opened_sends_one_reset() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind destination listener");
+        let destination_addr = listener.local_addr().expect("destination listener address");
+        let (reset_tx, reset_rx) = tokio::sync::oneshot::channel();
+        let destination = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("accept destination connection");
+            reset_rx.await.expect("request destination reset");
+            #[allow(deprecated)]
+            {
+                stream
+                    .set_linger(Some(Duration::ZERO))
+                    .expect("configure destination reset");
+            }
+            drop(stream);
+        });
+
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        let (data_tx, mut data_rx) = mpsc::channel(1);
+        let sink = FrameSink {
+            control_tx,
+            data_tx,
+            data_liveness: Arc::new(ParkingMutex::new(DataLaneLiveness {
+                receiver_open: true,
+            })),
+        };
+        let token = CancellationToken::new();
+        let idle = IdleGuard::spawn(Duration::from_secs(60), token.clone());
+        let (_to_dest_tx, to_dest_rx) = mpsc::channel(1);
+        let session: Arc<dyn TunnelServerSession> = Arc::new(RecordingSession::new());
+        let egress = EgressPolicy::default();
+        let send_credit = SendCredit::with_window(0);
+        let download_uncredited = Arc::new(AtomicU64::new(0));
+        let download_gate = Arc::new(Mutex::new(()));
+        let observe_reset = async {
+            let opened = tokio::time::timeout(Duration::from_secs(1), control_rx.recv())
+                .await
+                .expect("TcpOpened must arrive before destination failure")
+                .expect("control lane must stay open");
+            assert!(
+                matches!(opened, TunnelFrame::TcpOpened { stream_id: 7, .. }),
+                "destination failure must occur after TcpOpened, got {opened:?}"
+            );
+            reset_tx.send(()).expect("signal destination reset");
+
+            let reset = tokio::time::timeout(Duration::from_secs(1), data_rx.recv())
+                .await
+                .expect("post-open destination error must emit TcpReset")
+                .expect("data lane must stay open");
+            assert_eq!(
+                reset,
+                TunnelFrame::TcpReset {
+                    stream_id: 7,
+                    code: TunnelErrorCode::ConnectionRefused,
+                }
+            );
+            assert!(
+                data_rx.try_recv().is_err(),
+                "a post-open destination error must emit exactly one TcpReset"
+            );
+        };
+        let pump = open_and_pump(
+            7,
+            "127.0.0.1".to_owned(),
+            destination_addr.port(),
+            &egress,
+            &sink,
+            session,
+            to_dest_rx,
+            &send_credit,
+            &idle,
+            download_uncredited,
+            download_gate,
+            &token,
+        );
+        let (result, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(1), pump),
+            observe_reset
+        );
+
+        assert!(
+            result.expect("relay pump must finish").is_ok(),
+            "post-open destination reset is reported on the wire, not as a second caller reset"
+        );
+        destination
+            .await
+            .expect("destination reset task must not panic");
+        assert!(
+            token.is_cancelled(),
+            "stream tears down only after its reset is sent"
+        );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn relay_shutdown_joins_idle_watchdog() {
+        let (exit_gate, _clear_exit_gate) = super::super::flow::install_idle_guard_exit_gate();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind destination listener");
+        let destination_addr = listener.local_addr().expect("destination listener address");
+        let (close_destination, wait_for_close) = tokio::sync::oneshot::channel();
+        let destination = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("accept destination connection");
+            wait_for_close.await.expect("close destination connection");
+            drop(stream);
+        });
+
+        let (mut client_transport, server_transport) = handshake_pair();
+        let (
+            (mut client_read, mut client_write, _client_peer),
+            (server_read, server_write, server_peer),
+        ) = carrier_test_pair().await;
+        let shutdown = CancellationToken::new();
+        let session: Arc<dyn TunnelServerSession> = Arc::new(RecordingSession::new());
+        let mut relay = tokio::spawn(run_server_relay(
+            AdmittedPeer {
+                client_key: TunnelPublicKey([0; 32]),
+                session,
+                transport: server_transport,
+                read_half: server_read,
+                write_half: server_write,
+                carrier_peer: server_peer,
+            },
+            Arc::new(EgressPolicy {
+                idle_timeout: Duration::from_secs(60),
+                ..EgressPolicy::default()
+            }),
+            shutdown.clone(),
+        ));
+
+        let open = client_transport
+            .encrypt(&TunnelFrame::OpenTcp {
+                stream_id: 7,
+                host: "127.0.0.1".to_owned(),
+                port: destination_addr.port(),
+            })
+            .expect("encrypt OpenTcp");
+        for chunk in chunk_ciphertext(&open) {
+            client_write
+                .send_tunnel(&chunk)
+                .await
+                .expect("send OpenTcp");
+        }
+
+        let mut defrag = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
+        let opened = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let ciphertext = recv_one_ciphertext(&mut client_read, &mut defrag)
+                    .await
+                    .expect("server must respond over the carrier");
+                let frame = client_transport
+                    .decrypt(&ciphertext)
+                    .expect("decrypt server response");
+                if matches!(frame, TunnelFrame::TcpOpened { stream_id: 7, .. }) {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("TcpOpened must prove the relay created its stream watchdog");
+        assert!(matches!(
+            opened,
+            TunnelFrame::TcpOpened { stream_id: 7, .. }
+        ));
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), exit_gate.wait_until_entered())
+            .await
+            .expect("idle watchdog must observe relay cancellation");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut relay)
+                .await
+                .is_err(),
+            "relay shutdown must wait for its idle watchdog to exit"
+        );
+
+        exit_gate.release();
+        tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .expect("relay shutdown must finish after watchdog exit")
+            .expect("relay task must not panic");
+        close_destination
+            .send(())
+            .expect("release destination connection");
+        destination.await.expect("destination task must not panic");
     }
 }

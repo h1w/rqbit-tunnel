@@ -136,16 +136,16 @@ pub fn initiator_complete(
 
 // ── Responder (single-phase) ────────────────────────────────────────────────
 
-/// Accept an incoming Noise IK handshake as the responder.
+/// Accept an incoming Noise IK handshake with an authorization context.
 ///
-/// Processes the initiator's first message, inspects the remote static public
-/// key, rejects if absent from `allowed_clients`, and returns a ready-to-use
-/// `NoiseTransport`, the remote public key, and the reply bytes to send back.
-pub fn responder_accept(
+/// The remote static key is available only after reading the initiator's first
+/// Noise message. Authorization runs exactly once before the responder writes
+/// a reply, so rejected clients receive no Noise response.
+pub(crate) fn responder_accept_with<T>(
     local_key: &TunnelPrivateKey,
     msg: &[u8],
-    allowed_clients: &HashSet<TunnelPublicKey>,
-) -> Result<(NoiseTransport, TunnelPublicKey, Vec<u8>), TunnelCryptoError> {
+    authorize: impl FnOnce(&TunnelPublicKey) -> Option<T>,
+) -> Result<(NoiseTransport, TunnelPublicKey, T, Vec<u8>), TunnelCryptoError> {
     let params = noise_params();
 
     let builder = snow::Builder::new(params).local_private_key(&local_key.0);
@@ -154,13 +154,11 @@ pub fn responder_accept(
         .build_responder()
         .map_err(|e| TunnelCryptoError::HandshakeFailed(format!("responder build: {e}")))?;
 
-    // Read the initiator's first message.
     let mut read_buf = [0u8; 256];
     responder
         .read_message(msg, &mut read_buf)
         .map_err(|e| TunnelCryptoError::HandshakeFailed(format!("responder read: {e}")))?;
 
-    // Extract the remote static key (the initiator's public key).
     let remote_static: [u8; 32] = responder
         .get_remote_static()
         .ok_or_else(|| {
@@ -168,19 +166,14 @@ pub fn responder_accept(
         })?
         .try_into()
         .map_err(|_| TunnelCryptoError::HandshakeFailed("remote static key wrong length".into()))?;
-
     let remote_pub = TunnelPublicKey(remote_static);
+    let context = authorize(&remote_pub)
+        .ok_or_else(|| TunnelCryptoError::ClientNotAllowed(remote_pub.clone()))?;
 
-    if !allowed_clients.contains(&remote_pub) {
-        return Err(TunnelCryptoError::ClientNotAllowed(remote_pub));
-    }
-
-    // Write the responder's reply.
     let mut msg_buf = [0u8; 256];
     let len = responder
         .write_message(&[], &mut msg_buf)
         .map_err(|e| TunnelCryptoError::HandshakeFailed(format!("responder write: {e}")))?;
-
     let noise = responder
         .into_transport_mode()
         .map_err(|e| TunnelCryptoError::HandshakeFailed(format!("responder transport: {e}")))?;
@@ -192,8 +185,22 @@ pub fn responder_accept(
             send_seq: 0,
         },
         remote_pub,
+        context,
         msg_buf[..len].to_vec(),
     ))
+}
+
+/// Accept an incoming Noise IK handshake as the responder using a static
+/// allowlist.
+pub fn responder_accept(
+    local_key: &TunnelPrivateKey,
+    msg: &[u8],
+    allowed_clients: &HashSet<TunnelPublicKey>,
+) -> Result<(NoiseTransport, TunnelPublicKey, Vec<u8>), TunnelCryptoError> {
+    let (transport, key, (), reply) = responder_accept_with(local_key, msg, |key| {
+        allowed_clients.contains(key).then_some(())
+    })?;
+    Ok((transport, key, reply))
 }
 
 // ── Noise transport encrypt / decrypt ───────────────────────────────────────
@@ -287,6 +294,14 @@ pub fn generate_keypair() -> (TunnelPrivateKey, TunnelPublicKey) {
     (TunnelPrivateKey(private), TunnelPublicKey(public))
 }
 
+/// Derive the X25519 public key corresponding to a tunnel private key.
+///
+/// This keeps callers outside the tunnel implementation independent from the
+/// Curve25519 implementation details.
+pub fn tunnel_public_key(private: &TunnelPrivateKey) -> TunnelPublicKey {
+    public_key(private)
+}
+
 // ── Carrier hash derivation ─────────────────────────────────────────────────
 
 /// Derive the x25519 public key from a private key (Curve25519 base-point
@@ -342,19 +357,20 @@ mod tests {
     use super::super::frame::{TunnelDestination, TunnelErrorCode};
     use super::*;
     use bytes::Bytes;
+    use std::cell::Cell;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
-    /// Linchpin: our `public_key` derivation MUST match the public key snow
-    /// produced for the same private key, otherwise the client (deriving the
-    /// carrier hash from the pinned server *public* key) and the server
-    /// (deriving it from its own *private* key) would disagree and the MSE
-    /// handshake would fail.
+    /// Linchpin: our public `tunnel_public_key` derivation MUST match the
+    /// public key snow produced for the same private key, otherwise the client
+    /// (deriving the carrier hash from the pinned server *public* key) and the
+    /// server (deriving it from its own *private* key) would disagree and the
+    /// MSE handshake would fail.
     #[test]
-    fn public_key_matches_generated_keypair() {
+    fn tunnel_public_key_matches_generated_keypair() {
         for _ in 0..16 {
             let (priv_key, pub_key) = generate_keypair();
             assert_eq!(
-                public_key(&priv_key),
+                tunnel_public_key(&priv_key),
                 pub_key,
                 "derived public key must equal snow's public key"
             );
@@ -413,6 +429,50 @@ mod tests {
             matches!(result, Err(TunnelCryptoError::ClientNotAllowed(_))),
             "expected ClientNotAllowed, got {result:?}"
         );
+    }
+
+    #[test]
+    fn responder_accept_with_calls_authorizer_once_before_reply() {
+        let (client_key, client_public_key) = client_keys();
+        let (server_key, server_public_key) = server_keys();
+        let (handshake, initial_message) =
+            initiator_start(&client_key, &server_public_key).expect("start initiator");
+        let calls = Cell::new(0);
+
+        let (_transport, key, context, reply) =
+            responder_accept_with(&server_key, &initial_message, |key| {
+                calls.set(calls.get() + 1);
+                (key == &client_public_key).then_some("session")
+            })
+            .expect("authorized client should receive a reply");
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(key, client_public_key);
+        assert_eq!(context, "session");
+        assert!(
+            initiator_complete(handshake, &reply).is_ok(),
+            "the reply must complete the initiator handshake"
+        );
+    }
+
+    #[test]
+    fn responder_accept_with_rejects_unauthorized_before_reply() {
+        let (client_key, _) = client_keys();
+        let (server_key, server_public_key) = server_keys();
+        let (_handshake, initial_message) =
+            initiator_start(&client_key, &server_public_key).expect("start initiator");
+        let calls = Cell::new(0);
+
+        let result = responder_accept_with(&server_key, &initial_message, |_| {
+            calls.set(calls.get() + 1);
+            None::<()>
+        });
+
+        assert!(matches!(
+            result,
+            Err(TunnelCryptoError::ClientNotAllowed(_))
+        ));
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]

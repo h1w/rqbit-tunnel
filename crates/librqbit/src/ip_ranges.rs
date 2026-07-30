@@ -225,6 +225,7 @@ mod tests {
         // Create a temporary file
         let mut temp_file = tokio::fs::File::create("temp_list.txt").await?;
         tokio::io::AsyncWriteExt::write_all(&mut temp_file, LIST).await?;
+        temp_file.flush().await?;
         drop(temp_file); // Close the file
 
         // Load the list from the file

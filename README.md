@@ -85,118 +85,159 @@ rqbit --socks-url socks5://[username:password]@host:port ...
 
 ## Tunnel mode
 
-rqbit can operate as an **encrypted TCP tunnel** between a desktop client behind
-NAT and a reachable VPS server. The tunnel uses a private BitTorrent v2 (BEP 52)
-carrier keyed by a real per-server torrent info-hash — at the protocol level the
-connection looks like an encrypted (MSE/PE) BitTorrent peer connection.
+rqbit tunnel is an encrypted TCP tunnel between a reachable VPS server and an
+enrolled client. The carrier uses a private BitTorrent v2 (BEP 52) info-hash
+and MSE/PE on the wire; Noise IK authenticates and encrypts every tunnel frame.
+The managed server relays authorized client traffic to destination hosts.
 
-> **Quickstart:** it's one binary; server and client differ only by flags. See
-> [`scripts/tunnel/`](scripts/tunnel/README.md) — run `server-quickstart.sh` on
-> the VPS, then `client-run.sh` (or double-click `client-run.bat` on Windows) on
-> the desktop.
+> **Managed-server quickstart:** see
+> [`scripts/tunnel/README.md`](scripts/tunnel/README.md). The server is a
+> root-owned systemd service, not a foreground `rqbit server start` command.
 
-> **Honest scope:** this blends at the *protocol* level. It does **not** disguise
-> traffic *shape* — a single long-lived, high-throughput connection to one IP
-> with no swarm/DHT is still distinguishable by traffic analysis.
+> **Honest scope:** this blends at the protocol level. A long-lived,
+> high-throughput connection to one IP is still distinguishable by traffic
+> analysis; it does not hide traffic shape.
 
-**Encryption layers:**
-1. **Outer:** MSE/PE (Message Stream Encryption / Protocol Encryption) —
-   standard BitTorrent peer-wire obfuscation.
-2. **Inner:** Noise IK (Curve25519 + ChaChaPoly) — static-key authenticated
-   encryption of every tunnel frame.
+### Install the VPS server
 
-**Traffic flow:**
-- Local applications (browser, curl, etc.) **→** client loopback SOCKS5 (`127.0.0.1:1080`).
-- **Client → VPS:** encrypted carrier leg (Noise frames inside BitTorrent peer-wire).
-- **VPS → destination:** normal TCP (the VPS egresses requests to the target host).
-
-The server allowlists client public keys — only authorized clients may connect.
-
-**DHT discovery (optional).** With the DHT enabled, the server announces the
-carrier hash and the client looks it up, so the client can find the server
-without a pre-shared address (`--tunnel-server-addr` becomes optional) — which
-also survives a change of the server's IP — and the connection blends with real
-BitTorrent DHT traffic. DHT results are untrusted: the server is always
-authenticated by its pinned static key, so a wrong/poisoned address just fails
-and the next candidate is tried. A static `--tunnel-server-addr`, when given, is
-tried first as a fast path.
-
-### Key generation
-
-The binary generates the keypairs (no dependencies):
+Extract a trusted Linux release bundle and run its bootstrap script from the
+bundle directory. It automatically uses the bundled `rqbit-tunnel` and `rqbit`,
+never an executable selected from `PATH`:
 
 ```bash
-rqbit tunnel keygen --output-dir ~/.rqbit/tunnel-keys
+cd rqbit-tunnel-x86_64-unknown-linux-gnu
+SERVER_IP="$PUBLIC_SERVER_IPV4" ./server-quickstart.sh
 ```
 
-No pairing bundle is needed — the carrier identity is derived from the server
-key on both sides. This produces:
+It discovers a public IPv4 address only as a best effort. Set `SERVER_IP` to
+the VPS's reachable numeric public IPv4 address when known. The generated server
+binds `peer_listen` to `0.0.0.0:PEER_PORT` and writes that public endpoint
+separately as `advertised_peer` for enrollment bundles; this also works when the
+VPS uses 1:1 NAT.
 
-| File | Permissions | Purpose |
-|------|------------|---------|
-| `client.key` | `600` (secret) | Client x25519 private key |
-| `client.pub` | `644` (public) | Client x25519 public key |
-| `server.key` | `600` (secret) | Server x25519 private key |
-| `server.pub` | `644` (public) | Server x25519 public key |
+The installation creates root-owned `/etc/rqbit-tunnel`,
+`/var/lib/rqbit-tunnel`, `/var/lib/rqbit-tunnel/enrollments`, and
+`/run/rqbit-tunnel`; `server.key` is mode `0600`.
+On refresh, the installer stops an active managed service and waits for its
+control socket to disappear before replacing files and starting it again; the
+protected configuration, key, and database stay intact. If the unit is inactive
+while a control-socket path exists, it aborts rather than starting beside an
+unknown server.
 
-Keys are 32-byte hex-encoded values (64 hex characters).
-
-**Security:** Never share `.key` files. Only `.pub` files should be exchanged
-between client and server operators.
-
-### VPS server
+It then runs `daemon-reload`, enables and starts the service, and requires both
+an active systemd unit and local `server users list --json` health before opening
+the TUI. Automation must opt out explicitly:
 
 ```bash
-# Create allowed-clients file with the client's public key
-echo "CLIENT_PUB_HEX" > /etc/rqbit/allowed-clients.txt
-
-rqbit server start /data \
-  --tunnel-mode server \
-  --tunnel-peer-listen 0.0.0.0:4242 \
-  --tunnel-server-key /etc/rqbit/server.key \
-  --tunnel-allowed-clients /etc/rqbit/allowed-clients.txt \
-  --tunnel-carrier-root /var/lib/rqbit/tunnel
+# Set PUBLIC_SERVER_IPV4 to the VPS's real reachable public IPv4 address.
+SERVER_IP="$PUBLIC_SERVER_IPV4" ./server-quickstart.sh --skip-tui
 ```
 
-### Desktop client
+The service command is exactly:
+
+```text
+/opt/rqbit-tunnel/rqbit-tunnel server run --config /etc/rqbit-tunnel/server.json
+```
+
+### SSH administration
+
+The Unix control socket is local to the VPS at
+`/run/rqbit-tunnel/server.sock`; no management port is exposed. From an SSH
+terminal:
 
 ```bash
-rqbit server start /data \
-  --tunnel-mode client \
-  --tunnel-socks-listen 127.0.0.1:1080 \
-  --tunnel-server-addr vps.example.com:4242 \
-  --tunnel-client-key ~/.rqbit/client.key \
-  --tunnel-server-key ~/.rqbit/server.pub
+ssh -t admin@your-vps 'sudo /opt/rqbit-tunnel/rqbit-tunnel server tui'
 ```
 
-### Using the tunnel
-
-Point any SOCKS5-compatible application at `127.0.0.1:1080`:
+The dashboard refreshes state every second; `F5` requests an immediate refresh.
+It adds users only through an explicit name/export-path flow and displays a
+confirmation before writing an enrollment bundle. The service sandbox can write
+only its managed paths, so choose a path below
+`/var/lib/rqbit-tunnel/enrollments`, not `/root` or `/home`. The CLI supports
+the same operations for automation:
 
 ```bash
-# curl
-curl --socks5 127.0.0.1:1080 https://checkip.amazonaws.com
-# → shows your VPS IP
-
-# Firefox: Settings → Network Settings → SOCKS Host: 127.0.0.1, Port: 1080, SOCKS v5
+sudo /opt/rqbit-tunnel/rqbit-tunnel server users list --json
+sudo /opt/rqbit-tunnel/rqbit-tunnel server users add \
+  --name alice --export /var/lib/rqbit-tunnel/enrollments/alice.rqbt
+sudo /opt/rqbit-tunnel/rqbit-tunnel server users disable USER_ID
+sudo /opt/rqbit-tunnel/rqbit-tunnel server users delete USER_ID
+sudo /opt/rqbit-tunnel/rqbit-tunnel server settings show --json
 ```
 
-### Environment variables
+Disable immediately removes the user's admission key and ends active carrier
+sessions; an explicit later enable restores that same user's access. Delete does
+the same and removes the record, so the old bundle stays revoked even if a later
+user is created.
 
-Every `--tunnel-*` flag has a corresponding `RQBIT_TUNNEL_*` environment variable:
+### Operate an enrolled client
 
-| Flag | Environment variable |
-|------|---------------------|
-| `--tunnel-mode` | `RQBIT_TUNNEL_MODE` |
-| `--tunnel-socks-listen` | `RQBIT_TUNNEL_SOCKS_LISTEN` |
-| `--tunnel-server-addr` | `RQBIT_TUNNEL_SERVER_ADDR` |
-| `--tunnel-peer-listen` | `RQBIT_TUNNEL_PEER_LISTEN` |
-| `--tunnel-client-key` | `RQBIT_TUNNEL_CLIENT_KEY` |
-| `--tunnel-server-key` | `RQBIT_TUNNEL_SERVER_KEY` |
-| `--tunnel-allowed-clients` | `RQBIT_TUNNEL_ALLOWED_CLIENTS` |
-| `--tunnel-pairing` | `RQBIT_TUNNEL_PAIRING` |
-| `--tunnel-carrier-root` | `RQBIT_TUNNEL_CARRIER_ROOT` |
-| `--tunnel-egress-policy` | `RQBIT_TUNNEL_EGRESS_POLICY` |
+Transfer a server-issued enrollment bundle over an authenticated channel, then
+run the client as a managed service rather than a detached foreground process.
+The complete platform procedures are in
+[`scripts/tunnel/README.md`](scripts/tunnel/README.md).
+
+On Linux, extract the signed release bundle and run `sudo ./install-client.sh`.
+On Windows, run `.\install-client.ps1` from an Administrator PowerShell. Each
+bootstrap installs a stable launcher plus an immutable versioned payload; all
+service commands must go through that launcher:
+
+```bash
+sudo /opt/rqbit-tunnel/launcher client import --bundle /secure-transfer/alice.rqbt
+sudo /opt/rqbit-tunnel/launcher client config set --socks-listen 127.0.0.1:1080
+sudo /opt/rqbit-tunnel/launcher client service install
+sudo /opt/rqbit-tunnel/launcher client service start
+/opt/rqbit-tunnel/launcher client service status --json
+sudo /opt/rqbit-tunnel/launcher client service enable-autostart
+```
+
+Run `client service restart` after a configuration change.
+`client service disable-autostart` removes future boot activation only; use
+`client service stop` separately to terminate a live client. The delivered
+`client-run.sh`, `client-run.ps1`, and `client-run.bat` provide the same
+interactive flow.
+
+The dashboard's `u` action checks the pinned, signed GitHub Release manifest
+only after confirmation, then asks again before installing the displayed
+version. It has no background updater; a failed local health check restores the
+previous release. A release that requires a newer launcher ABI requires a
+matching manual bundle installation.
+
+Run the per-user tray through `launcher tray`, never from the service account.
+It opens the dashboard on click and reports gray (local IPC unavailable), red
+(service failed), yellow (reconnecting/no carrier), or green (live carrier).
+Linux exits successfully with `tray unavailable` if its desktop has no
+supported tray backend.
+The Linux service and CLI payload do not load desktop libraries; GTK/AppIndicator
+runtime dependencies apply only to the separate `rqbit-tunnel-tray` companion.
+
+### Traffic counters
+
+`upload` means client → VPS → destination: TCP payload counts after a successful
+destination write and UDP after a successful destination send. `download` means
+destination → VPS → client: TCP counts after the client confirms its local SOCKS
+write, while UDP counts once queued toward the client because it has no delivery
+acknowledgement. Totals exclude tunnel framing, cryptographic overhead, cover
+traffic, rejected requests, failed writes, and unsent queue contents.
+
+Counters refresh live in memory and attempt a SQLite flush at least once per
+second (and synchronously during graceful shutdown). After successful flushes,
+a power loss can omit no more than the last unflushed second. If SQLite remains
+unwritable, pending deltas stay in memory and a power loss can lose every delta
+since the last successful flush; totals are not per-byte crash-durable.
+
+### Security boundaries
+
+- **Enrollment bundles are unencrypted transferable secrets.** Each export
+  contains a client private key; any holder can use the tunnel until the user is
+  disabled or deleted. Export only on an explicit TUI/CLI action to a protected
+  path.
+- **Client SOCKS defaults to loopback.** The default server-issued bundle
+  configures `127.0.0.1:1080`. A non-loopback listener is rejected unless
+  the operator passes `--allow-unauthenticated-lan-socks true`; this creates
+  an unauthenticated open proxy for every reachable host. Use it only behind
+  a trusted network boundary. The client dashboard keeps a persistent critical
+  warning while that setting is enabled.
 
 ## Watching a directory for .torrents
 

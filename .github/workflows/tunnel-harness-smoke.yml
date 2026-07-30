@@ -1,0 +1,151 @@
+name: Tunnel harness service smoke
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  linux-systemd:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux tray build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Linux managed client
+        run: |
+          CARGO_TARGET_DIR=target/tunnel-core cargo build --release -p rqbit-tunnel \
+            --bin rqbit-tunnel \
+            --bin rqbit-tunnel-launcher \
+            --bin rqbit-tunnel-updater
+          CARGO_TARGET_DIR=target/tunnel-tray cargo build --release -p rqbit-tunnel \
+            --features tray-linux \
+            --bin rqbit-tunnel-tray
+
+      - name: Assemble Linux smoke bundle
+        run: |
+          set -euo pipefail
+          bundle=rqbit-tunnel-x86_64-unknown-linux-gnu
+          mkdir -p "$bundle/systemd"
+          cp target/tunnel-core/release/rqbit-tunnel "$bundle/rqbit-tunnel"
+          cp target/tunnel-core/release/rqbit-tunnel-launcher "$bundle/launcher"
+          cp target/tunnel-core/release/rqbit-tunnel-updater "$bundle/rqbit-tunnel-updater"
+          cp target/tunnel-tray/release/rqbit-tunnel-tray "$bundle/rqbit-tunnel-tray"
+          cp scripts/tunnel/install-client.sh "$bundle/"
+          cp systemd/rqbit-tunnel-client.service "$bundle/systemd/"
+          printf '9.0.0-rc.0\n' >"$bundle/release-version.txt"
+          chmod 0755 "$bundle/rqbit-tunnel" "$bundle/launcher" \
+            "$bundle/rqbit-tunnel-tray" "$bundle/rqbit-tunnel-updater" "$bundle/install-client.sh"
+          tar -czf "$bundle.tar.gz" "$bundle"
+
+      - name: Build systemd smoke image
+        run: |
+          cat >"$RUNNER_TEMP/Dockerfile.rqbit-tunnel-systemd-smoke" <<'EOF'
+          FROM ubuntu:24.04
+          RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends systemd systemd-sysv util-linux && rm -rf /var/lib/apt/lists/*
+          STOPSIGNAL SIGRTMIN+3
+          CMD ["/sbin/init"]
+          EOF
+          docker build --tag rqbit-tunnel-systemd-smoke \
+            --file "$RUNNER_TEMP/Dockerfile.rqbit-tunnel-systemd-smoke" .
+
+      - name: Run real systemd smoke container
+        run: |
+          set -euo pipefail
+          container=rqbit-tunnel-systemd-smoke
+          trap 'docker rm --force "$container" >/dev/null 2>&1 || true' EXIT
+          docker run --detach --name "$container" --privileged --cgroupns=host \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+            -v "$PWD:/workspace:ro" \
+            rqbit-tunnel-systemd-smoke
+          dump_systemd_state() {
+            docker inspect "$container" --format 'status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}' || true
+            docker exec "$container" cat /proc/1/cgroup || true
+            docker exec "$container" systemctl --no-pager --full status || true
+            docker exec "$container" journalctl --no-pager --no-hostname -b || true
+            docker logs "$container" || true
+          }
+          # PID 1 exposes a system bus before its service manager is reliably reachable.
+          ready_probes=0
+          for _ in $(seq 1 30); do
+            if docker exec "$container" systemctl show --property=Version --value >/dev/null 2>&1; then
+              ((ready_probes += 1))
+              if (( ready_probes == 3 )); then
+                break
+              fi
+            else
+              ready_probes=0
+            fi
+            sleep 1
+          done
+          if (( ready_probes < 3 )); then
+            dump_systemd_state
+            exit 1
+          fi
+          docker exec "$container" bash -lc '
+            set -euo pipefail
+            bash /workspace/scripts/tunnel/smoke-systemd.sh \
+              --bundle /workspace/rqbit-tunnel-x86_64-unknown-linux-gnu.tar.gz
+          ' || {
+            dump_systemd_state
+            exit 1
+          }
+
+  windows-service:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Windows managed client
+        shell: pwsh
+        run: |
+          cargo build --release -p rqbit-tunnel --features tray-windows `
+            --bin rqbit-tunnel `
+            --bin rqbit-tunnel-launcher `
+            --bin rqbit-tunnel-tray `
+            --bin rqbit-tunnel-updater
+
+      - name: Assemble and test Windows bundle
+        shell: pwsh
+        run: |
+          $bundle = 'rqbit-tunnel-x86_64-pc-windows-msvc'
+          New-Item -ItemType Directory -Force -Path $bundle | Out-Null
+          Copy-Item target/release/rqbit-tunnel.exe "$bundle/rqbit-tunnel.exe"
+          Copy-Item target/release/rqbit-tunnel-launcher.exe "$bundle/launcher.exe"
+          Copy-Item target/release/rqbit-tunnel-updater.exe "$bundle/rqbit-tunnel-updater.exe"
+          Copy-Item target/release/rqbit-tunnel-tray.exe "$bundle/rqbit-tunnel-tray.exe"
+          Copy-Item scripts/tunnel/install-client.ps1 "$bundle/install-client.ps1"
+          Copy-Item scripts/tunnel/client-run.ps1 "$bundle/client-run.ps1"
+          Copy-Item scripts/tunnel/client-run.bat "$bundle/client-run.bat"
+          Set-Content -LiteralPath "$bundle/release-version.txt" -Value '9.0.0-rc.0' -NoNewline
+          Compress-Archive -Path $bundle -DestinationPath "$bundle.zip" -Force
+          pwsh -NoProfile -File scripts/tunnel/test-client-bootstrap.ps1 `
+            -Installer scripts/tunnel/install-client.ps1
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          pwsh -NoProfile -File scripts/tunnel/smoke-windows-service.ps1 -Bundle "$bundle.zip"
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Collect Windows service diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          sc.exe query rqbit-tunnel-client
+          Get-WinEvent -LogName System -MaxEvents 100 |
+            Where-Object { $_.ProviderName -match 'Service Control Manager' } |
+            Format-List -Property TimeCreated, Id, LevelDisplayName, Message
