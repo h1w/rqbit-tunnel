@@ -420,7 +420,7 @@ param(
         $syntheticDirectoryItem = [pscustomobject]@{
             PSIsContainer = $true
             Attributes = [IO.FileAttributes]::Normal
-            FullName = (Join-Path $bundleTestDirectory 'directory bundle.rqbt')
+            FullName = $aliceBundle
         }
         if (Test-RegularEnrollmentBundleCandidate -Item $syntheticDirectoryItem) {
             throw 'a directory item must not be an enrollment bundle candidate'
@@ -429,7 +429,7 @@ param(
         $syntheticReparsePointItem = [pscustomobject]@{
             PSIsContainer = $false
             Attributes = [IO.FileAttributes]::ReparsePoint
-            FullName = (Join-Path $bundleTestDirectory 'reparse bundle.rqbt')
+            FullName = $aliceBundle
         }
         if (Test-RegularEnrollmentBundleCandidate -Item $syntheticReparsePointItem) {
             throw 'a reparse-point item must not be an enrollment bundle candidate'
