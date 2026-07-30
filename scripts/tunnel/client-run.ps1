@@ -168,13 +168,14 @@ if ($SelfTest) {
     }
 
     $expectedStatusOwnerSid = 'S-1-5-21-42424-42425-42426-1001'
-    $captureDirectory = Join-Path ([IO.Path]::GetTempPath()) ("rqbit-tunnel-menu-self-test-" + [Guid]::NewGuid().ToString("N"))
+    $captureDirectory = Join-Path ([IO.Path]::GetTempPath()) ("rqbit tunnel menu self test " + [Guid]::NewGuid().ToString("N"))
     $captureScriptPath = Join-Path $captureDirectory 'capture-menu-invocation.ps1'
     $captureResultPath = Join-Path $captureDirectory 'capture-menu-invocation.json'
     $captureEnvironmentVariable = 'RQBIT_TUNNEL_MENU_CAPTURE_PATH'
     $previousCaptureResultPath = [Environment]::GetEnvironmentVariable($captureEnvironmentVariable, 'Process')
     [IO.Directory]::CreateDirectory($captureDirectory) | Out-Null
     Set-Content -LiteralPath $captureScriptPath -Value @'
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [switch]$ElevatedMenu,
     [string]$StatusOwnerSid,
