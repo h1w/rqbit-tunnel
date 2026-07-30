@@ -464,6 +464,32 @@ param(
     finally {
         Remove-Item -LiteralPath $bundleTestDirectory -Recurse -Force -ErrorAction SilentlyContinue
     }
+    $menuOutputSentinel = 'rqbit tunnel menu output self-test'
+    $bin = {
+        param(
+            [Parameter(ValueFromRemainingArguments = $true)]
+            [string[]]$Arguments
+        )
+        Write-Output $menuOutputSentinel
+        & $env:ComSpec /d /c exit 0
+    }
+    $successfulMenuResult = @(Invoke-MenuCommand -ClientArguments @('client', 'import') -PassThru)
+    if ($successfulMenuResult.Count -ne 1 -or [bool]$successfulMenuResult[0] -ne $true) {
+        throw 'successful menu commands must return only true when their output is displayed'
+    }
+
+    $bin = {
+        param(
+            [Parameter(ValueFromRemainingArguments = $true)]
+            [string[]]$Arguments
+        )
+        Write-Output $menuOutputSentinel
+        & $env:ComSpec /d /c exit 1
+    }
+    $failedMenuResult = @(Invoke-MenuCommand -ClientArguments @('client', 'import') -PassThru)
+    if ($failedMenuResult.Count -ne 1 -or [bool]$failedMenuResult[0] -ne $false) {
+        throw 'failed menu commands must return only false when their output is displayed'
+    }
     exit 0
 }
 
