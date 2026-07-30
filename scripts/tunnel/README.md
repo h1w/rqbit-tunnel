@@ -202,6 +202,16 @@ Administrator PowerShell:
 `client-run.ps1` and its `client-run.bat` double-click wrapper offer the same
 interactive service and configuration flow from the extracted bundle.
 
+Double-click `client-run.bat` as the desktop user. It opens one elevated
+control console after one UAC confirmation; all menu actions, configuration
+output, and the client TUI run in that console without additional UAC prompts.
+Closing it ends that elevated session, so the next launch asks once again.
+
+When importing an enrollment bundle, press Enter at the path prompt if the
+extracted bundle folder contains exactly one regular `*.rqbt` file. The menu
+names and imports that file automatically. With no bundle or multiple bundles,
+it prints the discovered state and requires an explicit path; it never guesses.
+
 ### Tray status (Linux and Windows)
 
 The tray is a best-effort, per-user status process; it never runs inside the
