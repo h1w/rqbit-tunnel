@@ -154,56 +154,57 @@ if ($SelfTest) {
     if ($actualElevatedHost -cne $expectedElevatedHost) {
         throw "elevated PowerShell host must come from the current process"
     }
-    $tuiAction = Get-ClientTuiMenuAction
-    if (-not $tuiAction.Protected -or @($tuiAction.ClientArguments).Count -ne 2 -or $tuiAction.ClientArguments[0] -cne "client" -or $tuiAction.ClientArguments[1] -cne "tui") {
-        throw "Windows dashboard launch must use the protected client tui invocation"
-    }
-    $configShowAction = Get-ClientConfigShowMenuAction
-    if (-not $configShowAction.Protected -or @($configShowAction.ClientArguments).Count -ne 3 -or $configShowAction.ClientArguments[0] -cne "client" -or $configShowAction.ClientArguments[1] -cne "config" -or $configShowAction.ClientArguments[2] -cne "show") {
-        throw "Windows configuration display must use the protected client config show invocation"
-    }
-    $expectedExecutable = "C:\Program Files\Rqbit Tunnel\rqbit-tunnel.exe"
-    $expectedArguments = @(
-        "client",
-        "import",
-        "--bundle",
-        "C:\Users\Alice Example\Bundles\client bundle.json",
-        '--literal=$(Get-Date);$HOME'
+    $launchCases = @(
+        [pscustomobject]@{ Administrator = $false; ElevatedMenu = $false; Expected = 'elevate' },
+        [pscustomobject]@{ Administrator = $false; ElevatedMenu = $true; Expected = 'reject' },
+        [pscustomobject]@{ Administrator = $true; ElevatedMenu = $false; Expected = 'run' },
+        [pscustomobject]@{ Administrator = $true; ElevatedMenu = $true; Expected = 'run' }
     )
-    $expectedStatusOwnerSid = "S-1-5-21-42424-42425-42426-1001"
-    $startProcessArguments = New-ElevatedClientStartProcessArguments -Executable $expectedExecutable -ClientArguments $expectedArguments -StatusOwnerSid $expectedStatusOwnerSid
-    if ($startProcessArguments.Count -ne 4 -or $startProcessArguments[0] -cne "-NoProfile" -or $startProcessArguments[1] -cne "-NonInteractive" -or $startProcessArguments[2] -cne "-EncodedCommand") {
-        throw "elevated invocation must pass only fixed PowerShell flags and one encoded payload"
-    }
-    $payload = Read-ElevatedClientEncodedPayload -EncodedCommand $startProcessArguments[3]
-    $decoder = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($startProcessArguments[3]))
-    if (-not $decoder.Contains('$env:RQBIT_TUNNEL_STATUS_OWNER_SID = [string]$payload.status_owner_sid')) {
-        throw "elevated invocation must propagate the desktop status owner SID"
-    }
-    $actualArguments = [string[]]@($payload.arguments)
-    if ($payload.executable -cne $expectedExecutable -or $actualArguments.Count -ne $expectedArguments.Count) {
-        throw "elevated invocation payload did not preserve its executable and argument count"
-    }
-    if ($payload.status_owner_sid -cne $expectedStatusOwnerSid) {
-        throw "elevated invocation payload changed the desktop status owner SID"
-    }
-    for ($index = 0; $index -lt $expectedArguments.Count; $index++) {
-        if ($actualArguments[$index] -cne $expectedArguments[$index]) {
-            throw "elevated invocation payload changed argument $index"
+    foreach ($case in $launchCases) {
+        $actual = Get-ClientMenuLaunchMode -Administrator:$case.Administrator -ElevatedMenu:$case.ElevatedMenu
+        if ($actual -cne $case.Expected) {
+            throw "unexpected menu launch mode: expected $($case.Expected), got $actual"
         }
     }
-    $expectedInstaller = "C:\Users\Alice Example\Tunnel Bundle\install-client.ps1"
-    $installerStartProcessArguments = New-ElevatedInstallerStartProcessArguments -Installer $expectedInstaller
-    if ($installerStartProcessArguments.Count -ne 4 -or $installerStartProcessArguments[0] -cne "-NoProfile" -or $installerStartProcessArguments[1] -cne "-NonInteractive" -or $installerStartProcessArguments[2] -cne "-EncodedCommand") {
-        throw "elevated installer invocation must pass only fixed PowerShell flags and one encoded payload"
+
+    $expectedScript = 'C:\Users\Alice Example\Tunnel Bundle\client-run.ps1'
+    $expectedStatusOwnerSid = 'S-1-5-21-42424-42425-42426-1001'
+    $menuArguments = New-ElevatedMenuStartProcessArguments `
+        -ScriptPath $expectedScript `
+        -StatusOwnerSid $expectedStatusOwnerSid `
+        -OpenDashboard
+    if ($menuArguments.Count -ne 5 -or
+        $menuArguments[0] -cne '-NoProfile' -or
+        $menuArguments[1] -cne '-ExecutionPolicy' -or
+        $menuArguments[2] -cne 'Bypass' -or
+        $menuArguments[3] -cne '-EncodedCommand') {
+        throw 'elevated menu invocation must contain only fixed PowerShell flags and one encoded payload'
     }
-    $installerPayload = Read-ElevatedInstallerEncodedPayload -EncodedCommand $installerStartProcessArguments[3]
-    $actualInstallerArguments = [string[]]@($installerPayload.arguments)
-    if ($installerPayload.executable -cne $expectedInstaller -or $actualInstallerArguments.Count -ne 0) {
-        throw "elevated installer invocation payload did not preserve its executable and empty argument array"
+    $menuPayload = Read-ElevatedMenuEncodedPayload -EncodedCommand $menuArguments[4]
+    if ($menuPayload.script_path -cne $expectedScript -or
+        $menuPayload.status_owner_sid -cne $expectedStatusOwnerSid -or
+        -not [bool]$menuPayload.open_dashboard) {
+        throw 'elevated menu payload did not preserve the script, desktop SID, and dashboard mode'
     }
-    if ($installerPayload.PSObject.Properties.Name -contains 'status_owner_sid') {
-        throw "elevated installer payload must not carry a desktop status owner SID"
+    $menuDecoder = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($menuArguments[4]))
+    if (-not $menuDecoder.Contains("'-ElevatedMenu'")) {
+        throw 'elevated menu payload must invoke the internal elevated-menu switch'
+    }
+
+    $tuiAction = Get-ClientTuiMenuAction
+    if (@($tuiAction.ClientArguments).Count -ne 2 -or $tuiAction.ClientArguments[0] -cne "client" -or $tuiAction.ClientArguments[1] -cne "tui") {
+        throw "Windows dashboard launch must use the client tui invocation"
+    }
+    if ($tuiAction.PSObject.Properties.Name -contains 'Protected') {
+        throw 'dashboard actions must not create an action-specific elevation boundary'
+    }
+
+    $configShowAction = Get-ClientConfigShowMenuAction
+    if (@($configShowAction.ClientArguments).Count -ne 3 -or $configShowAction.ClientArguments[0] -cne "client" -or $configShowAction.ClientArguments[1] -cne "config" -or $configShowAction.ClientArguments[2] -cne "show") {
+        throw "Windows configuration display must use the client config show invocation"
+    }
+    if ($configShowAction.PSObject.Properties.Name -contains 'Protected') {
+        throw 'configuration display actions must not create an action-specific elevation boundary'
     }
     exit 0
 }
