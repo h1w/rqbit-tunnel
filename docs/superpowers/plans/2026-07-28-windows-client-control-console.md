@@ -46,28 +46,72 @@ No Rust production source changes are needed. `crates/rqbit-tunnel/src/tray/agen
       }
   }
 
-  $expectedScript = 'C:\Users\Alice Example\Tunnel Bundle\client-run.ps1'
   $expectedStatusOwnerSid = 'S-1-5-21-42424-42425-42426-1001'
-  $menuArguments = New-ElevatedMenuStartProcessArguments `
-      -ScriptPath $expectedScript `
-      -StatusOwnerSid $expectedStatusOwnerSid `
-      -OpenDashboard
-  if ($menuArguments.Count -ne 5 -or
-      $menuArguments[0] -cne '-NoProfile' -or
-      $menuArguments[1] -cne '-ExecutionPolicy' -or
-      $menuArguments[2] -cne 'Bypass' -or
-      $menuArguments[3] -cne '-EncodedCommand') {
-      throw 'elevated menu invocation must contain only fixed PowerShell flags and one encoded payload'
+  $captureRoot = Join-Path ([IO.Path]::GetTempPath()) "rqbit tunnel menu capture $([Guid]::NewGuid().ToString('N'))"
+  $previousCapturePath = $env:RQBIT_TUNNEL_MENU_CAPTURE
+  try {
+      New-Item -ItemType Directory -Path $captureRoot -Force | Out-Null
+      $capturePath = Join-Path $captureRoot 'capture.json'
+      $captureScript = Join-Path $captureRoot 'capture.ps1'
+      @'
+  [CmdletBinding(PositionalBinding = $false)]
+  param(
+      [switch]$ElevatedMenu,
+      [string]$StatusOwnerSid,
+      [switch]$OpenDashboard
+  )
+  [pscustomobject]@{
+      elevated_menu = [bool]$ElevatedMenu
+      status_owner_sid = $StatusOwnerSid
+      open_dashboard = [bool]$OpenDashboard
+      unexpected_argument_count = @($args).Count
+  } | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:RQBIT_TUNNEL_MENU_CAPTURE -Encoding UTF8
+'@ | Set-Content -LiteralPath $captureScript -Encoding UTF8
+      $env:RQBIT_TUNNEL_MENU_CAPTURE = $capturePath
+
+      foreach ($menuCase in @(
+          [pscustomobject]@{ OpenDashboard = $false },
+          [pscustomobject]@{ OpenDashboard = $true }
+      )) {
+          Remove-Item -LiteralPath $capturePath -Force -ErrorAction SilentlyContinue
+          $menuArguments = New-ElevatedMenuStartProcessArguments `
+              -ScriptPath $captureScript `
+              -StatusOwnerSid $expectedStatusOwnerSid `
+              -OpenDashboard:$menuCase.OpenDashboard
+          if ($menuArguments.Count -ne 5 -or
+              $menuArguments[0] -cne '-NoProfile' -or
+              $menuArguments[1] -cne '-ExecutionPolicy' -or
+              $menuArguments[2] -cne 'Bypass' -or
+              $menuArguments[3] -cne '-EncodedCommand') {
+              throw 'elevated menu invocation must contain only fixed PowerShell flags and one encoded payload'
+          }
+          $menuPayload = Read-ElevatedMenuEncodedPayload -EncodedCommand $menuArguments[4]
+          if ($menuPayload.script_path -cne $captureScript -or
+              $menuPayload.status_owner_sid -cne $expectedStatusOwnerSid -or
+              ([bool]$menuPayload.open_dashboard -ne [bool]$menuCase.OpenDashboard)) {
+              throw 'elevated menu payload did not preserve the script, desktop SID, and dashboard mode'
+          }
+          & $expectedElevatedHost @menuArguments
+          if ($LASTEXITCODE -ne 0) {
+              throw "encoded menu payload exited with $LASTEXITCODE"
+          }
+          $captured = Get-Content -LiteralPath $capturePath -Raw | ConvertFrom-Json
+          if (-not [bool]$captured.elevated_menu -or
+              $captured.status_owner_sid -cne $expectedStatusOwnerSid -or
+              ([bool]$captured.open_dashboard -ne [bool]$menuCase.OpenDashboard) -or
+              $captured.unexpected_argument_count -ne 0) {
+              throw 'encoded menu payload did not bind the elevated-menu parameters correctly'
+          }
+      }
   }
-  $menuPayload = Read-ElevatedMenuEncodedPayload -EncodedCommand $menuArguments[4]
-  if ($menuPayload.script_path -cne $expectedScript -or
-      $menuPayload.status_owner_sid -cne $expectedStatusOwnerSid -or
-      -not [bool]$menuPayload.open_dashboard) {
-      throw 'elevated menu payload did not preserve the script, desktop SID, and dashboard mode'
-  }
-  $menuDecoder = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($menuArguments[4]))
-  if (-not $menuDecoder.Contains("'-ElevatedMenu'")) {
-      throw 'elevated menu payload must invoke the internal elevated-menu switch'
+  finally {
+      if ($null -eq $previousCapturePath) {
+          Remove-Item Env:RQBIT_TUNNEL_MENU_CAPTURE -ErrorAction SilentlyContinue
+      }
+      else {
+          $env:RQBIT_TUNNEL_MENU_CAPTURE = $previousCapturePath
+      }
+      Remove-Item -LiteralPath $captureRoot -Recurse -Force -ErrorAction SilentlyContinue
   }
   ```
 
@@ -128,8 +172,8 @@ No Rust production source changes are needed. `crates/rqbit-tunnel/src/tray/agen
           '$payload = $payloadJson | ConvertFrom-Json',
           'if ([string]::IsNullOrWhiteSpace([string]$payload.script_path)) { throw ''missing client control script path'' }',
           'if ([string]::IsNullOrWhiteSpace([string]$payload.status_owner_sid)) { throw ''missing desktop status owner SID'' }',
-          '$scriptArguments = @(''-ElevatedMenu'', ''-StatusOwnerSid'', [string]$payload.status_owner_sid)',
-          'if ([bool]$payload.open_dashboard) { $scriptArguments += ''-OpenDashboard'' }',
+          '$scriptArguments = @{ ElevatedMenu = $true; StatusOwnerSid = [string]$payload.status_owner_sid }',
+          'if ([bool]$payload.open_dashboard) { $scriptArguments.OpenDashboard = $true }',
           '& ([string]$payload.script_path) @scriptArguments',
           'exit $LASTEXITCODE'
       )).Replace('__RQBIT_MENU_PAYLOAD__', $payloadBase64)
