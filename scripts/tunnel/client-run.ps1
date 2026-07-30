@@ -167,28 +167,69 @@ if ($SelfTest) {
         }
     }
 
-    $expectedScript = 'C:\Users\Alice Example\Tunnel Bundle\client-run.ps1'
     $expectedStatusOwnerSid = 'S-1-5-21-42424-42425-42426-1001'
-    $menuArguments = New-ElevatedMenuStartProcessArguments `
-        -ScriptPath $expectedScript `
-        -StatusOwnerSid $expectedStatusOwnerSid `
-        -OpenDashboard
-    if ($menuArguments.Count -ne 5 -or
-        $menuArguments[0] -cne '-NoProfile' -or
-        $menuArguments[1] -cne '-ExecutionPolicy' -or
-        $menuArguments[2] -cne 'Bypass' -or
-        $menuArguments[3] -cne '-EncodedCommand') {
-        throw 'elevated menu invocation must contain only fixed PowerShell flags and one encoded payload'
+    $captureDirectory = Join-Path ([IO.Path]::GetTempPath()) ("rqbit-tunnel-menu-self-test-" + [Guid]::NewGuid().ToString("N"))
+    $captureScriptPath = Join-Path $captureDirectory 'capture-menu-invocation.ps1'
+    $captureResultPath = Join-Path $captureDirectory 'capture-menu-invocation.json'
+    $captureEnvironmentVariable = 'RQBIT_TUNNEL_MENU_CAPTURE_PATH'
+    $previousCaptureResultPath = [Environment]::GetEnvironmentVariable($captureEnvironmentVariable, 'Process')
+    [IO.Directory]::CreateDirectory($captureDirectory) | Out-Null
+    Set-Content -LiteralPath $captureScriptPath -Value @'
+param(
+    [switch]$ElevatedMenu,
+    [string]$StatusOwnerSid,
+    [switch]$OpenDashboard
+)
+
+[pscustomobject]@{
+    ElevatedMenu = [bool]$ElevatedMenu
+    StatusOwnerSid = $StatusOwnerSid
+    OpenDashboard = [bool]$OpenDashboard
+    UnexpectedArgumentCount = $args.Count
+} | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:RQBIT_TUNNEL_MENU_CAPTURE_PATH -NoNewline
+'@
+    try {
+        [Environment]::SetEnvironmentVariable($captureEnvironmentVariable, $captureResultPath, 'Process')
+        foreach ($openDashboard in @($false, $true)) {
+            $menuArguments = New-ElevatedMenuStartProcessArguments `
+                -ScriptPath $captureScriptPath `
+                -StatusOwnerSid $expectedStatusOwnerSid `
+                -OpenDashboard:$openDashboard
+            if ($menuArguments.Count -ne 5 -or
+                $menuArguments[0] -cne '-NoProfile' -or
+                $menuArguments[1] -cne '-ExecutionPolicy' -or
+                $menuArguments[2] -cne 'Bypass' -or
+                $menuArguments[3] -cne '-EncodedCommand') {
+                throw 'elevated menu invocation must contain only fixed PowerShell flags and one encoded payload'
+            }
+            $menuPayload = Read-ElevatedMenuEncodedPayload -EncodedCommand $menuArguments[4]
+            if ($menuPayload.script_path -cne $captureScriptPath -or
+                $menuPayload.status_owner_sid -cne $expectedStatusOwnerSid -or
+                $menuPayload.PSObject.Properties.Name -notcontains 'open_dashboard' -or
+                [bool]$menuPayload.open_dashboard -ne $openDashboard) {
+                throw 'elevated menu payload did not preserve the script, desktop SID, and dashboard mode'
+            }
+
+            $captureProcess = Start-Process -FilePath $actualElevatedHost -ArgumentList $menuArguments -Wait -PassThru
+            if ($captureProcess.ExitCode -ne 0) {
+                throw "elevated menu payload execution exited with $($captureProcess.ExitCode)"
+            }
+            if (-not (Test-Path -LiteralPath $captureResultPath -PathType Leaf)) {
+                throw 'elevated menu payload execution did not write its invocation capture'
+            }
+            $menuCapture = Get-Content -LiteralPath $captureResultPath -Raw | ConvertFrom-Json
+            if (-not [bool]$menuCapture.ElevatedMenu -or
+                $menuCapture.StatusOwnerSid -cne $expectedStatusOwnerSid -or
+                [bool]$menuCapture.OpenDashboard -ne $openDashboard -or
+                [int]$menuCapture.UnexpectedArgumentCount -ne 0) {
+                throw 'elevated menu payload did not bind its internal menu parameters exactly'
+            }
+            Remove-Item -LiteralPath $captureResultPath -Force
+        }
     }
-    $menuPayload = Read-ElevatedMenuEncodedPayload -EncodedCommand $menuArguments[4]
-    if ($menuPayload.script_path -cne $expectedScript -or
-        $menuPayload.status_owner_sid -cne $expectedStatusOwnerSid -or
-        -not [bool]$menuPayload.open_dashboard) {
-        throw 'elevated menu payload did not preserve the script, desktop SID, and dashboard mode'
-    }
-    $menuDecoder = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($menuArguments[4]))
-    if (-not $menuDecoder.Contains("'-ElevatedMenu'")) {
-        throw 'elevated menu payload must invoke the internal elevated-menu switch'
+    finally {
+        [Environment]::SetEnvironmentVariable($captureEnvironmentVariable, $previousCaptureResultPath, 'Process')
+        Remove-Item -LiteralPath $captureDirectory -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     $tuiAction = Get-ClientTuiMenuAction
