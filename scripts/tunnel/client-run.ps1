@@ -162,6 +162,117 @@ function Get-ClientConfigShowMenuAction {
     }
 }
 
+function Test-RegularEnrollmentBundleCandidate {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Item
+    )
+
+    $stream = $null
+    try {
+        if ([bool]$Item.PSIsContainer) {
+            return $false
+        }
+        $attributes = [IO.FileAttributes]$Item.Attributes
+        if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return $false
+        }
+        $stream = [IO.File]::Open(
+            [string]$Item.FullName,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::ReadWrite
+        )
+        return $true
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
+function Get-EnrollmentBundleCandidates {
+    param(
+        [string]$Directory
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Directory) -or
+        -not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        return @()
+    }
+
+    try {
+        $items = @(Get-ChildItem -LiteralPath $Directory -Filter '*.rqbt' -Force)
+    }
+    catch {
+        return @()
+    }
+
+    return @(
+        foreach ($item in $items) {
+            if (Test-RegularEnrollmentBundleCandidate -Item $item) {
+                $item.FullName
+            }
+        }
+    )
+}
+
+function Resolve-EnrollmentBundlePath {
+    param(
+        [AllowEmptyString()]
+        [string]$EnteredPath,
+        [string[]]$Candidates
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($EnteredPath)) {
+        return $EnteredPath
+    }
+    if (@($Candidates).Count -eq 1) {
+        return $Candidates[0]
+    }
+    return $null
+}
+
+function Read-EnrollmentBundlePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Directory
+    )
+
+    $candidates = @(Get-EnrollmentBundleCandidates -Directory $Directory)
+    if ($candidates.Count -eq 0) {
+        Write-Host 'No .rqbt was found beside client-run.ps1. Enter an explicit enrollment bundle path.'
+        $enteredPath = Read-Host 'Enrollment bundle path'
+    }
+    elseif ($candidates.Count -eq 1) {
+        $candidateName = [IO.Path]::GetFileName($candidates[0])
+        $enteredPath = Read-Host "Enrollment bundle path (press Enter to use $candidateName)"
+    }
+    else {
+        Write-Host 'Multiple .rqbt enrollment bundles were found beside client-run.ps1:'
+        foreach ($candidate in $candidates) {
+            Write-Host "  $([IO.Path]::GetFileName($candidate))"
+        }
+        Write-Host 'Enter an explicit enrollment bundle path.'
+        $enteredPath = Read-Host 'Enrollment bundle path'
+    }
+
+    $bundle = Resolve-EnrollmentBundlePath -EnteredPath $enteredPath -Candidates $candidates
+    if (-not [string]::IsNullOrWhiteSpace($enteredPath)) {
+        return $bundle
+    }
+    if ($null -ne $bundle) {
+        Write-Host "Using enrollment bundle: $bundle"
+        return $bundle
+    }
+    Write-Host 'Enrollment bundle was not selected'
+    return $null
+}
+
 if ($SelfTest) {
     $expectedElevatedHost = (Get-Process -Id $PID).Path
     $actualElevatedHost = Get-ElevatedPowerShellHost
@@ -269,6 +380,89 @@ param(
     }
     if ($configShowAction.PSObject.Properties.Name -contains 'Protected') {
         throw 'configuration display actions must not create an action-specific elevation boundary'
+    }
+    $bundleTestDirectory = Join-Path ([IO.Path]::GetTempPath()) ("rqbit tunnel enrollment bundles " + [Guid]::NewGuid().ToString("N"))
+    [IO.Directory]::CreateDirectory($bundleTestDirectory) | Out-Null
+    try {
+        $noCandidates = @(Get-EnrollmentBundleCandidates -Directory $bundleTestDirectory)
+        if ($noCandidates.Count -ne 0) {
+            throw 'an empty bundle directory must not produce enrollment candidates'
+        }
+
+        $aliceBundle = Join-Path $bundleTestDirectory 'alice bundle.rqbt'
+        [IO.File]::WriteAllText($aliceBundle, 'alice')
+        $singleCandidate = @(Get-EnrollmentBundleCandidates -Directory $bundleTestDirectory)
+        if ($singleCandidate.Count -ne 1 -or $singleCandidate[0] -cne $aliceBundle) {
+            throw 'the single adjacent enrollment bundle must be returned exactly'
+        }
+        $singleBlankResolution = Resolve-EnrollmentBundlePath -EnteredPath '' -Candidates $singleCandidate
+        if ($singleBlankResolution -cne $aliceBundle) {
+            throw 'a blank bundle path must resolve the sole adjacent enrollment bundle'
+        }
+
+        $explicitBundle = 'C:\explicit path\bob.rqbt'
+        $explicitResolution = Resolve-EnrollmentBundlePath -EnteredPath $explicitBundle -Candidates $singleCandidate
+        if ($explicitResolution -cne $explicitBundle) {
+            throw 'an explicit enrollment bundle path must win over an adjacent candidate'
+        }
+
+        $bobBundle = Join-Path $bundleTestDirectory 'bob.rqbt'
+        [IO.File]::WriteAllText($bobBundle, 'bob')
+        $multipleCandidates = @(Get-EnrollmentBundleCandidates -Directory $bundleTestDirectory)
+        if ($multipleCandidates.Count -ne 2) {
+            throw 'two adjacent enrollment bundles must remain two candidates'
+        }
+        $multipleBlankResolution = Resolve-EnrollmentBundlePath -EnteredPath '' -Candidates $multipleCandidates
+        if ($null -ne $multipleBlankResolution) {
+            throw 'a blank bundle path must not guess among multiple adjacent candidates'
+        }
+
+        $syntheticDirectoryItem = [pscustomobject]@{
+            PSIsContainer = $true
+            Attributes = [IO.FileAttributes]::Normal
+            FullName = (Join-Path $bundleTestDirectory 'directory bundle.rqbt')
+        }
+        if (Test-RegularEnrollmentBundleCandidate -Item $syntheticDirectoryItem) {
+            throw 'a directory item must not be an enrollment bundle candidate'
+        }
+
+        $syntheticReparsePointItem = [pscustomobject]@{
+            PSIsContainer = $false
+            Attributes = [IO.FileAttributes]::ReparsePoint
+            FullName = (Join-Path $bundleTestDirectory 'reparse bundle.rqbt')
+        }
+        if (Test-RegularEnrollmentBundleCandidate -Item $syntheticReparsePointItem) {
+            throw 'a reparse-point item must not be an enrollment bundle candidate'
+        }
+
+        $missingItem = [pscustomobject]@{
+            PSIsContainer = $false
+            Attributes = [IO.FileAttributes]::Normal
+            FullName = (Join-Path $bundleTestDirectory 'missing bundle.rqbt')
+        }
+        if (Test-RegularEnrollmentBundleCandidate -Item $missingItem) {
+            throw 'a missing regular-looking item must not be an enrollment bundle candidate'
+        }
+
+        $unreadableBundle = Join-Path $bundleTestDirectory 'unreadable bundle.rqbt'
+        [IO.File]::WriteAllText($unreadableBundle, 'unreadable')
+        $unreadableStream = [IO.File]::Open(
+            $unreadableBundle,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::ReadWrite,
+            [IO.FileShare]::None
+        )
+        try {
+            if (Test-RegularEnrollmentBundleCandidate -Item (Get-Item -LiteralPath $unreadableBundle -Force)) {
+                throw 'an unreadable regular-looking item must not be an enrollment bundle candidate'
+            }
+        }
+        finally {
+            $unreadableStream.Dispose()
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $bundleTestDirectory -Recurse -Force -ErrorAction SilentlyContinue
     }
     exit 0
 }
@@ -453,12 +647,12 @@ while ($true) {
             Invoke-MenuCommand -ClientArguments $tuiAction.ClientArguments
         }
         "2" {
-            $bundle = Read-Host "Enrollment bundle path"
-            if (-not [string]::IsNullOrWhiteSpace($bundle) -and
-                (Invoke-MenuCommand -ClientArguments @("client", "import", "--bundle", $bundle) -PassThru)) {
-                if (Invoke-MenuCommand -ClientArguments @("client", "service", "install") -PassThru) {
-                    if (Invoke-MenuCommand -ClientArguments @("client", "service", "enable-autostart") -PassThru) {
-                        Invoke-MenuCommand -ClientArguments @("client", "service", "start") | Out-Null
+            $bundle = Read-EnrollmentBundlePath -Directory $here
+            if ($null -ne $bundle -and
+                (Invoke-MenuCommand -ClientArguments @('client', 'import', '--bundle', $bundle) -PassThru)) {
+                if (Invoke-MenuCommand -ClientArguments @('client', 'service', 'install') -PassThru) {
+                    if (Invoke-MenuCommand -ClientArguments @('client', 'service', 'enable-autostart') -PassThru) {
+                        Invoke-MenuCommand -ClientArguments @('client', 'service', 'start') | Out-Null
                     }
                 }
             }
