@@ -273,6 +273,39 @@ function Read-EnrollmentBundlePath {
     return $null
 }
 
+function Invoke-ClientCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$ClientArguments
+    )
+
+    & $bin @ClientArguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "rqbit-tunnel command exited with $LASTEXITCODE"
+    }
+}
+
+function Invoke-MenuCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$ClientArguments,
+        [switch]$PassThru
+    )
+
+    try {
+        Invoke-ClientCommand -ClientArguments $ClientArguments
+        if ($PassThru) {
+            return $true
+        }
+    }
+    catch {
+        Write-Host "error: $($_.Exception.Message)" -ForegroundColor Red
+        if ($PassThru) {
+            return $false
+        }
+    }
+}
+
 if ($SelfTest) {
     $expectedElevatedHost = (Get-Process -Id $PID).Path
     $actualElevatedHost = Get-ElevatedPowerShellHost
@@ -565,17 +598,6 @@ else {
     }
 }
 
-function Invoke-ClientCommand {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string[]]$ClientArguments
-    )
-
-    & $bin @ClientArguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "rqbit-tunnel command exited with $LASTEXITCODE"
-    }
-}
 
 if ($OpenDashboard) {
     $tuiAction = Get-ClientTuiMenuAction
@@ -583,26 +605,6 @@ if ($OpenDashboard) {
     exit 0
 }
 
-function Invoke-MenuCommand {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string[]]$ClientArguments,
-        [switch]$PassThru
-    )
-
-    try {
-        Invoke-ClientCommand -ClientArguments $ClientArguments
-        if ($PassThru) {
-            return $true
-        }
-    }
-    catch {
-        Write-Host "error: $($_.Exception.Message)" -ForegroundColor Red
-        if ($PassThru) {
-            return $false
-        }
-    }
-}
 
 function Set-ClientConfiguration {
     $configArguments = @("client", "config", "set")

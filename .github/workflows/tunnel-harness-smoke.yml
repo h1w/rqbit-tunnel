@@ -133,7 +133,13 @@ jobs:
           Compress-Archive -Path $bundle -DestinationPath "$bundle.zip" -Force
           pwsh -NoProfile -File scripts/tunnel/test-client-bootstrap.ps1 `
             -Installer scripts/tunnel/install-client.ps1
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
           pwsh -NoProfile -File scripts/tunnel/smoke-windows-service.ps1 -Bundle "$bundle.zip"
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
 
       - name: Collect Windows service diagnostics
         if: failure()
