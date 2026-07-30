@@ -408,10 +408,12 @@ No Rust production source changes are needed. `crates/rqbit-tunnel/src/tray/agen
       $directoryCandidate = [pscustomobject]@{
           PSIsContainer = $true
           Attributes = [IO.FileAttributes]::Directory
+          FullName = $singleBundle
       }
       $reparseCandidate = [pscustomobject]@{
           PSIsContainer = $false
           Attributes = [IO.FileAttributes]::ReparsePoint
+          FullName = $singleBundle
       }
       $missingCandidate = [pscustomobject]@{
           PSIsContainer = $false
