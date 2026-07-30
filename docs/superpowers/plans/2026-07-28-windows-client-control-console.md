@@ -642,6 +642,7 @@ No Rust production source changes are needed. `crates/rqbit-tunnel/src/tray/agen
 - Modify: `scripts/tunnel/README.md:176-203`
 - Test: `scripts/tunnel/test-client-bootstrap.ps1`
 - Test: `scripts/tunnel/smoke-windows-service.ps1`
+- Modify: `.github/workflows/tunnel-harness-smoke.yml:120-142`
 
 - [ ] **Step 1: Update the Windows usage section with the menu’s privilege and bundle rules.**
 
@@ -654,10 +655,11 @@ No Rust production source changes are needed. `crates/rqbit-tunnel/src/tray/agen
   Closing it ends that elevated session, so the next launch asks once again.
 
   When importing an enrollment bundle, press Enter at the path prompt if the
-  extracted bundle folder contains exactly one regular `*.rqbt` file. The menu
-  names and imports that file automatically, then installs the client service,
-  enables its autostart, and starts it. With no bundle or multiple bundles, it
-  prints the discovered state and requires an explicit path; it never guesses.
+  extracted bundle folder contains exactly one readable, non-reparse regular
+  `*.rqbt` file. The menu names and imports that file automatically, then
+  installs the client service definition, enables its autostart, and starts it.
+  With no bundle or multiple bundles, it prints the discovered state and
+  requires an explicit path; it never guesses.
   ```
 
 - [ ] **Step 2: Run local PowerShell contract coverage.**
@@ -677,6 +679,10 @@ No Rust production source changes are needed. `crates/rqbit-tunnel/src/tray/agen
   ```
 
   Expected: the `windows-service` job completes successfully, including `Assemble and test Windows bundle`; the `linux-systemd` job remains green because this change does not alter Linux assets.
+
+  The workflow must explicitly exit with each child `pwsh` command’s
+  `$LASTEXITCODE`; PowerShell otherwise permits a later successful command to
+  mask a failed bootstrap contract.
 
 - [ ] **Step 4: Perform the desktop acceptance scenario from the specification.**
 
