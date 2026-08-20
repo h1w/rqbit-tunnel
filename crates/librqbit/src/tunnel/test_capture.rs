@@ -42,6 +42,8 @@ pub(crate) enum CarrierEvent {
     Have,
     Cancel,
     KeepAlive,
+    /// A BEP-11 `ut_pex` peer-exchange update.
+    UtPex,
     /// A BEP-9 `ut_metadata` `request` (a peer asking us for a metadata piece).
     UtMetadataRequest,
     /// A BEP-9 `ut_metadata` `data` response (a served metadata piece).
@@ -70,6 +72,7 @@ impl CarrierEvent {
                 use peer_binary_protocol::extended::ut_metadata::UtMetadata;
                 match ext_msg {
                     ExtendedMessage::Handshake(_) => CarrierEvent::ExtendedHandshake,
+                    ExtendedMessage::UtPex(_) => CarrierEvent::UtPex,
                     ExtendedMessage::UtMetadata(UtMetadata::Request(_)) => {
                         CarrierEvent::UtMetadataRequest
                     }

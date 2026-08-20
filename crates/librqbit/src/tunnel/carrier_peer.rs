@@ -6,6 +6,7 @@ use bytes::Bytes;
 use librqbit_core::{Id32, torrent_metainfo_v2::torrent_v2_from_bytes};
 use peer_binary_protocol::extended::ExtendedMessage;
 use peer_binary_protocol::extended::ut_metadata::{UtMetadata, UtMetadataData};
+use peer_binary_protocol::extended::ut_pex::UtPex;
 use peer_binary_protocol::{Message, Piece, Request};
 use sha2::{Digest, Sha256};
 
@@ -81,13 +82,14 @@ pub(crate) enum CoverMessage {
     /// `metadata_size` and lacks the metadata fetches it). Serialized with the
     /// peer's advertised `ut_metadata` id by the writer's `send_message`.
     UtMetadataRequest(u32),
+    /// A BEP-11 peer exchange update containing plausible synthetic peers.
+    UtPex(UtPex<buffers::ByteBufOwned>),
 }
 
 impl CoverMessage {
     /// Borrow this owned cover message as a wire [`Message`] for serialization.
     pub(crate) fn to_message(&self) -> peer_binary_protocol::Message<'_> {
         use buffers::ByteBuf;
-        use peer_binary_protocol::{Message, Piece, Request};
         match self {
             CoverMessage::Bitfield(b) => Message::Bitfield(ByteBuf(b)),
             CoverMessage::Unchoke => Message::Unchoke,
@@ -116,6 +118,9 @@ impl CoverMessage {
             }
             CoverMessage::UtMetadataRequest(piece) => {
                 Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Request(*piece)))
+            }
+            CoverMessage::UtPex(pex) => {
+                Message::Extended(ExtendedMessage::UtPex(pex.as_borrowed()))
             }
         }
     }
@@ -358,6 +363,7 @@ impl TunnelCarrierPeer {
             Message::Interested | Message::NotInterested => Ok(vec![]),
             Message::KeepAlive => Ok(vec![]),
             Message::Extended(ExtendedMessage::UtMetadata(m)) => Ok(self.on_ut_metadata(m)),
+            Message::Extended(ExtendedMessage::UtPex(_)) => Ok(vec![]),
             Message::Extended(_) => Ok(vec![]),
             Message::Cancel(_) => Ok(vec![]),
         }
@@ -1352,5 +1358,65 @@ mod tests {
             )),
             "carrier must keep serving ordinary Piece cover after the metadata cap"
         );
+    }
+
+    #[test]
+    fn ut_pex_cover_message_roundtrips_with_peer_extension_id() {
+        use peer_binary_protocol::Message;
+        use peer_binary_protocol::extended::ut_pex::UtPex;
+        use peer_binary_protocol::extended::{ExtendedMessage, PeerExtendedMessageIds};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let peers = [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 6881),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)), 51413),
+        ];
+        let pex = UtPex::from_addrs(peers.into_iter(), std::iter::empty());
+        let cover = CoverMessage::UtPex(pex);
+        let mut custom_wire = [0u8; peer_binary_protocol::MAX_MSG_LEN];
+        let custom_len = cover
+            .to_message()
+            .serialize(&mut custom_wire, &|| PeerExtendedMessageIds {
+                ut_metadata: None,
+                ut_pex: Some(7),
+                rq_tunnel: None,
+            })
+            .expect("ut_pex must serialize with advertised peer id");
+        assert_eq!(custom_wire[4], 20);
+        assert_eq!(custom_wire[5], 7);
+
+        let mut scratch = [0u8; peer_binary_protocol::MAX_MSG_LEN];
+        let len = cover
+            .to_message()
+            .serialize(&mut scratch, &|| PeerExtendedMessageIds::my())
+            .expect("ut_pex must serialize with the standard peer id");
+        assert_eq!(custom_len, len);
+        let (parsed, _) =
+            Message::deserialize(&scratch[..len], &[]).expect("serialized ut_pex must parse");
+        match parsed {
+            Message::Extended(ExtendedMessage::UtPex(parsed)) => {
+                let addrs: Vec<_> = parsed.added_peers().map(|p| p.addr).collect();
+                assert_eq!(addrs, peers);
+            }
+            other => panic!("expected UtPex, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_inbound_ut_pex_as_cover_no_actions() {
+        use peer_binary_protocol::extended::ut_pex::UtPex;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let (mut peer, _dir) = test_peer().await;
+        let peers = [SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            6881,
+        )];
+        let pex = UtPex::from_addrs(peers.into_iter(), std::iter::empty());
+        let actions = peer
+            .on_message(Message::Extended(ExtendedMessage::UtPex(pex.as_borrowed())))
+            .await
+            .expect("ut_pex is valid cover input");
+        assert!(actions.is_empty());
     }
 }

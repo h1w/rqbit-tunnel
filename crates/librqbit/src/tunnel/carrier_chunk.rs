@@ -5,6 +5,8 @@
 // Delivery under rq_tunnel is reliable + ordered, so the receiver just
 // accumulates bytes and drains complete `length || payload` messages.
 
+use bytes::{BufMut, Bytes, BytesMut};
+
 use peer_binary_protocol::MAX_RQ_TUNNEL_MESSAGE_LEN;
 
 use super::frame::MAX_FRAME_PAYLOAD;
@@ -24,25 +26,37 @@ pub(crate) enum CarrierChunkError {
 
 /// Split one ciphertext blob into ordered <= CHUNK_MAX chunks (with a 4-byte
 /// length prefix on the logical message).
-pub(crate) fn chunk_ciphertext(blob: &[u8]) -> Vec<Vec<u8>> {
-    let mut framed = Vec::with_capacity(4 + blob.len());
-    framed.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+///
+/// The payload is copied once into one contiguous allocation. Each returned
+/// [`Bytes`] is then a zero-copy view into that shared allocation, avoiding one
+/// allocation and payload copy per carrier chunk.
+pub(crate) fn chunk_ciphertext(blob: &[u8]) -> Vec<Bytes> {
+    let framed_len = 4 + blob.len();
+    let chunk_count = framed_len.div_ceil(CHUNK_MAX);
+    let mut framed = BytesMut::with_capacity(framed_len);
+    framed.put_u32(blob.len() as u32);
     framed.extend_from_slice(blob);
 
-    framed.chunks(CHUNK_MAX).map(|c| c.to_vec()).collect()
+    let mut framed = framed.freeze();
+    let mut chunks = Vec::with_capacity(chunk_count);
+    while !framed.is_empty() {
+        let chunk_len = framed.len().min(CHUNK_MAX);
+        chunks.push(framed.split_to(chunk_len));
+    }
+    chunks
 }
 
 /// Reassembles the length-prefixed ciphertext stream produced by
 /// `chunk_ciphertext`.
 pub(crate) struct CarrierDefragmenter {
-    buf: Vec<u8>,
+    buf: BytesMut,
     max: usize,
 }
 
 impl CarrierDefragmenter {
     pub(crate) fn new(max_msg_len: usize) -> Self {
         Self {
-            buf: Vec::new(),
+            buf: BytesMut::with_capacity(CHUNK_MAX.min(max_msg_len.saturating_add(4))),
             max: max_msg_len,
         }
     }
@@ -53,24 +67,33 @@ impl CarrierDefragmenter {
     pub(crate) fn push(&mut self, chunk: &[u8]) -> Result<Vec<Vec<u8>>, CarrierChunkError> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
+        let mut consumed = 0;
         loop {
-            if self.buf.len() < 4 {
+            let remaining = &self.buf[consumed..];
+            if remaining.len() < 4 {
                 break;
             }
             let len =
-                u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
+                u32::from_be_bytes(remaining[..4].try_into().expect("length checked")) as usize;
             if len > self.max {
                 return Err(CarrierChunkError::MessageTooLarge {
                     declared: len,
                     max: self.max,
                 });
             }
-            if self.buf.len() < 4 + len {
+            if remaining.len() < 4 + len {
                 break;
             }
-            let msg = self.buf[4..4 + len].to_vec();
-            self.buf.drain(..4 + len);
-            out.push(msg);
+            out.push(remaining[4..4 + len].to_vec());
+            consumed += 4 + len;
+        }
+
+        if consumed != 0 {
+            let remaining = self.buf.len() - consumed;
+            if remaining != 0 {
+                self.buf.copy_within(consumed.., 0);
+            }
+            self.buf.truncate(remaining);
         }
         Ok(out)
     }
@@ -183,5 +206,132 @@ mod tests {
                 max: MAX_CARRIER_CIPHERTEXT
             }
         );
+    }
+
+    #[test]
+    fn chunks_share_one_contiguous_allocation() {
+        let blob = vec![0x5A; CHUNK_MAX * 2];
+        let chunks = chunk_ciphertext(&blob);
+        assert!(chunks.len() >= 2);
+
+        assert_eq!(
+            chunks[0].as_ptr().wrapping_add(chunks[0].len()),
+            chunks[1].as_ptr()
+        );
+        let cloned = chunks[0].clone();
+        assert_eq!(cloned.as_ptr(), chunks[0].as_ptr());
+    }
+
+    #[test]
+    fn high_throughput_defragmentation_preserves_all_messages() {
+        const MESSAGES: usize = 4_096;
+        let blob = vec![0xC3; CHUNK_MAX - 4];
+        let chunks = chunk_ciphertext(&blob);
+        let mut d = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
+        let mut decoded = 0;
+
+        for _ in 0..MESSAGES {
+            for chunk in &chunks {
+                let messages = d.push(chunk).unwrap();
+                decoded += messages.len();
+                assert!(messages.iter().all(|message| message == &blob));
+            }
+        }
+
+        assert_eq!(decoded, MESSAGES);
+    }
+
+    #[test]
+    fn defragmenter_reuses_accumulation_buffer() {
+        let blob = vec![0xA5; CHUNK_MAX - 4];
+        let chunks = chunk_ciphertext(&blob);
+        assert_eq!(chunks.len(), 1);
+
+        let mut d = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
+        let initial_capacity = d.buf.capacity();
+        for _ in 0..1_024 {
+            let messages = d.push(&chunks[0]).unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0], blob);
+            assert_eq!(d.buf.capacity(), initial_capacity);
+        }
+    }
+
+    #[test]
+    fn defragmenter_retains_capacity_with_partial_trailing_message() {
+        let first = [1u8, 2, 3, 4];
+        let second = [5u8; 32];
+        let mut stream = chunk_ciphertext(&first)[0].to_vec();
+        stream.extend_from_slice(&chunk_ciphertext(&second)[0][..1]);
+
+        let mut d = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
+        let initial_capacity = d.buf.capacity();
+        assert_eq!(d.push(&stream).unwrap(), vec![first.to_vec()]);
+        assert_eq!(d.buf.as_ref(), &chunk_ciphertext(&second)[0][..1]);
+        assert_eq!(d.buf.capacity(), initial_capacity);
+    }
+
+    #[test]
+    #[ignore = "throughput microbenchmark; run explicitly with --ignored --nocapture"]
+    fn benchmark_high_throughput_defragmentation() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        struct LegacyDefragmenter {
+            buf: Vec<u8>,
+        }
+
+        impl LegacyDefragmenter {
+            fn push(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
+                self.buf.extend_from_slice(chunk);
+                let mut out = Vec::new();
+                while self.buf.len() >= 4 {
+                    let len = u32::from_be_bytes(self.buf[..4].try_into().unwrap()) as usize;
+                    if self.buf.len() < 4 + len {
+                        break;
+                    }
+                    out.push(self.buf[4..4 + len].to_vec());
+                    self.buf.drain(..4 + len);
+                }
+                out
+            }
+        }
+
+        const MESSAGES: usize = 8_192;
+        let blob = vec![0x7D; CHUNK_MAX - 4];
+        let chunks = chunk_ciphertext(&blob);
+
+        let legacy_started = Instant::now();
+        let mut legacy = LegacyDefragmenter { buf: Vec::new() };
+        let mut legacy_decoded = 0;
+        for _ in 0..MESSAGES {
+            for chunk in &chunks {
+                legacy_decoded += black_box(legacy.push(black_box(chunk))).len();
+            }
+        }
+        let legacy_elapsed = legacy_started.elapsed();
+
+        let optimized_started = Instant::now();
+        let mut optimized = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
+        let mut optimized_decoded = 0;
+        for _ in 0..MESSAGES {
+            for chunk in &chunks {
+                optimized_decoded += black_box(optimized.push(black_box(chunk)).unwrap()).len();
+            }
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        let mib = (blob.len() * MESSAGES) as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "carrier defrag legacy: {mib:.1} MiB in {legacy_elapsed:?} ({:.1} MiB/s)",
+            mib / legacy_elapsed.as_secs_f64()
+        );
+        eprintln!(
+            "carrier defrag optimized: {mib:.1} MiB in {optimized_elapsed:?} ({:.1} MiB/s), {:.2}x speedup",
+            mib / optimized_elapsed.as_secs_f64(),
+            legacy_elapsed.as_secs_f64() / optimized_elapsed.as_secs_f64()
+        );
+        assert_eq!(legacy_decoded, MESSAGES);
+        assert_eq!(optimized_decoded, MESSAGES);
     }
 }

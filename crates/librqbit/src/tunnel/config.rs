@@ -204,6 +204,13 @@ pub(crate) const COVER_REQUEST_INTERVAL: Duration = Duration::from_secs(3);
 /// 16 KiB block at a time.
 pub(crate) const COVER_REQUEST_BLOCK_LEN: u32 = 16 * 1024;
 
+/// How often an active carrier emits a BEP-11 `ut_pex` peer-exchange update.
+/// Real BitTorrent peers commonly send PEX approximately once per minute.
+pub(crate) const COVER_PEX_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Number of synthetic peers included in each PEX update.
+pub(crate) const COVER_PEX_PEERS_COUNT: usize = 4;
+
 /// Number of distinct low piece indices the cover cadence rotates its
 /// `Request`s across. Every synthetic carrier has at least
 /// `CARRIER_CORPUS_MIN / CARRIER_PIECE_LENGTH` pieces

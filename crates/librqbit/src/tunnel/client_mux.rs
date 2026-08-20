@@ -28,9 +28,9 @@ use super::carrier_peer::{CoverMessage, TunnelCarrierPeer};
 use super::carrier_wire::CarrierReadHalf;
 use super::client::TunnelClient;
 use super::config::{
-    COVER_REQUEST_BLOCK_LEN, COVER_REQUEST_BLOCKS_PER_PIECE, COVER_REQUEST_INTERVAL,
-    COVER_REQUEST_PIECE_SPAN, OPEN_WINDOW, OUTBOUND_QUEUE, PACING_DEFAULT_RATE, PER_CONN_QUEUE,
-    PING_INTERVAL, PING_NONCE_MAP_CAP,
+    COVER_PEX_INTERVAL, COVER_PEX_PEERS_COUNT, COVER_REQUEST_BLOCK_LEN,
+    COVER_REQUEST_BLOCKS_PER_PIECE, COVER_REQUEST_INTERVAL, COVER_REQUEST_PIECE_SPAN, OPEN_WINDOW,
+    OUTBOUND_QUEUE, PACING_DEFAULT_RATE, PER_CONN_QUEUE, PING_INTERVAL, PING_NONCE_MAP_CAP,
 };
 use super::crypto::NoiseTransport;
 use super::flow::{
@@ -419,36 +419,50 @@ async fn ping_and_control_task(
 /// have, so a request is always in range without the client needing to know the
 /// exact corpus size. Stops on shutdown, or once the cover lane is gone.
 async fn cover_request_cadence(cover_tx: mpsc::Sender<CoverMessage>, shutdown: CancellationToken) {
+    use peer_binary_protocol::extended::ut_pex::UtPex;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
     // A real client that sees a peer advertise `ut_metadata` + `metadata_size`
-    // and lacks the metadata fetches it ONCE, up front (BEP-9). Best-effort;
-    // the server answers with a `ut_metadata` data response.
+    // and lacks the metadata fetches it ONCE, up front (BEP-9). Best-effort.
     let _ = cover_tx.try_send(CoverMessage::UtMetadataRequest(0));
 
-    let mut interval = tokio::time::interval(COVER_REQUEST_INTERVAL);
-    // A rotating counter over (piece, block): the piece index walks
-    // `0..COVER_REQUEST_PIECE_SPAN` and, once it wraps, the block offset walks
-    // `0..COVER_REQUEST_BLOCKS_PER_PIECE` — so successive requests look like a
-    // client fetching different blocks of different pieces.
+    let pex_peers = [
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 6881),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)), 51413),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 3)), 6000),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 4)), 49000),
+    ];
+    let mut pex_interval = tokio::time::interval(COVER_PEX_INTERVAL);
+    let mut request_interval = tokio::time::interval(COVER_REQUEST_INTERVAL);
     let mut counter: u32 = 0;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            _ = interval.tick() => {}
+            _ = pex_interval.tick() => {
+                let pex = UtPex::from_addrs(
+                    pex_peers[..COVER_PEX_PEERS_COUNT.min(pex_peers.len())].iter().copied(),
+                    std::iter::empty(),
+                );
+                match cover_tx.try_send(CoverMessage::UtPex(pex)) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
+            _ = request_interval.tick() => {
+                let index = counter % COVER_REQUEST_PIECE_SPAN;
+                let block = (counter / COVER_REQUEST_PIECE_SPAN) % COVER_REQUEST_BLOCKS_PER_PIECE;
+                let begin = block * COVER_REQUEST_BLOCK_LEN;
+                match cover_tx.try_send(CoverMessage::Request {
+                    index,
+                    begin,
+                    length: COVER_REQUEST_BLOCK_LEN,
+                }) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                }
+                counter = counter.wrapping_add(1);
+            }
         }
-        let index = counter % COVER_REQUEST_PIECE_SPAN;
-        let block = (counter / COVER_REQUEST_PIECE_SPAN) % COVER_REQUEST_BLOCKS_PER_PIECE;
-        let begin = block * COVER_REQUEST_BLOCK_LEN;
-        // Best-effort: drop on a full cover lane (`try_send`). If the lane is
-        // gone (writer exited / peer disconnected) there's nothing left to do.
-        match cover_tx.try_send(CoverMessage::Request {
-            index,
-            begin,
-            length: COVER_REQUEST_BLOCK_LEN,
-        }) {
-            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
-            Err(mpsc::error::TrySendError::Closed(_)) => break,
-        }
-        counter = counter.wrapping_add(1);
     }
 }
 
